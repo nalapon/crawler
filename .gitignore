@@ -1,0 +1,17 @@
+prototype/.impeccable/review/
+.DS_Store
+.build/
+build/
+dist/
+artifacts/
+output/
+.swiftpm/
+.jj/
+*.xcuserstate
+# Local signing material and credentials never belong in the source repository.
+.env
+.env.*
+!.env.example
+*.p12
+*.pfx
+*.keychain-db

@@ -1,0 +1,209 @@
+<!doctype html>
+<!-- Disposable prototype. File operations, sharing, devices, and system readings are simulated. -->
+<html lang="en" data-theme="cupertino">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Crawler · Cupertino</title>
+    <link rel="stylesheet" href="app.css" />
+    <link rel="icon" type="image/png" href="favicon.png">
+</head>
+  <body>
+    <div class="stage">
+      <div class="prototype-bar">
+        <span
+          ><strong>Crawler</strong> · Interactive mockup
+          <span class="sample-disclosure"
+            >/ sample files, devices & system data</span
+          ></span
+        >
+        <div class="theme-control" aria-label="Appearance">
+          <button data-theme="cupertino" aria-pressed="true">Cupertino</button
+          ><button data-theme="classic" aria-pressed="false">System 7</button>
+        </div>
+      </div>
+      <main class="window" aria-label="Crawler file manager">
+        <header class="titlebar">
+          <div class="traffic" aria-hidden="true"><i></i><i></i><i></i></div>
+          <span class="wordmark">crawler</span>
+          <button
+            class="icon-button sidebar-toggle"
+            id="sidebar-toggle"
+            aria-label="Collapse sidebar"
+            aria-expanded="true"
+            aria-controls="navigation-sidebar"
+            title="Toggle sidebar · hold ⌘ to peek"
+            data-icon="panel"
+          ></button>
+          <div class="tabs" id="tabs" aria-label="Open tabs"></div>
+          <button
+            class="icon-button"
+            data-action="new-tab"
+            aria-label="New tab"
+            data-icon="plus"
+          ></button>
+          <div class="title-spacer"></div>
+          <button
+            class="title-tool"
+            data-action="quick-settings"
+            aria-label="Quick settings"
+          >
+            <span data-icon="sliders"></span><span>Quick settings</span></button
+          ><button
+            class="icon-button"
+            data-action="help"
+            aria-label="Keyboard shortcuts"
+            data-icon="help"
+          ></button>
+        </header>
+        <div class="app-body">
+          <aside
+            class="sidebar"
+            id="navigation-sidebar"
+            aria-label="Navigation"
+          >
+            <div class="sidebar-scroll" id="sidebar"></div>
+            <button class="storage-shortcut" data-go="activity">
+              <span data-icon="drive"></span
+              ><span
+                ><strong>Macintosh HD</strong
+                ><small>312 GB of 512 GB available</small
+                ><i class="storage-meter"><i></i></i
+              ></span>
+            </button>
+          </aside>
+          <section class="main-panel">
+            <div class="navigation-bar">
+              <div class="navigation-buttons">
+                <button
+                  class="icon-button"
+                  id="back"
+                  data-action="back"
+                  aria-label="Back"
+                  data-icon="left"
+                ></button
+                ><button
+                  class="icon-button"
+                  id="forward"
+                  data-action="forward"
+                  aria-label="Forward"
+                  data-icon="right"
+                ></button
+                ><button
+                  class="icon-button"
+                  id="up"
+                  data-action="up"
+                  aria-label="Parent folder"
+                  data-icon="up"
+                ></button>
+              </div>
+              <nav class="address" id="address" aria-label="Location"></nav>
+              <form class="address-form" id="address-form" hidden>
+                <input
+                  id="address-input"
+                  aria-label="Folder path"
+                  autocomplete="off"
+                />
+              </form>
+              <button
+                class="icon-button path-edit"
+                data-action="edit-path"
+                aria-label="Edit folder path"
+                data-icon="edit"
+              ></button>
+              <div class="search-field">
+                <span data-icon="search"></span
+                ><input
+                  type="search"
+                  id="search"
+                  placeholder="Search files on this Mac"
+                  aria-label="Search files"
+                  autocomplete="off"
+                /><kbd>⌘ F</kbd>
+              </div>
+            </div>
+            <div id="file-commandbar" class="file-commandbar">
+              <button data-action="new-folder">
+                <span data-icon="folder-plus"></span>New folder</button
+              ><span class="divider"></span
+              ><button
+                data-action="cut"
+                aria-label="Cut selected file"
+                data-icon="cut"
+                title="Cut"
+              ></button
+              ><button
+                data-action="copy"
+                aria-label="Copy selected file"
+                data-icon="copy"
+                title="Copy"
+              ></button
+              ><button
+                data-action="paste"
+                aria-label="Paste file"
+                data-icon="paste"
+                title="Paste"
+              ></button
+              ><button
+                data-action="rename"
+                aria-label="Rename selected file"
+                data-icon="edit"
+                title="Rename"
+              ></button
+              ><span class="divider"></span
+              ><button data-action="share">
+                <span data-icon="share"></span>Share</button
+              ><button
+                data-action="trash"
+                aria-label="Move selected file to Trash"
+                data-icon="trash"
+                title="Move to Trash"
+              ></button>
+              <div class="command-spacer"></div>
+              <button data-action="start-search">
+                <span data-icon="filter"></span>Search & filters</button
+              ><button
+                class="inspector-toggle"
+                data-action="toggle-preview"
+                aria-pressed="true"
+              >
+                <span data-icon="panel"></span>Details
+              </button>
+            </div>
+            <div id="content" class="content"></div>
+            <div hidden>
+              <span id="status"></span><span id="keyboard-status"></span>
+            </div>
+          </section>
+        </div>
+        <div class="toast" id="toast" role="status">
+          <span></span><button id="undo">Undo</button>
+        </div>
+        <aside
+          class="quick-settings"
+          id="quick-settings"
+          aria-label="Quick settings"
+          hidden
+        ></aside>
+      </main>
+    </div>
+    <dialog id="modal">
+      <header>
+        <h2 id="modal-title"></h2>
+        <button
+          class="icon-button"
+          data-action="close-modal"
+          aria-label="Close dialog"
+          data-icon="close"
+        ></button>
+      </header>
+      <div id="modal-body"></div>
+    </dialog>
+    <script src="app.js"></script>
+    <script src="columns.js"></script>
+    <script src="sidebar.js"></script>
+    <script>
+      render();
+    </script>
+  </body>
+</html>
