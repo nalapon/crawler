@@ -277,6 +277,9 @@ final class FilePane: Surface, NSTableViewDataSource, NSTableViewDelegate {
     table.delegate = self
     table.target = self
     table.doubleAction = #selector(doubleClick)
+    // Drags carry the file URL; other apps and the sidebar only ever copy it.
+    table.setDraggingSourceOperationMask(.copy, forLocal: true)
+    table.setDraggingSourceOperationMask(.copy, forLocal: false)
     scroll.documentView = table
     addSubview(scroll)
     empty.maximumNumberOfLines = 4
@@ -450,6 +453,9 @@ final class FilePane: Surface, NSTableViewDataSource, NSTableViewDelegate {
     return v
   }
   func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool { !rows[row].pending }
+  func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> (any NSPasteboardWriting)? {
+    rows.indices.contains(row) && !rows[row].pending ? rows[row].item.url as NSURL : nil
+  }
   func tableViewSelectionDidChange(_ notification: Notification) {
     guard !updating, rows.indices.contains(table.selectedRow) else { return }
     selectionChanged?(

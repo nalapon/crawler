@@ -120,6 +120,9 @@ final class FileSearchPalette: Surface, NSTextFieldDelegate, NSTableViewDataSour
     table.delegate = self
     table.target = self
     table.doubleAction = #selector(openSelection)
+    // Drags carry the file URL; other apps and the sidebar only ever copy it.
+    table.setDraggingSourceOperationMask(.copy, forLocal: true)
+    table.setDraggingSourceOperationMask(.copy, forLocal: false)
     table.setAccessibilityLabel("File search results")
     table.hover = { [weak self] row in self?.select(row, scroll: false) }
     scroll.documentView = table
@@ -757,6 +760,11 @@ final class FileSearchPalette: Surface, NSTextFieldDelegate, NSTableViewDataSour
     return cell
   }
   func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? { SearchResultRow() }
+  func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> (any NSPasteboardWriting)? {
+    if isHome { return recentFiles.indices.contains(row) ? recentFiles[row].url as NSURL : nil }
+    guard search.responseIsCurrent, displayedHits.indices.contains(row), let root = search.resultRoot else { return nil }
+    return root.url.appendingPathComponent(displayedHits[row].entry.path) as NSURL
+  }
   func tableViewSelectionDidChange(_ notification: Notification) {
     guard !updatingResults else { return }
     if isHome {

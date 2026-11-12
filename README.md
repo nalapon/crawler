@@ -34,3 +34,11 @@ open "/Applications/Crawler.app"
 ```
 
 The build script downloads the pinned dependencies, builds the release app and signs it. Keep the same signing certificate between builds. There is no Homebrew package yet.
+
+To open folders from a terminal, link the `crawler` command into a folder on your `PATH`:
+
+```sh
+ln -s "$PWD/scripts/crawler" ~/.local/bin/crawler
+crawler .          # current folder
+crawler ~/Code     # any folder; a file path opens the file
+```

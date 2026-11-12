@@ -52,7 +52,8 @@ final class DocumentPreview: Surface, NSTextViewDelegate {
     textView.textContainer?.widthTracksTextView = true
     textView.textContainer?.containerSize = NSSize(
       width: 0, height: CGFloat.greatestFiniteMagnitude)
-    textView.layoutManager?.allowsNonContiguousLayout = true
+    // Contiguous, like MarkdownReader, so the scroll height is exact rather than estimated.
+    textView.layoutManager?.allowsNonContiguousLayout = false
     textView.textContainerInset = NSSize(width: 14, height: 16)
     textView.delegate = self
     textView.setAccessibilityLabel("File preview")
@@ -123,7 +124,7 @@ final class DocumentPreview: Surface, NSTextViewDelegate {
       needsLayout = true
       return
     }
-    if format == .thumbnail {
+    if format.usesQuickLook {
       state = "thumbnail"
       message.isHidden = true
       artwork.isHidden = false
@@ -292,85 +293,27 @@ final class DocumentPreview: Surface, NSTextViewDelegate {
   private func display(_ content: PreviewText) {
     renderedTheme = Design.theme
     state = content.markdown ? "markdown" : "code"
-    let baseFont =
-      content.markdown ? Design.font(13) : NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-    let paragraph = NSMutableParagraphStyle()
-    paragraph.lineSpacing = content.markdown ? 4 : 2
-    paragraph.lineBreakMode = .byWordWrapping
-    let attributed = NSMutableAttributedString(
-      string: content.text,
-      attributes: [
-        .font: baseFont, .foregroundColor: Design.text, .paragraphStyle: paragraph,
-      ])
-    var tables: [Int: NSTextTable] = [:]
-    var colors: [String: NSColor] = [:]
-    for span in content.spans where NSMaxRange(span.range) <= attributed.length {
-      var attributes: [NSAttributedString.Key: Any] = [:]
-      switch span.style {
-      case .syntax(let name):
-        let color = colors[name] ?? Self.syntaxColor(name)
+    let attributed: NSAttributedString
+    if content.markdown {
+      attributed = MarkdownStyle.attributedString(content, .pane, base: current?.url)
+    } else {
+      let paragraph = NSMutableParagraphStyle()
+      paragraph.lineSpacing = 2
+      paragraph.lineBreakMode = .byWordWrapping
+      let code = NSMutableAttributedString(
+        string: content.text,
+        attributes: [
+          .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
+          .foregroundColor: Design.text, .paragraphStyle: paragraph,
+        ])
+      var colors: [String: NSColor] = [:]
+      for span in content.spans where NSMaxRange(span.range) <= code.length {
+        guard case .syntax(let name) = span.style else { continue }
+        let color = colors[name] ?? Design.syntaxColor(name)
         colors[name] = color
-        attributes[.foregroundColor] = color
-      case .heading(let level):
-        attributes[.font] = Design.font(CGFloat(max(14, 26 - level * 2)), .bold)
-      case .strong:
-        attributed.enumerateAttribute(.font, in: span.range) { value, range, _ in
-          if let font = value as? NSFont {
-            attributed.addAttribute(
-              .font, value: NSFontManager.shared.convert(font, toHaveTrait: .boldFontMask),
-              range: range)
-          }
-        }
-      case .emphasis:
-        attributed.enumerateAttribute(.font, in: span.range) { value, range, _ in
-          if let font = value as? NSFont {
-            attributed.addAttribute(
-              .font, value: NSFontManager.shared.convert(font, toHaveTrait: .italicFontMask),
-              range: range)
-          }
-        }
-      case .strike: attributes[.strikethroughStyle] = NSUnderlineStyle.single.rawValue
-      case .code:
-        attributes[.font] = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-        attributes[.backgroundColor] = Design.line.withAlphaComponent(0.45)
-      case .quote:
-        let style = NSMutableParagraphStyle()
-        style.lineSpacing = paragraph.lineSpacing
-        style.headIndent = 16
-        style.firstLineHeadIndent = 16
-        attributes[.paragraphStyle] = style
-        attributes[.foregroundColor] = Design.muted
-      case .link(let destination):
-        if let url = URL(string: destination, relativeTo: current?.url.deletingLastPathComponent()),
-          ["http", "https", "mailto", "file"].contains(url.scheme?.lowercased() ?? "")
-        {
-          attributes[.link] = url.absoluteURL
-        }
-      case .list(let depth):
-        let style = NSMutableParagraphStyle()
-        style.headIndent = CGFloat(max(0, depth - 2) * 8 + 18)
-        style.paragraphSpacing = 2
-        attributes[.paragraphStyle] = style
-      case .cell(let id, let row, let column, let columns):
-        let table = tables[id] ?? NSTextTable()
-        table.numberOfColumns = columns
-        table.layoutAlgorithm = .fixedLayoutAlgorithm
-        table.setValue(100, type: .percentageValueType, for: .width)
-        tables[id] = table
-        let block = NSTextTableBlock(
-          table: table, startingRow: row, rowSpan: 1, startingColumn: column, columnSpan: 1)
-        block.setWidth(5, type: .absoluteValueType, for: .padding)
-        block.setWidth(0.5, type: .absoluteValueType, for: .border)
-        block.setBorderColor(Design.line)
-        if row == 0 {
-          block.backgroundColor = Design.line.withAlphaComponent(0.4)
-          attributes[.font] = Design.font(12, .semibold)
-        }
-        let style = NSMutableParagraphStyle()
-        style.textBlocks = [block]
-        attributes[.paragraphStyle] = style
+        code.addAttribute(.foregroundColor, value: color, range: span.range)
       }
-      attributed.addAttributes(attributes, range: span.range)
+      attributed = code
     }
     textView.textStorage?.setAttributedString(attributed)
     textView.setSelectedRange(NSRange(location: 0, length: 0))
@@ -394,21 +337,6 @@ final class DocumentPreview: Surface, NSTextViewDelegate {
     layoutSubtreeIfNeeded()
     textScroll.contentView.scroll(to: .zero)
     textScroll.reflectScrolledClipView(textScroll.contentView)
-  }
-
-  private static func syntaxColor(_ capture: String) -> NSColor {
-    let family = capture.split(separator: ".").first.map(String.init) ?? capture
-    return switch family {
-    case "comment": Design.color(Design.dark ? 0x9ba891 : 0x78836b)
-    case "string", "character": Design.color(Design.dark ? 0xeda4a4 : 0x9b3434)
-    case "keyword", "include", "conditional", "repeat", "exception": Design.color(Design.dark ? 0xe8a4dc : 0x9a328d)
-    case "number", "float", "boolean", "constant": Design.color(Design.dark ? 0xbfa5f0 : 0x7653b5)
-    case "type", "constructor", "namespace", "module": Design.color(Design.dark ? 0x85c9d7 : 0x236e80)
-    case "function", "method": Design.color(Design.dark ? 0x8abaf0 : 0x2462a6)
-    case "property", "field", "attribute", "tag", "label": Design.color(Design.dark ? 0xdec185 : 0x8b6518)
-    case "operator", "punctuation": Design.muted
-    default: Design.text
-    }
   }
 
   func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
@@ -504,6 +432,25 @@ private final class CodeLineGutter: Surface {
       value.draw(
         at: NSPoint(x: bounds.width - value.size(withAttributes: attributes).width - 9, y: y + 2),
         withAttributes: attributes)
+    }
+  }
+}
+
+@MainActor
+extension Design {
+  /// Tree-sitter capture colors shared by code previews and Markdown code blocks.
+  static func syntaxColor(_ capture: String) -> NSColor {
+    let family = capture.split(separator: ".").first.map(String.init) ?? capture
+    return switch family {
+    case "comment": Design.color(Design.dark ? 0x9ba891 : 0x78836b)
+    case "string", "character": Design.color(Design.dark ? 0xeda4a4 : 0x9b3434)
+    case "keyword", "include", "conditional", "repeat", "exception": Design.color(Design.dark ? 0xe8a4dc : 0x9a328d)
+    case "number", "float", "boolean", "constant": Design.color(Design.dark ? 0xbfa5f0 : 0x7653b5)
+    case "type", "constructor", "namespace", "module": Design.color(Design.dark ? 0x85c9d7 : 0x236e80)
+    case "function", "method": Design.color(Design.dark ? 0x8abaf0 : 0x2462a6)
+    case "property", "field", "attribute", "tag", "label": Design.color(Design.dark ? 0xdec185 : 0x8b6518)
+    case "operator", "punctuation": Design.muted
+    default: Design.text
     }
   }
 }

@@ -41,6 +41,12 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>NSBluetoothAlwaysUsageDescription</key><string>Crawler shows your paired Bluetooth devices and their connection status in System Settings.</string>
 <key>NSLocalNetworkUsageDescription</key><string>Crawler discovers nearby AirDrop devices so you can choose where to send files.</string>
 <key>NSBonjourServices</key><array><string>_airdrop._tcp</string></array>
+<key>CFBundleDocumentTypes</key><array><dict>
+  <key>CFBundleTypeName</key><string>Folder</string>
+  <key>CFBundleTypeRole</key><string>Viewer</string>
+  <key>LSHandlerRank</key><string>None</string>
+  <key>LSItemContentTypes</key><array><string>public.folder</string></array>
+</dict></array>
 <key>NSPrincipalClass</key><string>NSApplication</string>
 <key>CFBundleIconFile</key><string>CrawlerCabinet</string>
 </dict></plist>

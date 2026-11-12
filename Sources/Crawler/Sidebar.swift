@@ -30,8 +30,13 @@ final class SidebarView: Surface {
       ]),
     ]
   }
-  let scroll = NSScrollView(), content = Surface(), storage = Surface()
+  let scroll = NSScrollView(), content = SidebarDropArea(), storage = Surface()
   var eject: ((MountedVolume) -> Void)?
+  /// Files dropped on a folder or drive row, to be copied into that folder.
+  var drop: (([URL], FolderID) -> Void)? {
+    get { content.drop }
+    set { content.drop = newValue }
+  }
   var choosePin: (() -> Void)?
   var navigate: ((Location) -> Void)?, openSaved: ((Int) -> Void)?
   override init(frame: NSRect) {
@@ -52,6 +57,7 @@ final class SidebarView: Surface {
     applyMaterial(.sidebar)
     content.subviews.forEach { $0.removeFromSuperview() }
     storage.subviews.forEach { $0.removeFromSuperview() }
+    content.targets = []
     var y: CGFloat = 17
     func groupTitle(_ title: String) {
       let field = label(title, size: 10, weight: .semibold, color: Design.muted)
@@ -90,6 +96,7 @@ final class SidebarView: Surface {
           content.addSubview(eject)
         }
         content.addSubview(button)
+        if case .folder(let folder) = entry.location { content.targets.append((button, folder)) }
         if commandHeld && !entry.key.isEmpty {
           let hint = label(entry.key, size: 10, color: Design.muted)
           hint.alignment = .center
@@ -135,5 +142,53 @@ final class SidebarView: Surface {
     super.layout()
     scroll.frame = NSRect(x: 0, y: 0, width: bounds.width, height: bounds.height)
     storage.isHidden = true
+  }
+}
+
+/// Accepts files dragged onto folder and drive rows and outlines the row under the pointer.
+@MainActor
+final class SidebarDropArea: Surface {
+  var targets: [(button: ActionButton, folder: FolderID)] = []
+  var drop: (([URL], FolderID) -> Void)?
+  private var highlighted: ActionButton? {
+    didSet {
+      guard oldValue !== highlighted else { return }
+      oldValue?.layer?.borderWidth = 0
+      guard let highlighted else { return }
+      highlighted.wantsLayer = true
+      highlighted.layer?.cornerRadius = Design.square ? 0 : 5
+      highlighted.layer?.borderColor = Design.accent.cgColor
+      highlighted.layer?.borderWidth = 2
+    }
+  }
+  override init(frame: NSRect) {
+    super.init(frame: frame)
+    registerForDraggedTypes([.fileURL])
+  }
+  required init?(coder: NSCoder) { nil }
+
+  private func urls(_ sender: NSDraggingInfo) -> [URL] {
+    (sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
+  }
+  /// The folder row under the pointer, unless every dragged file already lives there.
+  private func target(_ sender: NSDraggingInfo) -> (button: ActionButton, folder: FolderID)? {
+    let point = convert(sender.draggingLocation, from: nil)
+    guard let target = targets.first(where: { $0.button.frame.contains(point) }) else { return nil }
+    let urls = urls(sender)
+    guard !urls.isEmpty, !urls.allSatisfy({ FolderID($0.deletingLastPathComponent().path) == target.folder }) else { return nil }
+    return target
+  }
+  override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { draggingUpdated(sender) }
+  override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+    highlighted = target(sender)?.button
+    return highlighted == nil ? [] : .copy
+  }
+  override func draggingExited(_ sender: NSDraggingInfo?) { highlighted = nil }
+  override func draggingEnded(_ sender: NSDraggingInfo) { highlighted = nil }
+  override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+    highlighted = nil
+    guard let target = target(sender) else { return false }
+    drop?(urls(sender), target.folder)
+    return true
   }
 }

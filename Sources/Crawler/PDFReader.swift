@@ -3,7 +3,7 @@ import UniformTypeIdentifiers
 
 /// Covers the workspace without replacing its tabs, search, selection, or scroll views.
 @MainActor
-final class PDFReader: Surface {
+final class PDFReader: Surface, WorkspaceReader {
   let file: FileItem
   let document = DocumentPreview()
   var close: (() -> Void)?
@@ -25,6 +25,7 @@ final class PDFReader: Surface {
   private let title = label("", size: 12, weight: .medium)
   private let hint = label("Esc twice to return", size: 11, color: Design.muted)
   private let closeButton = ActionButton("", symbol: "xmark", help: "Close PDF · Esc twice", action: {})
+  private let copyNameButton = ActionButton("", symbol: "doc.on.doc", help: "Copy file name", action: {})
   private var lastEscape: TimeInterval?
 
   init(file: FileItem) {
@@ -38,9 +39,10 @@ final class PDFReader: Surface {
     title.toolTip = file.name
     closeButton.identifier = NSUserInterfaceItemIdentifier("close-pdf")
     closeButton.invoke = { [weak self] in self?.requestClose() }
+    copyNameButton.invoke = { [weak self] in self?.copyName() }
     tools.bottomLine = true
     for view in [document, header, tools] { addSubview(view) }
-    for view in [title, hint, closeButton] { header.addSubview(view) }
+    for view in [title, copyNameButton, hint, closeButton] { header.addSubview(view) }
     for view in [selectButton, highlightButton, underlineButton, noteButton, deleteButton, undoButton, redoButton,
       removeAllButton, annotationStatus, saveAsButton, saveButton] { tools.addSubview(view) }
     selectButton.invoke = { [weak self] in self?.document.pdf?.chooseTool(.select) }
@@ -104,7 +106,10 @@ final class PDFReader: Surface {
   override func layout() {
     super.layout()
     header.frame = NSRect(x: 0, y: 0, width: bounds.width, height: 48)
-    title.frame = NSRect(x: 88, y: 15, width: max(0, bounds.width - 340), height: 20)
+    // The copy button follows the name; a long name truncates before it.
+    let titleWidth = min(ceil(title.attributedStringValue.size().width) + 4, max(0, bounds.width - 376))
+    title.frame = NSRect(x: 88, y: 15, width: titleWidth, height: 20)
+    copyNameButton.frame = NSRect(x: 88 + titleWidth + 4, y: 9, width: 30, height: 30)
     hint.frame = NSRect(x: bounds.width - 236, y: 15, width: 176, height: 20)
     closeButton.frame = NSRect(x: bounds.width - 46, y: 8, width: 32, height: 32)
     tools.frame = NSRect(x: 0, y: 48, width: bounds.width, height: 40)
@@ -159,6 +164,19 @@ final class PDFReader: Surface {
       : pdf == nil ? "Loading PDF…" : "Annotations unavailable"
     title.stringValue = (session?.url.lastPathComponent ?? file.name) + (session?.isDirty == true ? " •" : "")
     title.toolTip = session?.url.lastPathComponent ?? file.name
+    needsLayout = true
+  }
+
+  /// Copies the file name with its extension, then briefly shows a checkmark.
+  private func copyName() {
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(document.pdf?.annotations.url.lastPathComponent ?? file.name, forType: .string)
+    copyNameButton.image = Design.symbol("checkmark")
+    copyNameButton.toolTip = "Copied"
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+      self?.copyNameButton.image = Design.symbol("doc.on.doc")
+      self?.copyNameButton.toolTip = "Copy file name"
+    }
   }
 
   func undoAnnotation() {
@@ -267,44 +285,66 @@ final class PDFReader: Surface {
   }
 }
 
+/// A full-window document view that temporarily covers the workspace.
+@MainActor
+protocol WorkspaceReader: NSView {
+  var close: (() -> Void)? { get set }
+  func handleKey(_ event: NSEvent) -> Bool
+  /// A click elsewhere interrupts a pending double-Escape.
+  func cancelEscape()
+}
+
 extension Workspace {
-  func showPDF(_ url: URL, succeeded: (() -> Void)? = nil) {
-    guard pdfReader == nil else { return }
+  /// Cover the workspace with `reader`. Closing restores view visibility, focus and any
+  /// text selection after running `closed`.
+  func presentReader(_ reader: some WorkspaceReader, focus: NSResponder, closed: @escaping () -> Void) {
     previewWindow?.close()
     previewWindow = nil
-    let id = ItemID(rawValue: url.standardizedFileURL.path)
-    let preview = [filePalette.preview, previewPane, inspector].first { $0.item?.id == id }
-    let file = preview?.item ?? library.item(id) ?? FileItem(
-      id: id, name: url.lastPathComponent, parent: FolderID(url.deletingLastPathComponent().path),
-      kind: .document(.pdf), bytes: nil, modified: nil, created: nil)
     let visibility = subviews.map { (view: $0, hidden: $0.isHidden) }
     let responder = window?.firstResponder
     let editor = responder as? NSTextView
     let returnResponder = editor?.isFieldEditor == true ? editor?.delegate as? NSResponder : responder
     let selectedRange = editor?.selectedRange()
-    let reader = PDFReader(file: file)
-    pdfReader = reader
-    reader.close = { [weak self, weak reader, weak returnResponder, weak preview] in
-      guard let self, let reader, self.pdfReader === reader else { return }
-      let savedElsewhere = reader.document.pdf?.annotations.url.standardizedFileURL != file.url.standardizedFileURL
-      reader.document.stop()
+    self.reader = reader
+    reader.close = { [weak self, weak reader, weak returnResponder] in
+      guard let self, let reader, self.reader === reader else { return }
+      closed()
       reader.removeFromSuperview()
-      self.pdfReader = nil
+      self.reader = nil
       for (view, hidden) in visibility { view.isHidden = hidden }
-      preview?.document.resumePDF()
-      if savedElsewhere {
-        preview?.document.stop()
-        preview?.document.configure(file, coalesceSelection: false)
-      }
       self.window?.makeFirstResponder(returnResponder ?? self)
       if let selectedRange, let editor = self.window?.firstResponder as? NSTextView {
         editor.setSelectedRange(selectedRange)
       }
       self.onChange?()
     }
+    addSubview(reader, positioned: .above, relativeTo: nil)
+    needsLayout = true
+    layoutSubtreeIfNeeded()
+    window?.makeFirstResponder(focus)
+  }
+
+  func showPDF(_ url: URL, succeeded: (() -> Void)? = nil) {
+    guard reader == nil else { return }
+    let id = ItemID(rawValue: url.standardizedFileURL.path)
+    let preview = [filePalette.preview, previewPane, inspector].first { $0.item?.id == id }
+    let file = preview?.item ?? library.item(id) ?? FileItem(
+      id: id, name: url.lastPathComponent, parent: FolderID(url.deletingLastPathComponent().path),
+      kind: .document(.pdf), bytes: nil, modified: nil, created: nil)
+    let reader = PDFReader(file: file)
+    presentReader(reader, focus: reader) { [weak reader, weak preview] in
+      guard let reader else { return }
+      let savedElsewhere = reader.document.pdf?.annotations.url.standardizedFileURL != file.url.standardizedFileURL
+      reader.document.stop()
+      preview?.document.resumePDF()
+      if savedElsewhere {
+        preview?.document.stop()
+        preview?.document.configure(file, coalesceSelection: false)
+      }
+    }
     var recorded = false
     reader.document.didChange = { [weak self, weak reader] in
-      guard let self, let reader, self.pdfReader === reader else { return }
+      guard let self, let reader, self.reader === reader else { return }
       reader.updateAnnotationControls()
       if reader.document.state == "pdf", !recorded {
         recorded = true
@@ -314,10 +354,6 @@ extension Workspace {
       }
       self.onChange?()
     }
-    addSubview(reader, positioned: .above, relativeTo: nil)
-    needsLayout = true
-    layoutSubtreeIfNeeded()
-    window?.makeFirstResponder(reader)
     reader.document.configure(file, coalesceSelection: false, reusingPDF: preview?.document, presentation: .reader)
     preview?.document.suspendPDF()
     onChange?()

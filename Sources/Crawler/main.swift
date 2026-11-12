@@ -41,6 +41,23 @@ final class AppMenuItem: NSMenuItem {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
   var window: NSWindow?
   var workspace: Workspace?
+  /// URLs delivered before the workspace exists (cold launch through `open`).
+  private var pendingURLs: [URL] = []
+  /// Folders and files sent by `open`, the `crawler` CLI, Finder or the Dock icon.
+  /// Folders open in the workspace; files follow the normal Enter policy.
+  func application(_ sender: NSApplication, open urls: [URL]) {
+    guard let workspace else { pendingURLs += urls; return }
+    for url in urls {
+      let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey])
+      if values?.isDirectory == true, values?.isPackage != true {
+        workspace.navigate(.folder(FolderID(url.path)))
+      } else {
+        workspace.openFile(url)
+      }
+    }
+    window?.makeKeyAndOrderFront(nil)
+    NSApp.activate(ignoringOtherApps: true)
+  }
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSApp.setActivationPolicy(.regular)
     Design.applyAppearance()
@@ -89,6 +106,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
       if let query = self.argument("--find") {
         self.workspace?.showFileSearch(query: query,
           root: self.argument("--search-root").map { FolderID($0) } ?? .home)
+      }
+      if let path = self.argument("--open") {
+        self.workspace?.openFile(URL(fileURLWithPath: (path as NSString).expandingTildeInPath))
+      }
+      if !self.pendingURLs.isEmpty {
+        self.application(NSApp, open: self.pendingURLs)
+        self.pendingURLs = []
       }
       if let path = self.argument("--snapshot") {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { self.saveSnapshot(path) }
@@ -163,6 +187,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
       "pdf_reader_frame": root.pdfReader.map { NSStringFromRect($0.frame) } ?? "",
       "pdf_reader_rendering": root.pdfReader?.document.pdfDiagnostics ?? [:],
       "pdf_reader_annotations": root.pdfReader?.document.pdf?.annotationDiagnostics ?? [:],
+      "markdown_reader_visible": root.markdownReader != nil,
+      "markdown_reader_path": root.markdownReader?.url.path ?? "",
+      "markdown_reader_state": root.markdownReader?.state ?? "closed",
+      "markdown_reader_load_ms": root.markdownReader?.loadMilliseconds ?? -1,
       "file_search_preview_path": root.filePalette.selectedFile?.id.rawValue ?? "",
       "file_search_root": root.filePalette.search.resultRoot?.rawValue ?? "",
       "file_search_mode": root.filePalette.search.mode == .computer ? "computer" : "folder",
@@ -328,6 +356,8 @@ if let index = CommandLine.arguments.firstIndex(of: "--benchmark-search-reload")
   }
   dispatchMain()
 }
+// Diagnostic flag values such as `--open <path>` must not also arrive as open-document events.
+UserDefaults.standard.register(defaults: ["NSTreatUnknownArgumentsAsOpen": "NO"])
 let app = CrawlerApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate

@@ -44,10 +44,15 @@ final class Workspace: Surface, NSTextFieldDelegate {
   let pathEditor = NSTextField()
   let toastView = Surface(), toastLabel = label("", size: 11)
   var toastTimer: Timer?
+  let copyPanel = CopyProgressPanel()
+  var copying: FileCopyProgress?
   var isEditingPath = false
   var popover: NSPopover?
   var previewWindow: NSPanel?
-  var pdfReader: PDFReader?
+  /// The full-window PDF or Markdown reader covering the workspace, if one is open.
+  var reader: (any WorkspaceReader)?
+  var pdfReader: PDFReader? { reader as? PDFReader }
+  var markdownReader: MarkdownReader? { reader as? MarkdownReader }
   private var lastTheme: Theme = .cupertino
   private var lastSidebarState = ""
   private var rowCache: [FileItem] = []
@@ -88,8 +93,9 @@ final class Workspace: Surface, NSTextFieldDelegate {
       self.render()
     }
     for view in [
-      titlebar, navigation, commands, page, guidance, paneHost, sidebar, utility, toastView,
+      titlebar, navigation, commands, page, guidance, paneHost, sidebar, utility, copyPanel, toastView,
     ] { addSubview(view) }
+    copyPanel.isHidden = true
     titlebar.bottomLine = true
     navigation.bottomLine = false
     commands.bottomLine = false
@@ -124,6 +130,7 @@ final class Workspace: Surface, NSTextFieldDelegate {
       if self.mountedVolumes.containing(destination.folder) != nil { self.mode = .list; self.funnelFolder = nil }
       self.navigate(destination)
     }
+    sidebar.drop = { [weak self] urls, folder in self?.copy(urls, to: folder) }
     sidebar.eject = { [weak self] volume in
       Task { [weak self] in
         let error = await Task.detached(priority: .userInitiated) { () -> String? in
@@ -200,7 +207,7 @@ final class Workspace: Surface, NSTextFieldDelegate {
       guard let self else { return }
       if reveal { self.navigate(.folder(file.parent)); self.filePalette.selectPath(file.url, isFolder: false) }
       else {
-        if PreviewFormat.forURL(file.url) != .pdf { self.filePalette.close() }
+        if !PreviewFormat.forURL(file.url).opensInReader { self.filePalette.close() }
         self.openFile(file.url)
       }
     }
@@ -228,7 +235,7 @@ final class Workspace: Surface, NSTextFieldDelegate {
     }
     paletteClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
       guard let self, event.window === self.window else { return event }
-      if let reader = self.pdfReader { reader.cancelEscape(); return event }
+      if let reader = self.reader { reader.cancelEscape(); return event }
       let point = self.convert(event.locationInWindow, from: nil)
       if self.palette.isPresented && !self.palette.frame.contains(point) { self.palette.close() }
       if self.filePalette.isPresented && !self.filePalette.embedded && !self.filePalette.frame.contains(point) { self.filePalette.close() }
@@ -399,7 +406,11 @@ final class Workspace: Surface, NSTextFieldDelegate {
     openFile(f.url)
   }
   func openFile(_ url: URL, succeeded: (() -> Void)? = nil) {
-    if PreviewFormat.forURL(url) == .pdf { showPDF(url, succeeded: succeeded); return }
+    switch PreviewFormat.forURL(url) {
+    case .pdf: showPDF(url, succeeded: succeeded); return
+    case .markdown, .document: showMarkdown(url, succeeded: succeeded); return
+    case .text, .video, .thumbnail: break
+    }
     FileOpening.shared.open(url) { [weak self] outcome in
       switch outcome {
       case .opened(let notice):
@@ -750,13 +761,15 @@ final class Workspace: Surface, NSTextFieldDelegate {
         x: 2 * width, y: 0, width: mainW - 2 * width, height: paneHost.bounds.height)
     }
     pathEditor.frame = NSRect(x: 111, y: 14, width: max(100, mainW - 140), height: 28)
-    toastView.frame = NSRect(x: max(side + 16, w / 2 - 225), y: h - 66, width: 450, height: 43)
+    // A running copy keeps the bottom slot; toasts stack above it.
+    copyPanel.frame = NSRect(x: max(side + 16, w / 2 - 225), y: h - 81, width: 450, height: 58)
+    toastView.frame = NSRect(x: max(side + 16, w / 2 - 225), y: h - (copyPanel.isHidden ? 66 : 132), width: 450, height: 43)
     toastLabel.frame = NSRect(x: 14, y: 13, width: 350, height: 19)
     let sheetHeight = min(shortcuts.preferredHeight, h - 76)
     shortcuts.frame = NSRect(
       x: max(12, w - 362), y: h - sheetHeight - 18, width: 344, height: sheetHeight)
     layoutFlexibleControls()
-    if let reader = pdfReader {
+    if let reader {
       for view in subviews where view !== reader { view.isHidden = true }
       reader.frame = bounds
       addSubview(reader, positioned: .above, relativeTo: nil)
@@ -1139,7 +1152,7 @@ final class Workspace: Surface, NSTextFieldDelegate {
         render()
       }
     } else {
-      if PreviewFormat.forURL(url) != .pdf { filePalette.close() }
+      if !PreviewFormat.forURL(url).opensInReader { filePalette.close() }
       openFile(url) { [weak self] in
         guard let self, self.filePalette.search.resultRoot == root else { return }
         self.filePalette.search.recordOpen(hit)
@@ -1148,7 +1161,7 @@ final class Workspace: Surface, NSTextFieldDelegate {
   }
 
   func handleKey(_ event: NSEvent) -> Bool {
-    if let reader = pdfReader { return reader.handleKey(event) }
+    if let reader { return reader.handleKey(event) }
     let modifiers = event.modifierFlags
     let command = modifiers.contains(.command)
     let key = event.charactersIgnoringModifiers?.lowercased() ?? ""

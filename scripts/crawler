@@ -1,0 +1,11 @@
+#!/bin/sh
+# Opens a folder (default: the current one) or a file in Crawler.
+# Usage: crawler [path]
+# Works whether Crawler is running or not. Install with:
+#   ln -s "$PWD/scripts/crawler" ~/.local/bin/crawler
+target="${1:-.}"
+if [ ! -e "$target" ]; then
+  echo "crawler: $target: no such file or directory" >&2
+  exit 1
+fi
+exec open -b studio.crawler.native-prototype -- "$target"

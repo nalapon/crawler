@@ -53,8 +53,11 @@ Paths in the table are relative to `Sources/Crawler/` unless stated otherwise.
 | `FFFSearch.swift`, `SearchPaths.swift`, `Sources/FFFBridge/engine.rs` | FFF C ABI, immutable/mapped path snapshots, matching, ranking and highlights. |
 | `SearchPerformance.swift` | Numeric search-stage tracing and first title draw diagnostics. |
 | `FileSearch.swift` | Retained Spotlight backend, outside the current FFF search UI. |
+| `FileCopy.swift` | Drag-and-drop copies with copyfile(3) byte progress and cancellation. |
 | `FileOpening.swift`, `EditorPicker.swift` | Installed editor discovery, shared opening policy and recent-file history. |
 | `PreviewPane.swift`, `DocumentPreview.swift`, `PreviewContent.swift`, `MarkdownPreview.swift` | Shared previews, metadata, bounded text reads, Tree-sitter and native Markdown rendering. |
+| `MarkdownReader.swift` | Full-window Markdown reader. |
+| `WordDocument.swift` | Word Open XML to Markdown conversion for the read-only Markdown reader. |
 | `PDFReader.swift`, `NativePDFView.swift`, `PDFRendering.swift` | Full-window PDF reader, retained page layers and actor-owned Core Graphics rasterization/text/link metadata. |
 | `PDFAnnotations.swift`, `PDFNoteEditor.swift` | Shared annotation editing/undo/save state and native note popovers. |
 | `VideoPreview.swift`, `Sources/VideoFallback/` | AVFoundation playback and on-demand VLCKit fallback. |
@@ -131,7 +134,7 @@ Command-Shift-P opens the command palette for navigation, selected-file actions,
 
 Code, Markdown, plain text, PDFs and video share `DocumentPreview` between panes and the Space window. Keep file reads, Markdown parsing and Tree-sitter work off the main actor, bounded and cancellation-aware. `QLThumbnailGenerator` provides asynchronous fallbacks for other formats; missing thumbnails show real metadata and an icon.
 
-Enter/double-click and search activation open PDFs in `PDFReader` inside the Crawler window. X, two consecutive non-repeated Escape presses within 700 ms, or Command-W restore the existing workspace and focus. Reuse an already loaded preview's `PDFSource` and bitmap cache; otherwise read only the selected PDF in the background. Suspend hidden previews while the reader or Space window is open. Space opens the shared native renderer in a resizable window and closes with Space or Escape.
+Enter/double-click and search activation open PDFs in `PDFReader` inside the Crawler window. X, two consecutive non-repeated Escape presses within 700 ms, or Command-W restore the existing workspace and focus. The header button beside the title copies the file name with its extension. Reuse an already loaded preview's `PDFSource` and bitmap cache; otherwise read only the selected PDF in the background. Suspend hidden previews while the reader or Space window is open. Space opens the shared native renderer in a resizable window and closes with Space or Escape.
 
 `NativePDFView` composites retained page layers. `PDFRasterizer` owns Core Graphics parsing/rasterization and PDFKit metadata/editing on its actor. PDFKit supplies text, selection, links and annotation serialization; never restore PDFView or PDFKit page rendering. Read only the first page geometry before initial display, estimate unread layout slots, and resolve them near the viewport. Retain visible surfaces plus one neighboring page on each side, cap the worker bitmap cache at 128 MiB and use bounded crops at large zoom levels. Do not eagerly parse or rasterize a long PDF.
 
@@ -139,7 +142,11 @@ PDF tools stay active between strokes. Choose Highlight, Underline or Note, then
 
 Command-S saves annotations into the PDF; Shift-Command-S saves a copy. Closing the reader/window or quitting must handle unsaved changes and in-flight operations. Failed saves retain edits. Detect external file changes before replacing the original; require Save As on conflict. Encrypted PDFs and those that disallow annotations remain read-only. Text tools require a text layer; there is no OCR or editing of the underlying document text.
 
-Code, Markdown and plain text open through `FileOpening` and the chosen installed editor; other formats use macOS defaults. Crawler Settings and the Open dropdown share `defaultTextEditorBundleID`. Discover app declarations in the background; do not hard-code editors or modify global file associations. Record recent-file history only after a successful open/display.
+Enter/double-click and search activation open Markdown in `MarkdownReader` inside the Crawler window, sharing the PDF reader's cover/restore path (`presentReader`) and close keys. It reads up to 4 MB through `PreviewTextLoader` with the `.reader` budget; panes keep the 256 KB `.preview` budget. `MarkdownStyle` styles both from the same semantic spans; only the typography differs. The reader centers a column of about 70 characters. It embeds local images (at most 48, downsampled off the main actor) and never fetches remote ones. `#fragment` links scroll to GitHub-style heading slugs, and links to other Markdown files open in the reader with Command-[ to go back. Command-F finds, the header zoom buttons, a trackpad pinch and Command-plus/minus/0 zoom in 10% steps from 70% to 200%, reflowing the text (persisted as `markdownReaderScale`), and E or Open in editor hands the file to the chosen editor. Raw HTML never runs: inline tags are dropped, comments hidden and other HTML blocks shown as source.
+
+Enter/double-click and search activation open Word documents (`.docx`, `.docm`, `.dotx`) read-only in `MarkdownReader`: `WordDocument` reads the package parts with the system `unzip` inside `PreviewTextLoader` and converts headings (Title and heading styles), bold, italics, strikethrough, lists, tables and external links to Markdown, so zoom, column, find and themes match Markdown. Fonts, colors, images and page layout are dropped. Panes keep the Quick Look thumbnail. E or Open in app opens the original in its default app. `.doc`, `.odt` and `.pages` still open in their default app.
+
+Code and plain text open through `FileOpening` and the chosen installed editor; other formats use macOS defaults. Crawler Settings and the Open dropdown share `defaultTextEditorBundleID`. Discover app declarations in the background; do not hard-code editors or modify global file associations. Record recent-file history only after a successful open/display.
 
 ## Video previews
 
@@ -147,7 +154,7 @@ Code, Markdown and plain text open through `FileOpening` and the chosen installe
 
 ## Connected volumes
 
-`MountedVolumes.swift` discovers browsable mounted volumes off the main actor and observes macOS mount/unmount/rename notifications. Locations shows these volumes directly, excluding the startup and hidden system volumes. Clicking a drive opens the existing folder-and-preview funnel. The default query scope is that drive, retained across folder navigation and tabs; `$` still narrows to the current folder. Empty queries restore immediate directory browsing. The selected volume is indexed progressively through the existing resident fuzzy matcher; its supplementary batches replace duplicate Mac-cache coverage during drive searches. Native ejection reports errors and never forces an unmount.
+`MountedVolumes.swift` discovers browsable mounted volumes off the main actor and observes macOS mount/unmount/rename notifications. Locations shows these volumes directly, excluding the startup and hidden system volumes. Clicking a drive opens the existing folder-and-preview funnel. The default query scope is that drive, retained across folder navigation and tabs; `$` still narrows to the current folder. Empty queries restore immediate directory browsing. The selected volume is indexed progressively through the existing resident fuzzy matcher; its supplementary batches replace duplicate Mac-cache coverage during drive searches. Native ejection reports errors and never forces an unmount. Dragging search results, recent files or folder rows onto a sidebar folder or drive copies them there in the background (`FileCopy.swift`) without changing the view. A bottom card shows byte progress and Cancel; one copy runs at a time. Existing names are skipped, never replaced (`COPYFILE_EXCL`), and a cancelled or failed item removes only its own partial target. Read-only volumes, such as NTFS drives that macOS mounts read-only, are reported before copying. Drags to other apps offer only copy, never move.
 
 ## Background sizes
 
@@ -199,15 +206,17 @@ open -n "$PWD/build/Crawler.app" --args \
 
 Existing diagnostics:
 
+- `scripts/crawler [path]` sends a folder or file to Crawler through `open`, launched or already running. `AppDelegate.application(_:open:)` navigates folders and opens files with the Enter policy; `CFBundleDocumentTypes` declares folders with rank None, so Crawler never becomes the default folder handler.
 - `--folder <absolute-path>` changes the initial Home workspace to that directory.
 - `--find <query>` opens/focuses search with an initial query.
+- `--open <absolute-path>` opens a file at launch through the normal Enter policy, including the PDF and Markdown readers. Combine it with `--snapshot` to check reader rendering without driving the UI.
 - `--search-root <absolute-path>` sets the initial browsing/local-search context for diagnostics. This Mac still uses the `/` index; use `$` folder mode to constrain a disposable search.
 - `--search-workers N` overrides the bounded matching worker count.
 - `--activity` and `--settings` launch directly into those utility workspaces.
 - `--snapshot <path>` saves an app-side startup screenshot; `--quit-after <seconds>` exits automatically.
 - `--event-log <existing-path>` appends state JSON when state reporting is active.
 
-State reports include search status/results/selection, query/index/cache timing, preview readiness, PDF rendering/annotation state and Activity Monitor samples. Reports can contain private paths and filenames; keep them local. `scripts/benchmark-startup.py` measures app-side window readiness, not asynchronous directory loading or compositor presentation. Do not claim cold-disk results from warm files or infer FPS from callback timers. Profile normal launches without state/event writes or accessibility polling during capture.
+State reports include search status/results/selection, query/index/cache timing, preview readiness, PDF rendering/annotation state, Markdown reader state/load time and Activity Monitor samples. Reports can contain private paths and filenames; keep them local. `scripts/benchmark-startup.py` measures app-side window readiness, not asynchronous directory loading or compositor presentation. Do not claim cold-disk results from warm files or infer FPS from callback timers. Profile normal launches without state/event writes or accessibility polling during capture.
 
 ## PDF performance
 

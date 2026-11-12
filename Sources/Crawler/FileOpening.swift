@@ -170,7 +170,7 @@ final class FileOpening: NSObject {
     }
     return switch PreviewFormat.forURL(url) {
     case .text, .markdown: true
-    case .pdf, .video, .thumbnail: false
+    case .pdf, .video, .document, .thumbnail: false
     }
   }
   func open(_ url: URL, completion: @escaping @MainActor (Outcome) -> Void) {

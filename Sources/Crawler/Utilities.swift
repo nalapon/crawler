@@ -121,7 +121,7 @@ extension Workspace {
     }
     let frame = NSRect(x: 0, y: 0, width: 640, height: 720)
     let preview: NSView
-    if PreviewFormat.forURL(file.url) == .thumbnail {
+    if PreviewFormat.forURL(file.url).usesQuickLook {
       guard let fallback = QLPreviewView(frame: frame, style: .normal) else { return }
       fallback.previewItem = file.url as NSURL
       fallback.autostarts = true
