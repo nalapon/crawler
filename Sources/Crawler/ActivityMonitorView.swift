@@ -31,10 +31,9 @@ final class ActivityMonitorView: Surface, NSTableViewDataSource, NSTableViewDele
   private var mapFocused = false
   private var pendingG = false
   var didChange: (() -> Void)?
-  private let heading = label("Activity Monitor", size: 25, weight: .semibold)
   private let summary = label("Reading processes…", size: 12)
-  private let listTitle = label("Applications & processes", size: 14, weight: .semibold)
-  private let mapTitle = label("Memory by application", size: 14, weight: .semibold)
+  private let listTitle = PaneTitle()
+  private let mapTitle = PaneTitle()
   private let mapHint = label("Area = physical footprint · Double-click to explore", size: 11)
   private let filter = NSSearchField()
   private let table = ActivityProcessTable()
@@ -46,15 +45,19 @@ final class ActivityMonitorView: Surface, NSTableViewDataSource, NSTableViewDele
   private let detailValues = label("", size: 12)
   private let detailPath = label("", size: 11)
   private let boundary = label("Process breakdown. Libraries inside a process require a runtime profiler.", size: 11)
-  private let keys = label("j/k Move   Tab Panel   Enter/l Expand/explore   h Collapse/back   / Filter   Space Pause   ⌘I Inspect   ⌘⌫ Quit process   1/2/3 Map   m/c/d Sort", size: 11)
+  /// Key hints for the window's status bar.
+  let hints = "j/k Move    Tab Panel    Enter/l Expand/explore    h Collapse/back    / Filter    Space Pause    ⌘I Inspect    ⌘⌫ Quit process    1/2/3 Map    m/c/d Sort"
   private lazy var pause = ActionButton("Pause", symbol: "pause", help: "Freeze the current sample · Space") { [weak self] in self?.togglePause() }
   private lazy var back = ActionButton("All applications", symbol: "chevron.left", help: "Go up one level · h") { [weak self] in self?.goBack() }
   private let metrics = NSSegmentedControl(labels: ActivityMetric.allCases.map(\.rawValue), trackingMode: .selectOne, target: nil, action: nil)
 
   override init(frame: NSRect) {
     super.init(frame: frame)
-    for view in [heading, summary, pause, listPanel, mapPanel, keys] { addSubview(view) }
-    for view in [listTitle, filter, scroll] { listPanel.addSubview(view) }
+    listTitle.title = "Applications & processes"
+    mapTitle.title = "Memory by application"
+    listTitle.active = true
+    for view in [summary, filter, pause, listPanel, mapPanel] { addSubview(view) }
+    for view in [listTitle, scroll] { listPanel.addSubview(view) }
     for view in [mapTitle, metrics, back, mapHint, map, detailTitle, detailValues, detailPath, boundary] { mapPanel.addSubview(view) }
     filter.placeholderString = "Filter processes · /"
     filter.delegate = self
@@ -134,11 +137,10 @@ final class ActivityMonitorView: Surface, NSTableViewDataSource, NSTableViewDele
     appliedTheme = Design.theme
     table.backgroundColor = Design.background
     fill = Design.background; listPanel.fill = Design.background; mapPanel.fill = Design.background
-    for field in [heading, listTitle, mapTitle, detailTitle] { field.textColor = Design.text }
-    heading.font = Design.font(25, .semibold)
-    for field in [listTitle, mapTitle] { field.font = Design.font(14, .semibold) }
+    detailTitle.textColor = Design.text
+    for title in [listTitle, mapTitle] { title.needsDisplay = true }
     detailTitle.font = Design.font(13, .semibold)
-    for field in [summary, mapHint, detailPath, boundary, keys] { field.textColor = Design.muted; field.font = Design.font(field === summary ? 12 : 11) }
+    for field in [summary, mapHint, detailPath, boundary] { field.textColor = Design.muted; field.font = Design.font(field === summary ? 12 : 11) }
     detailValues.textColor = Design.text; detailValues.font = Design.font(12)
     filter.font = Design.font(12); metrics.font = Design.font(11)
     for button in [pause, back] { button.font = Design.font(11); button.contentTintColor = Design.text }
@@ -297,7 +299,7 @@ final class ActivityMonitorView: Surface, NSTableViewDataSource, NSTableViewDele
     scope = valid
     if let parent = scope.last { nodes = ActivityMapNode.limited(nodes, parent: parent) }
     map.update(nodes: nodes, metric: mapMetric, showChildren: !scope.isEmpty)
-    setText(mapTitle, title)
+    if mapTitle.title != title { mapTitle.title = title }
     let backTitle = scope.isEmpty ? "All applications" : "Back · \(scope.count) level\(scope.count == 1 ? "" : "s")"
     if back.title != backTitle { back.title = backTitle }
     if back.isEnabled != !scope.isEmpty { back.isEnabled = !scope.isEmpty }
@@ -386,7 +388,11 @@ final class ActivityMonitorView: Surface, NSTableViewDataSource, NSTableViewDele
     setText(detailPath, process.executable.isEmpty ? "Executable path unavailable" : process.executable)
     if detailPath.toolTip != detailPath.stringValue { detailPath.toolTip = detailPath.stringValue }
   }
-  private func updateFocus() { map.keyboardFocus = mapFocused; listPanel.needsDisplay = true; mapPanel.needsDisplay = true; needsDisplay = true }
+  private func updateFocus() {
+    map.keyboardFocus = mapFocused
+    listTitle.active = !mapFocused
+    mapTitle.active = mapFocused
+  }
   private func explore(_ node: ActivityMapNode) {
     guard !node.children.isEmpty else { return }
     scope.append(node.id); updateMap()
@@ -617,41 +623,38 @@ final class ActivityMonitorView: Surface, NSTableViewDataSource, NSTableViewDele
   override func layout() {
     super.layout()
     let w = bounds.width, h = bounds.height
-    heading.frame = NSRect(x: 24, y: 12, width: w - 150, height: 34)
-    summary.frame = NSRect(x: 24, y: 51, width: w - 48, height: 20)
-    pause.frame = NSRect(x: w - 112, y: 15, width: 88, height: 30)
-    let panelWidth = (w - 66) / 2, panelY: CGFloat = 91
-    let panelH = max(100, h - panelY - 44)
-    listPanel.frame = NSRect(x: 24, y: panelY, width: panelWidth, height: panelH)
-    mapPanel.frame = NSRect(x: 42 + panelWidth, y: panelY, width: panelWidth, height: panelH)
-    listTitle.frame = NSRect(x: 8, y: 8, width: panelWidth - 16, height: 22)
-    filter.frame = NSRect(x: 8, y: 43, width: listPanel.bounds.width - 16, height: 28)
-    scroll.frame = NSRect(x: 1, y: 83, width: listPanel.bounds.width - 2, height: panelH - 84)
+    // A toolbar row, then two flush panes whose title strips show which one has the keyboard.
+    summary.frame = NSRect(x: 16, y: 13, width: max(0, w - 420), height: 18)
+    filter.frame = NSRect(x: w - 380, y: 8, width: 260, height: 28)
+    pause.frame = NSRect(x: w - 108, y: 7, width: 92, height: 30)
+    let panelY: CGFloat = 44, panelH = max(100, h - panelY)
+    let panelWidth = floor(w / 2)
+    listPanel.frame = NSRect(x: 0, y: panelY, width: panelWidth, height: panelH)
+    mapPanel.frame = NSRect(x: panelWidth + 1, y: panelY, width: w - panelWidth - 1, height: panelH)
+    listTitle.frame = NSRect(x: 0, y: 0, width: panelWidth, height: PaneTitle.height)
+    scroll.frame = NSRect(x: 1, y: PaneTitle.height + 2, width: panelWidth - 2, height: panelH - PaneTitle.height - 2)
     let available = scroll.contentSize.width
-    let numeric = min(78, max(60, (available - 140) / 3))
+    let numeric = min(84, max(64, (available - 140) / 3))
     for column in table.tableColumns { column.width = column.identifier.rawValue == "name" ? max(110, available - numeric * 3) : numeric }
     let mw = mapPanel.bounds.width
-    mapTitle.frame = NSRect(x: 8, y: 8, width: max(90, mw - 204), height: 22)
-    metrics.frame = NSRect(x: mw - 194, y: 5, width: 186, height: 28)
-    back.frame = NSRect(x: 3, y: 41, width: mw - 12, height: 25); back.alignment = .left
-    mapHint.frame = NSRect(x: 8, y: 73, width: mw - 16, height: 18)
-    map.frame = NSRect(x: 5, y: 99, width: mw - 10, height: max(70, panelH - 223))
+    mapTitle.frame = NSRect(x: 0, y: 0, width: mw, height: PaneTitle.height)
+    metrics.frame = NSRect(x: mw - 190, y: 3, width: 182, height: 24)
+    back.frame = NSRect(x: 3, y: PaneTitle.height + 6, width: mw - 12, height: 25); back.alignment = .left
+    mapHint.frame = NSRect(x: 12, y: PaneTitle.height + 36, width: mw - 24, height: 18)
+    map.frame = NSRect(x: 8, y: PaneTitle.height + 60, width: mw - 16, height: max(70, panelH - PaneTitle.height - 184))
     let detailY = panelH - 116
-    detailTitle.frame = NSRect(x: 8, y: detailY, width: mw - 16, height: 22)
-    detailValues.frame = NSRect(x: 8, y: detailY + 27, width: mw - 16, height: 34)
+    detailTitle.frame = NSRect(x: 12, y: detailY, width: mw - 24, height: 22)
+    detailValues.frame = NSRect(x: 12, y: detailY + 27, width: mw - 24, height: 34)
     detailValues.maximumNumberOfLines = 2; detailValues.lineBreakMode = .byWordWrapping
-    detailPath.frame = NSRect(x: 8, y: detailY + 63, width: mw - 16, height: 18)
-    boundary.frame = NSRect(x: 8, y: detailY + 86, width: mw - 16, height: 28)
+    detailPath.frame = NSRect(x: 12, y: detailY + 63, width: mw - 24, height: 18)
+    boundary.frame = NSRect(x: 12, y: detailY + 86, width: mw - 24, height: 28)
     boundary.maximumNumberOfLines = 2; boundary.lineBreakMode = .byWordWrapping
-    keys.frame = NSRect(x: 24, y: h - 29, width: w - 48, height: 22)
   }
   override func draw(_ dirtyRect: NSRect) {
     super.draw(dirtyRect)
-    for (panel, focused) in [(listPanel, !mapFocused), (mapPanel, mapFocused)] {
-      (focused ? Design.accent : Design.line).setStroke()
-      let path = NSBezierPath(rect: panel.frame.insetBy(dx: -1, dy: -1))
-      path.lineWidth = focused ? 2 : 1; path.stroke()
-    }
+    (Design.classic ? NSColor.black : Design.line).setFill()
+    NSRect(x: 0, y: 43, width: bounds.width, height: 1).fill()
+    NSRect(x: listPanel.frame.maxX, y: 44, width: 1, height: bounds.height - 44).fill()
   }
   var diagnostics: [String: Any] {
     ["process_count": snapshot.processes.count, "unavailable": snapshot.unavailable, "paused": paused,

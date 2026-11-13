@@ -1,6 +1,7 @@
 import AppKit
 
-// Scope funnel is shared by the default workspace and the Columns search overlay.
+// The scope funnel shows the Search and Folders sections. The workspace saves its
+// ScopeSession for one section while the other is visible.
 @MainActor
 final class FileSearchPalette: Surface, NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate {
   let search = QuickFileSearch()
@@ -38,18 +39,22 @@ final class FileSearchPalette: Surface, NSTextFieldDelegate, NSTableViewDataSour
     guard let folder = browsingFolder else { return nil }
     return folderLibrary.item(folderSelections[folder])
   }
-  private let scope = label("", size: 11, weight: .medium)
-  private let status = label("", size: 10)
-  private let hint = label("", size: 10)
-  private let recentHeading = label("Recently opened", size: 12, weight: .semibold)
+  /// Search progress or errors, shown in the window's status bar.
+  private(set) var statusLine = ""
+  /// The key hints for the current focus, shown in the window's status bar.
+  private(set) var hintLine = ""
+  /// Title of the recent-files or results list, the pane that keyboard navigation drives.
+  private let listTitle = PaneTitle()
   private var recentFiles: [FileItem] = []
   private var recentTask: Task<Void, Never>?
   private var showingHome = false
   private var showingBrowser = false
   var openRecent: ((FileItem, Bool) -> Void)?
-  var isHome: Bool { search.isHome }
+  /// True while Folders lists the funnel's root itself, so Home shows that folder instead of recent files.
+  private var listsRoot = false
+  var isHome: Bool { search.isHome && !listsRoot }
   private let empty = label("", size: 12)
-  private let topRule = Surface(), bottomRule = Surface(), leftRule = Surface(), rightRule = Surface(), railRule = Surface()
+  private let topRule = Surface(), leftRule = Surface(), rightRule = Surface(), railRule = Surface()
   private let scroll = NSScrollView()
   private let table = SearchResultTable()
   private let scopes = ScopeRail(title: "Narrow the search")
@@ -120,7 +125,7 @@ final class FileSearchPalette: Surface, NSTextFieldDelegate, NSTableViewDataSour
     table.delegate = self
     table.target = self
     table.doubleAction = #selector(openSelection)
-    // Drags carry the file URL; other apps and the sidebar only ever copy it.
+    // Drags carry the file URL; other apps and the Folders places only ever copy it.
     table.setDraggingSourceOperationMask(.copy, forLocal: true)
     table.setDraggingSourceOperationMask(.copy, forLocal: false)
     table.setAccessibilityLabel("File search results")
@@ -135,13 +140,14 @@ final class FileSearchPalette: Surface, NSTextFieldDelegate, NSTableViewDataSour
     empty.alignment = .center
     empty.maximumNumberOfLines = 4
     empty.lineBreakMode = .byWordWrapping
-    scope.lineBreakMode = .byTruncatingMiddle
-    for view in [searchBorder, input, searchScopeHint, scope, scroll, status, hint, empty, topRule, bottomRule, scopes, context, preview, leftRule, rightRule, railRule, recentHeading, currentFolderPane, childFolderPane] { addSubview(view) }
+    listTitle.active = true
+    for view in [searchBorder, input, searchScopeHint, scroll, empty, topRule, scopes, context, preview, leftRule, rightRule, railRule, listTitle, currentFolderPane, childFolderPane] { addSubview(view) }
     folderLibrary.didChange = { [weak self] _ in
       guard let self else { return }
       if self.isBrowsing { self.updateFolderPanels() }
       else { self.updateSelectionPreview() }
     }
+    folderLibrary.didUpdateSize = { [weak self] item in self?.currentFolderPane.updateSize(item) }
     for pane in [currentFolderPane, childFolderPane] {
       pane.selectionChanged = { [weak self] id, folder, _ in
         guard let self, let folder else { return }
@@ -172,6 +178,7 @@ final class FileSearchPalette: Surface, NSTextFieldDelegate, NSTableViewDataSour
   deinit { recentTask?.cancel(); navigationTask?.cancel(); metadataTask?.cancel(); siblingTask?.cancel(); resultUpdateTask?.cancel() }
 
   func present(in folder: FolderID, query: String = "", focus: Bool = true) {
+    listsRoot = false
     selectedPath = nil
     chosenNeighbor = nil
     navigationTask?.cancel(); navigationError = nil
@@ -189,7 +196,7 @@ final class FileSearchPalette: Surface, NSTextFieldDelegate, NSTableViewDataSour
     if focus { focusInput() }
   }
   var session: ScopeSession? {
-    search.root.map { root in ScopeSession(searchMode: inputMode, computerScope: search.computerScope, volumeRoot: search.volumeRoot, root: root, scope: search.scope, query: input.stringValue,
+    search.root.map { root in ScopeSession(searchMode: inputMode, computerScope: search.computerScope, volumeRoot: search.volumeRoot, listsRoot: listsRoot, root: root, scope: search.scope, query: input.stringValue,
       selectedPath: isBrowsing ? browsingItem.map { String($0.url.path.dropFirst(root.rawValue == "/" ? 1 : root.rawValue.count + 1)) } : selectedPath ?? selectedHit?.entry.path, chosenNeighbor: chosenNeighbor, history: history, scroll: scroll.contentView.bounds.minY) }
   }
   func restore(_ session: ScopeSession) {
@@ -197,6 +204,7 @@ final class FileSearchPalette: Surface, NSTextFieldDelegate, NSTableViewDataSour
     navigationTask?.cancel(); navigationError = nil
     if search.root != session.root { present(in: session.root, focus: false) }
     isHidden = false; alphaValue = 1
+    listsRoot = session.listsRoot
     search.resume()
     search.setVolumeRoot(session.volumeRoot)
     search.setScope(session.scope)
@@ -229,8 +237,11 @@ final class FileSearchPalette: Surface, NSTextFieldDelegate, NSTableViewDataSour
     let root = search.root ?? .home
     if folder != root && !folder.rawValue.hasPrefix(root.rawValue == "/" ? "/" : root.rawValue + "/") {
       present(in: folder, focus: false)
+      listsRoot = true
+      updateResults()
     } else {
       if !isPresented { present(in: root, focus: false) }
+      listsRoot = folder == root
       inputMode = .computer
       input.stringValue = ""
       searchInput()
@@ -291,6 +302,7 @@ final class FileSearchPalette: Surface, NSTextFieldDelegate, NSTableViewDataSour
     navigationTask?.cancel()
     search.dismiss()
     folderLibrary.watch([])
+    folderLibrary.calculateSizes(in: nil)
     clearContext()
     isHidden = true
   }
@@ -310,14 +322,10 @@ final class FileSearchPalette: Surface, NSTextFieldDelegate, NSTableViewDataSour
     input.font = Design.font(21)
     input.textColor = Design.text
     input.placeholderAttributedString = NSAttributedString(string: "Find a file…", attributes: [.foregroundColor: Design.muted, .font: Design.font(21)])
-    for field in [scope, status, hint, empty] { field.textColor = Design.muted }
-    recentHeading.textColor = Design.muted
-    recentHeading.font = Design.font(12, .semibold)
-    scope.textColor = Design.text
-    scope.font = Design.font(11, .medium)
-    status.font = Design.font(10); hint.font = Design.font(10)
+    empty.textColor = Design.muted
+    listTitle.needsDisplay = true
     empty.font = Design.font(12)
-    for rule in [topRule, bottomRule, leftRule, rightRule, railRule] { rule.fill = Design.line }
+    for rule in [topRule, leftRule, rightRule, railRule] { rule.fill = Design.line }
     scopes.refreshTheme(); context.refreshTheme()
     preview.configure(selectedFile)
     currentFolderPane.redrawTheme(); childFolderPane.redrawTheme()
@@ -345,7 +353,6 @@ final class FileSearchPalette: Surface, NSTextFieldDelegate, NSTableViewDataSour
       if self.isHome {
         self.table.reloadData()
         self.updateContext()
-        self.recentHeading.isHidden = false
         self.empty.isHidden = !files.isEmpty
         self.needsLayout = true
       }
@@ -392,15 +399,15 @@ final class FileSearchPalette: Surface, NSTextFieldDelegate, NSTableViewDataSour
     updateSearchAppearance()
     let homeChanged = showingHome != isHome
     showingHome = isHome
-    for view in [scope, scopes, context, bottomRule, leftRule, railRule, status, hint] {
+    for view in [scopes, context, leftRule, railRule] {
       view.isHidden = isHome
     }
     scopes.isHidden = isHome || isBrowsing
     context.isHidden = isHome || isBrowsing
     leftRule.isHidden = isHome || isBrowsing
     railRule.isHidden = isHome || isBrowsing
-    scope.isHidden = isHome
-    recentHeading.isHidden = !isHome
+    listTitle.isHidden = isBrowsing
+    if isHome { listTitle.title = "Recently opened"; listTitle.subtitle = "" } else { listTitle.title = "Results" }
     needsLayout = true
     if homeChanged {
       table.setAccessibilityLabel(isHome ? "Recently opened files" : "File search results")
@@ -411,14 +418,14 @@ final class FileSearchPalette: Surface, NSTextFieldDelegate, NSTableViewDataSour
       selectedURL = nil
       empty.isHidden = true
       displayedHits = []
-      status.stringValue = ""
-      scope.stringValue = browsingFolder?.rawValue ?? ""
+      statusLine = ""
       updateFolderPanels()
       updateHint()
       needsLayout = true
       return
     }
     folderLibrary.watch([])
+    folderLibrary.calculateSizes(in: nil)
     if isHome {
       if homeChanged { clearContext(); displayedHits = []; reloadRecents() }
       empty.isHidden = !recentFiles.isEmpty
@@ -485,8 +492,7 @@ final class FileSearchPalette: Surface, NSTextFieldDelegate, NSTableViewDataSour
     if search.responseIsCurrent, selectedPath == nil, displayedHits.indices.contains(table.selectedRow) {
       selectedPath = displayedHits[table.selectedRow].entry.path
     }
-    status.stringValue = search.status
-    status.toolTip = search.status
+    statusLine = search.status
     let partial = search.resultsArePartial
     empty.isHidden = !displayedHits.isEmpty
     empty.stringValue = search.status
@@ -494,7 +500,7 @@ final class FileSearchPalette: Surface, NSTextFieldDelegate, NSTableViewDataSour
     if let navigationError {
       empty.stringValue = navigationError
       empty.isHidden = false
-      status.stringValue = navigationError
+      statusLine = navigationError
     }
     updateScopes(partial: partial)
     updateContext()
@@ -510,7 +516,11 @@ final class FileSearchPalette: Surface, NSTextFieldDelegate, NSTableViewDataSour
     func rows(_ files: [FileItem]) -> [DisplayRow] {
       files.map { DisplayRow(item: $0, pending: false, dimmed: false, marked: false, locationText: "") }
     }
-    currentFolderPane.configure(title: folder.url.lastPathComponent, location: folder,
+    let home = FolderID.home.rawValue
+    let parentPath = folder.url.deletingLastPathComponent().path
+    let place = parentPath == home ? "~" : parentPath.hasPrefix(home + "/") ? "~" + parentPath.dropFirst(home.count) : parentPath
+    currentFolderPane.configure(title: folder.rawValue == "/" ? "/" : folder.url.lastPathComponent,
+      subtitle: folder.rawValue == "/" ? "" : "in " + place, location: folder,
       rows: rows(files), selected: folderSelections[folder], active: true)
     currentFolderPane.empty.stringValue = folderLibrary.state(folder).message ?? ""
     var watched: Set<FolderID> = [folder]
@@ -530,6 +540,8 @@ final class FileSearchPalette: Surface, NSTextFieldDelegate, NSTableViewDataSour
       preview.configure(item)
     }
     folderLibrary.watch(watched)
+    // Folder totals for the listed folder only; the child pane never starts its own scan.
+    folderLibrary.calculateSizes(in: folder)
     contextItem = item
     selectionChanged?(item)
     didChange?()
@@ -571,8 +583,8 @@ final class FileSearchPalette: Surface, NSTextFieldDelegate, NSTableViewDataSour
     let active = search.activeSearchScope ?? root
     let rootName = root.rawValue == "/" ? "This Mac" : root == .home ? "Home" : root.url.lastPathComponent
     let relative = active == root ? "" : String(active.rawValue.dropFirst(root.rawValue == "/" ? 1 : root.rawValue.count + 1))
-    scope.stringValue = rootName + (relative.isEmpty ? "  /  All files" : "  /  " + relative.replacingOccurrences(of: "/", with: "  /  "))
-    scope.toolTip = active.rawValue
+    listTitle.subtitle = "in " + rootName + (relative.isEmpty ? "" : "  /  " + relative.replacingOccurrences(of: "/", with: "  /  "))
+    listTitle.toolTip = active.rawValue
     var rows = [ScopeRail.Row(title: "All files in \(rootName)", detail: "", depth: 0, selected: active == root, target: .scope(root))]
     if !history.isEmpty { rows.append(.init(title: "Previous scope", detail: "←", depth: 0, selected: false, target: .back)) }
     rows += search.response.scopes.sorted { a, b in
@@ -623,7 +635,8 @@ final class FileSearchPalette: Surface, NSTextFieldDelegate, NSTableViewDataSour
   private func navigateFocus() { window?.makeFirstResponder(self); updateHint() }
   private var editing: Bool { input.currentEditor() != nil }
   private func updateHint() {
-    hint.stringValue = editing ? "SEARCH    Esc Navigate    Ctrl D/U Half page    ↵ Open" : "NAVIGATE    j/k Files    h/l Scope    / Search    Space Preview    ↵ Open"
+    hintLine = editing ? "SEARCH    Esc Navigate    Ctrl D/U Half page    ↵ Open" : "NAVIGATE    j/k Files    h/l Scope    / Search    Space Preview    ↵ Open"
+    didChange?()
   }
   func controlTextDidChange(_ notification: Notification) {
     let event = NSApp.currentEvent
@@ -817,8 +830,8 @@ final class FileSearchPalette: Surface, NSTextFieldDelegate, NSTableViewDataSour
     contextItem = nil
     selectionChanged?(nil)
     preview.configure(nil)
-    preview.titleField.stringValue = url.lastPathComponent
-    preview.caption.stringValue = "Loading preview…"
+    preview.header.title = url.lastPathComponent
+    preview.header.subtitle = "Loading preview…"
     metadataTask?.cancel()
     metadataTask = Task { [weak self] in
       do { try await Task.sleep(for: .milliseconds(35)) } catch { return }
@@ -838,9 +851,9 @@ final class FileSearchPalette: Surface, NSTextFieldDelegate, NSTableViewDataSour
           self.updateResults()
           return
         }
-        self.preview.titleField.stringValue = url.lastPathComponent
-        self.preview.caption.stringValue = error.localizedDescription
-        self.preview.caption.toolTip = error.localizedDescription
+        self.preview.header.title = url.lastPathComponent
+        self.preview.header.subtitle = error.localizedDescription
+        self.preview.header.toolTip = error.localizedDescription
       }
       self.renderContext(); self.didChange?()
     }
@@ -906,53 +919,45 @@ final class FileSearchPalette: Surface, NSTextFieldDelegate, NSTableViewDataSour
     searchBorder.frame = NSRect(x: searchLeft, y: 14, width: searchWidth, height: 48)
     input.frame = NSRect(x: searchLeft + 16, y: 23, width: searchWidth - 154, height: 32)
     searchScopeHint.frame = NSRect(x: searchLeft + searchWidth - 126, y: 30, width: 110, height: 18)
+    let top: CGFloat = 76
     if isHome {
-      let top: CGFloat = 94
       let listWidth = bounds.width * 0.46
       topRule.frame = NSRect(x: 0, y: top, width: bounds.width, height: 1)
-      recentHeading.frame = NSRect(x: 22, y: top + 20, width: listWidth - 44, height: 20)
-      scroll.frame = NSRect(x: 6, y: top + (isHome ? 53 : 5), width: listWidth - 12, height: max(0, bounds.height - top - (isHome ? 59 : 52)))
+      listTitle.frame = NSRect(x: 0, y: top + 1, width: listWidth, height: PaneTitle.height)
+      scroll.frame = NSRect(x: 6, y: top + PaneTitle.height + 5, width: listWidth - 12, height: max(0, bounds.height - top - PaneTitle.height - 11))
       table.tableColumns.first?.width = scroll.contentSize.width
       rightRule.frame = NSRect(x: listWidth, y: top, width: 1, height: bounds.height - top)
       preview.frame = NSRect(x: listWidth + 1, y: top + 1, width: bounds.width - listWidth - 1, height: bounds.height - top - 1)
-      empty.frame = NSRect(x: 22, y: top + 64, width: listWidth - 44, height: 60)
+      empty.frame = NSRect(x: 22, y: top + PaneTitle.height + 24, width: listWidth - 44, height: 60)
       childFolderPane.frame = preview.frame
       return
     }
     if isBrowsing {
-      let top: CGFloat = 94
       let width = bounds.width / 2
-      scope.frame = NSRect(x: 24, y: 69, width: bounds.width - 48, height: 19)
       topRule.frame = NSRect(x: 0, y: top, width: bounds.width, height: 1)
-      currentFolderPane.frame = NSRect(x: 0, y: top + 1, width: width, height: bounds.height - top - 48)
-      childFolderPane.frame = NSRect(x: width + 1, y: top + 1, width: bounds.width - width - 1, height: bounds.height - top - 48)
+      currentFolderPane.frame = NSRect(x: 0, y: top + 1, width: width, height: max(0, bounds.height - top - 1))
+      childFolderPane.frame = NSRect(x: width + 1, y: top + 1, width: bounds.width - width - 1, height: max(0, bounds.height - top - 1))
       preview.frame = childFolderPane.frame
-      rightRule.frame = NSRect(x: width, y: top, width: 1, height: bounds.height - top - 47)
-      bottomRule.frame = NSRect(x: 0, y: bounds.height - 47, width: bounds.width, height: 1)
-      status.frame = NSRect(x: 16, y: bounds.height - 40, width: bounds.width - 32, height: 15)
-      hint.frame = NSRect(x: 16, y: bounds.height - 21, width: bounds.width - 32, height: 15)
+      rightRule.frame = NSRect(x: width, y: top, width: 1, height: bounds.height - top)
       return
     }
     let rail = min(250, max(180, bounds.width * 0.23))
     let results = (bounds.width - rail) * 0.43
-    let top: CGFloat = 94
-    let bottom = max(top, bounds.height - 47)
+    let bottom = max(top, bounds.height)
     let height = bottom - top
-    scope.frame = NSRect(x: 24, y: 69, width: bounds.width - 48, height: 19)
     topRule.frame = NSRect(x: 0, y: top, width: bounds.width, height: 1)
     scopes.frame = NSRect(x: 0, y: top + 1, width: rail, height: height * 0.44)
     context.frame = NSRect(x: 0, y: top + height * 0.44 + 1, width: rail, height: height * 0.56 - 1)
     railRule.frame = NSRect(x: 0, y: context.frame.minY, width: rail, height: 1)
     leftRule.frame = NSRect(x: rail, y: top, width: 1, height: height)
-    scroll.frame = NSRect(x: rail + 5, y: top + 5, width: results - 10, height: max(0, height - 10))
+    listTitle.frame = NSRect(x: rail + 1, y: top + 1, width: results - 1, height: PaneTitle.height)
+    scroll.frame = NSRect(x: rail + 5, y: top + PaneTitle.height + 5, width: results - 10, height: max(0, height - PaneTitle.height - 10))
     table.tableColumns.first?.width = scroll.contentSize.width
     rightRule.frame = NSRect(x: rail + results, y: top, width: 1, height: height)
     preview.frame = NSRect(x: rail + results + 1, y: top + 1, width: bounds.width - rail - results - 1, height: height - 1)
     childFolderPane.frame = preview.frame
-    empty.frame = NSRect(x: rail + 24, y: top + 90, width: results - 48, height: 100)
-    bottomRule.frame = NSRect(x: 0, y: bottom, width: bounds.width, height: 1)
-    status.frame = NSRect(x: 16, y: bottom + 7, width: bounds.width - 32, height: 15)
-    hint.frame = NSRect(x: 16, y: bottom + 26, width: bounds.width - 32, height: 15)
+    empty.frame = NSRect(x: rail + 24, y: top + PaneTitle.height + 60, width: results - 48, height: 100)
+
   }
 }
 

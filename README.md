@@ -8,10 +8,11 @@ macOS Finder is slow and I don't like it. Never have.
 
 I built this for myself and I'm trying to make it as fast as possible. Or rather, as fast as I know how.
 
-The app has two view modes:
+The title bar has five sections:
 
-- A search bar powered by [fff](https://github.com/dmtrKovalenko/fff), the fastest file finder I know of.
-- [Yazi](https://github.com/sxyazi/yazi)-style navigation panels.
+- **Search**, powered by [fff](https://github.com/dmtrKovalenko/fff), the fastest file finder I know of.
+- **Folders**, [Yazi](https://github.com/sxyazi/yazi)-style panels for browsing and reading a folder.
+- **Activity**, **Transfers** (AirDrop) and **Settings**.
 
 You can use Vim motions to move around the app.
 
@@ -21,7 +22,7 @@ Hell yes, I do not know nothing about swift, have not read a single line of code
 
 ## This is for AI agents
 
-Crawler is a native macOS Finder replacement built with Swift and AppKit, with fuzzy file search, document previews and a PDF reader with annotations. The app source is in `Sources/Crawler/`. Read [AGENTS.md](AGENTS.md) before making changes.
+Crawler is a native macOS app for finding and reading files, built with Swift and AppKit, with fuzzy file search, document previews, Markdown and Word reading and a PDF reader with annotations. The app source is in `Sources/Crawler/`. Read [AGENTS.md](AGENTS.md) before making changes.
 
 Requires macOS 14+, Xcode with Swift 6.2+, Python 3.11+ and rustup. In Keychain Access, create a self-signed Code Signing certificate named `Crawler Local Development` once. You can also use an existing certificate through `CRAWLER_SIGNING_IDENTITY`.
 

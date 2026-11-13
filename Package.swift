@@ -30,7 +30,6 @@ let package = Package(
       .linkedFramework("Security"), .linkedFramework("SystemConfiguration"),
       .linkedFramework("CoreServices"),
     ]),
-    .target(name: "SystemSettingsBridge", cSettings: [.unsafeFlags(["-fobjc-arc"])]),
     .target(name: "AirDropBridge", cSettings: [.unsafeFlags(["-fobjc-arc"])]),
     .target(name: "VideoFallback", cSettings: [
       .unsafeFlags(["-F", videoFrameworkDirectory, "-fobjc-arc"]),
@@ -38,7 +37,6 @@ let package = Package(
     .executableTarget(name: "Crawler", dependencies: [
     "FFFBridge",
     "AirDropBridge",
-    "SystemSettingsBridge",
     "VideoFallback",
     .product(name: "SwiftTreeSitter", package: "swift-tree-sitter"),
     .product(name: "TreeSitterSwift", package: "tree-sitter-swift"),

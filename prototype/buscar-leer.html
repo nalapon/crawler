@@ -1,0 +1,1493 @@
+<!doctype html>
+<!--
+  Prototipo desechable: tres variantes del shell "Buscar y Leer" de Crawler, conmutables con ?variant=A|B|C
+  y la barra inferior. Datos simulados; nada toca el disco y no forma parte de la app nativa.
+  Ábrelo con doble clic o: open prototype/buscar-leer.html
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Crawler · Buscar y leer</title>
+<style>
+:root {
+  --is-dark: 0;
+  --bg: #ffffff; --raised: #f8f8fb; --side: #f3f2f8; --text: #292b34; --muted: #6a7282; --line: #e5e7ed;
+  --accent: #086cdc; --sel: #e5efff; --sel-text: #174d99; --sel-dim: #e9e9ef; --page-bg: #e8e8ed;
+  --kw: #c2410c; --str: #15803d; --ty: #7c3aed;
+  --ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --serif: "New York", "Iowan Old Style", Georgia, serif;
+  --z: 1;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --is-dark: 1;
+    --bg: #202124; --raised: #292a2e; --side: #1b1c1f; --text: #ededf0; --muted: #a6a8b1; --line: #3a3b41;
+    --accent: #80b6ff; --sel: #304564; --sel-text: #d5e7ff; --sel-dim: #303136; --page-bg: #151618;
+    --kw: #fb923c; --str: #86efac; --ty: #c4b5fd;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --is-dark: 1;
+  --bg: #202124; --raised: #292a2e; --side: #1b1c1f; --text: #ededf0; --muted: #a6a8b1; --line: #3a3b41;
+  --accent: #80b6ff; --sel: #304564; --sel-text: #d5e7ff; --sel-dim: #303136; --page-bg: #151618;
+  --kw: #fb923c; --str: #86efac; --ty: #c4b5fd;
+  color-scheme: dark;
+}
+* { box-sizing: border-box }
+html, body { margin: 0 }
+html.standalone body { background: var(--bg) }
+:where(.frame) button { font: inherit; color: inherit; background: none; border: 0; padding: 0; margin: 0; cursor: default; text-align: inherit }
+:where(.frame) kbd { font: 10.5px/1 var(--ui); padding: 2px 5px; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; color: var(--muted); background: var(--bg); white-space: nowrap }
+
+.frame { height: var(--frame-h, 760px); display: flex; flex-direction: column; position: relative; overflow: hidden;
+  background: var(--bg); color: var(--text); font: 13px/1.4 var(--ui); -webkit-font-smoothing: antialiased;
+  border: 1px solid var(--line); border-radius: 12px }
+html.standalone .frame { border: 0; border-radius: 0 }
+#app { flex: 1; min-height: 0; display: flex; flex-direction: column; position: relative }
+
+/* window chrome */
+.lights { display: flex; gap: 8px; padding: 0 12px 0 14px; flex: none }
+.lights i { width: 12px; height: 12px; border-radius: 50%; background: #ff5f57; display: block }
+.lights i:nth-child(2) { background: #febc2e } .lights i:nth-child(3) { background: #28c840 }
+.bar { height: 44px; flex: none; display: flex; align-items: center; gap: 4px; padding-right: 10px; min-width: 0;
+  background: var(--side); border-bottom: 1px solid var(--line); position: relative }
+.bar:not(:has(.lights)) { padding-left: 8px }
+.bar.flat { background: var(--bg); border-bottom-color: transparent; height: 40px }
+.bar.light { background: var(--bg) }
+.tb { height: 28px; min-width: 28px; padding: 0 8px; border-radius: 6px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; color: var(--muted); white-space: nowrap; flex: none }
+.tb:hover { background: color-mix(in srgb, var(--text) 8%, transparent); color: var(--text) }
+.tb.on { color: var(--accent) }
+.sp { flex: 1 }
+.rt { display: flex; flex-direction: column; min-width: 0; line-height: 1.25; margin-left: 4px }
+.rt b { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis }
+.rt span { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis }
+.zoom { display: inline-flex; align-items: center; flex: none }
+.zoom span { font-size: 11.5px; color: var(--muted); min-width: 38px; text-align: center; font-variant-numeric: tabular-nums }
+.pageind { font-size: 11.5px; color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; margin-right: 6px }
+.prog { position: absolute; left: 0; bottom: -1px; height: 2px; width: 0; background: var(--accent); transition: width .08s linear }
+
+/* search field */
+.field { position: relative; display: flex; align-items: center; gap: 9px; height: 44px; width: min(720px, 100%); padding: 0 6px 0 14px;
+  border: 1px solid var(--line); border-radius: 10px; background: var(--bg); box-shadow: 0 1px 2px rgba(0,0,0,.04) }
+.field:focus-within { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent) }
+.field.local { background: color-mix(in srgb, var(--accent) 7%, var(--bg)) }
+.field > svg { flex: none; color: var(--muted) }
+.field input { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--text); font: 19px var(--ui) }
+.field input::placeholder { color: color-mix(in srgb, var(--muted) 75%, transparent) }
+.field.sm { height: 34px; border-radius: 8px; padding-left: 10px; width: 100% }
+.field.sm input { font-size: 14px }
+.field.ovf { width: 100%; border: 0; box-shadow: none; padding-left: 6px }
+.field.ovf input { font-size: 20px }
+.scope { flex: none; max-width: 140px; font-size: 12px; color: var(--muted); padding: 4px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--raised);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis }
+.field.local .scope { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 35%, var(--line)) }
+.menu { position: absolute; right: 4px; top: calc(100% + 6px); z-index: 20; min-width: 230px; padding: 5px;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 12px 32px rgba(0,0,0,.16) }
+.menu button { display: flex; width: 100%; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 6px; text-align: left; font-size: 13px }
+.menu button:hover { background: var(--sel); color: var(--sel-text) }
+.menu small { margin-left: auto; color: var(--muted); font-size: 11px }
+.menu .cur { font-weight: 600 }
+.chips { display: flex; gap: 6px; flex-wrap: wrap }
+.chip { font-size: 12px; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); background: var(--bg) }
+.chip:hover { color: var(--text) }
+.chip.on { background: var(--text); color: var(--bg); border-color: var(--text) }
+
+/* lists */
+.list { flex: 1; min-height: 0; overflow: auto; padding: 4px 8px 12px; position: relative }
+.lh { flex: none; display: flex; align-items: center; gap: 6px; min-height: 32px; padding: 8px 16px 4px; font-size: 11.5px; color: var(--muted); white-space: nowrap; overflow: hidden }
+.crumbs button { color: var(--muted); padding: 1px 3px; border-radius: 4px }
+.crumbs button:hover { color: var(--text); background: var(--sel-dim) }
+.crumbs .last { color: var(--text); font-weight: 600 }
+.qpill { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 999px; background: var(--bg); border: 1px solid var(--line); color: var(--text) }
+.qpill svg { width: 11px; height: 11px }
+.row { display: flex; align-items: center; gap: 10px; padding: 6px 8px; border-radius: 8px; min-width: 0 }
+.row .t { flex: 1; min-width: 0 }
+.row .n { font-size: 13.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis }
+.row .p { font-size: 11.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis }
+.row .m { flex: none; font-size: 11.5px; color: var(--muted); white-space: nowrap }
+.row .chev { flex: none; color: var(--muted) }
+.row.sel { background: var(--sel); color: var(--sel-text) }
+.row.sel .p, .row.sel .m, .row.sel .chev { color: color-mix(in srgb, var(--sel-text) 70%, transparent) }
+.list.dim .row.sel { background: var(--sel-dim); color: var(--text) }
+.list.dim .row.sel .p, .list.dim .row.sel .m, .list.dim .row.sel .chev { color: var(--muted) }
+.row mark { background: none; color: inherit; font-weight: 700; text-decoration: underline; text-decoration-color: color-mix(in srgb, var(--accent) 65%, transparent); text-underline-offset: 2px }
+.compact .row { padding: 4px 8px; gap: 8px }
+.compact .row .n { font-size: 13px }
+.empty { padding: 20px 12px; color: var(--muted) }
+.ico { flex: none; width: 22px; height: 26px; border-radius: 4px; display: grid; place-items: center; font: 700 8.5px/1 var(--ui); letter-spacing: .02em;
+  color: var(--c); background: color-mix(in srgb, var(--c) 12%, var(--bg)); border: 1px solid color-mix(in srgb, var(--c) 24%, transparent) }
+.compact .ico, .tab .ico, .pal-row .ico { width: 17px; height: 20px; font-size: 7px }
+.ico.dir { background: none; border: 0; color: #4a90e2 }
+.k-md { --c: #2f6fdc } .k-pdf { --c: #d6372b } .k-docx { --c: #2257b5 } .k-code { --c: #7a4fd0 } .k-txt { --c: #6b7280 } .k-img { --c: #1f9d63 } .k-other { --c: #6b7280 }
+.hints { flex: none; display: flex; gap: 14px; align-items: center; padding: 7px 16px; font-size: 11.5px; color: var(--muted); border-top: 1px solid var(--line); white-space: nowrap; overflow: hidden; background: var(--side) }
+.hints span { display: inline-flex; gap: 5px; align-items: center }
+
+/* preview pane */
+.col, .pv, .reader { display: flex; flex-direction: column; min-height: 0; min-width: 0 }
+.pv { background: var(--raised); border-left: 1px solid var(--line) }
+.pv-head { flex: none; display: flex; align-items: center; gap: 10px; padding: 9px 14px; border-bottom: 1px solid var(--line) }
+.pv-head .t { flex: 1; min-width: 0 }
+.pv-head .n { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis }
+.mm { font-size: 11.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis }
+.pv-body { flex: 1; min-height: 0; overflow: auto; background: var(--bg); position: relative }
+.reader-body { flex: 1; min-height: 0; overflow: auto; background: var(--bg); position: relative; outline: none }
+
+/* documents */
+.doc { color: var(--text) }
+.dv.preview .doc { font-size: 13.5px; line-height: 1.55; padding: 18px 24px 48px; max-width: 72ch }
+.dv.read .doc { font-size: calc(17px * var(--z)); line-height: 1.62; max-width: 70ch; margin: 0 auto; padding: 44px 28px 120px }
+.doc h1 { font-size: 1.85em; line-height: 1.15; margin: 0 0 .55em; letter-spacing: -.015em }
+.doc h2 { font-size: 1.3em; line-height: 1.25; margin: 1.5em 0 .45em; letter-spacing: -.01em }
+.doc h3 { font-size: 1.08em; margin: 1.3em 0 .35em }
+.doc p { margin: .65em 0 }
+.doc ul, .doc ol { padding-left: 1.35em; margin: .6em 0 }
+.doc li { margin: .22em 0 }
+.doc li.task { list-style: none; margin-left: -1.35em }
+.doc li.task input { margin: 0 .45em 0 0; vertical-align: -1px }
+.doc code { font: .86em var(--mono); background: var(--raised); border: 1px solid var(--line); border-radius: 4px; padding: .05em .3em }
+.doc pre { font: .84em/1.5 var(--mono); background: var(--raised); border: 1px solid var(--line); border-radius: 8px; padding: .8em 1em; overflow: auto }
+.doc pre code { border: 0; background: none; padding: 0; font-size: 1em }
+.doc table { border-collapse: collapse; margin: .9em 0; font-size: .92em }
+.doc th, .doc td { border: 1px solid var(--line); padding: .35em .65em; text-align: left }
+.doc th { background: var(--raised); font-weight: 600 }
+.doc blockquote { margin: .9em 0; padding: .1em 0 .1em 1em; border-left: 3px solid var(--line); color: var(--muted) }
+.doc a { color: var(--accent) }
+.badge { display: inline-flex; font-size: 11.5px; color: var(--muted); border: 1px solid var(--line); border-radius: 6px; padding: 2px 8px; margin-bottom: 1.4em }
+.pages { background: var(--page-bg); padding: 22px 16px 80px; display: flex; flex-direction: column; align-items: center; gap: 16px; min-height: 100% }
+.page { flex: none; position: relative; width: min(100%, calc(680px * var(--z))); aspect-ratio: 1 / 1.414; overflow: hidden; padding: 7% 8.5%;
+  background: #fff; color: #1d1d1f; border-radius: 2px; box-shadow: 0 1px 3px rgba(0,0,0,.12), 0 6px 18px rgba(0,0,0,.06);
+  font: calc(11.5px * var(--z))/1.5 var(--serif) }
+.dv.preview .pages { padding: 16px 12px 40px; gap: 12px }
+.dv.preview .page { width: min(100%, 380px); font-size: 6.6px }
+.page h1 { font-size: 2.3em; line-height: 1.1; margin: 0 0 .25em }
+.page h2 { font-size: 1.35em; margin: .3em 0 .9em; color: #555; font-weight: 500 }
+.page p { margin: .6em 0 } .page ul, .page ol { padding-left: 1.3em }
+.page table { border-collapse: collapse; margin: 1em 0 }
+.page th, .page td { border-bottom: 1px solid #ddd; padding: .3em 1em .3em 0; text-align: left }
+.page .fl { display: block; height: .62em; background: #e9e9ed; border-radius: 2px; margin: .62em 0 }
+.page .fl.h { height: 1em; width: 45%; background: #d9d9de; margin: 1.6em 0 .9em }
+.page .pno { position: absolute; bottom: 3.5%; left: 0; right: 0; text-align: center; color: #999; font-size: .85em }
+.more { color: var(--muted); font-size: 12px }
+.codev { font: calc(13px * var(--z))/1.6 var(--mono); padding: 18px 0 100px }
+.dv.preview .codev { font-size: 11.5px; padding: 12px 0 40px }
+.codev .l { display: flex; white-space: pre-wrap; word-break: break-word; padding-right: 24px }
+.codev .no { flex: none; width: 4em; text-align: right; padding-right: 1.4em; color: var(--muted); opacity: .55; user-select: none }
+.c-kw { color: var(--kw) } .c-str { color: var(--str) } .c-ty { color: var(--ty) } .c-com { color: var(--muted); font-style: italic }
+.plaintext { margin: 0 auto; max-width: 80ch; padding: 40px 28px 120px; white-space: pre-wrap; font: calc(14px * var(--z))/1.65 var(--mono) }
+.dv.preview .plaintext { font-size: 12px; padding: 16px 22px }
+.imgph { margin: 32px auto 10px; width: min(86%, calc(640px * var(--z))); aspect-ratio: 4 / 3; border-radius: 6px; display: grid; place-items: center; color: rgba(0,0,0,.45); font-size: 12px;
+  background: linear-gradient(135deg, #a8c0ff 0%, #e8d5f0 55%, #ffd6a5 100%) }
+.meta-card { text-align: center; color: var(--muted); font-size: 12px }
+.nopv { display: grid; justify-items: center; gap: 10px; padding: 80px 20px; color: var(--muted); text-align: center }
+.nopv .ico { width: 44px; height: 52px; font-size: 12px }
+.fpv { padding: 16px 20px 40px; max-width: 760px; margin: 0 auto }
+.fpv-h { display: flex; align-items: center; gap: 10px; margin-bottom: 12px }
+.fpv-h b { font-size: 15px }
+.fr { display: flex; align-items: center; gap: 10px; padding: 5px 4px; border-bottom: 1px solid var(--line) }
+.fr .m { margin-left: auto; color: var(--muted); font-size: 11.5px }
+
+/* variant A */
+.a-search { flex: 1; min-height: 0; display: flex; flex-direction: column }
+.a-top { flex: none; display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 8px 20px 14px; position: relative }
+.a-body { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(250px, 2fr) minmax(0, 3fr); grid-template-rows: minmax(0, 1fr); border-top: 1px solid var(--line) }
+.a-read { flex: 1; min-height: 0; display: grid; grid-template-columns: 236px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) }
+.a-read.nolist, .c-main.nodrawer { grid-template-columns: minmax(0, 1fr) }
+.a-read.nolist .side, .c-main.nodrawer .side { display: none }
+.side { display: flex; flex-direction: column; min-height: 0; min-width: 0; background: var(--side); border-right: 1px solid var(--line) }
+
+/* variant B */
+.b { flex: 1; min-height: 0; display: grid; grid-template-columns: clamp(250px, 32%, 340px) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) }
+.b.nolist { grid-template-columns: minmax(0, 1fr) }
+.b.nolist .b-left { display: none }
+.b-left { display: flex; flex-direction: column; min-height: 0; min-width: 0; background: var(--side); border-right: 1px solid var(--line) }
+.b-top { flex: none; height: 44px; display: flex; align-items: center }
+.b-search { flex: none; display: flex; flex-direction: column; gap: 8px; padding: 0 10px 6px }
+.b-search .chip { font-size: 11.5px; padding: 2px 8px }
+.b .reader.focused .reader-body { box-shadow: inset 2px 0 0 var(--accent) }
+
+/* variant C */
+.tabsbar { flex: none; height: 40px; display: flex; align-items: flex-end; gap: 2px; padding-right: 8px; background: var(--side); border-bottom: 1px solid var(--line); min-width: 0 }
+.tabsbar .lights, .tabsbar .tb, .searchbtn { align-self: center }
+.tab { height: 32px; min-width: 0; max-width: 190px; flex: 0 1 190px; display: flex; align-items: center; gap: 7px; padding: 0 6px 0 10px; position: relative; top: 1px;
+  border-radius: 8px 8px 0 0; font-size: 12.5px; color: var(--muted); border: 1px solid transparent; border-bottom: 0 }
+.tab.on { background: var(--bg); color: var(--text); border-color: var(--line) }
+.tab .tn { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis }
+.tab .x { margin-left: auto; flex: none; width: 18px; height: 18px; border-radius: 4px; opacity: .55 }
+.tab .x:hover { opacity: 1; background: var(--sel-dim) }
+.searchbtn { margin-left: auto; flex: none; height: 28px; display: inline-flex; align-items: center; gap: 8px; padding: 0 8px 0 10px; min-width: 170px;
+  border: 1px solid var(--line); border-radius: 7px; color: var(--muted); background: var(--bg); font-size: 12px }
+.searchbtn span { flex: 1; text-align: left }
+.c-main { flex: 1; min-height: 0; display: grid; grid-template-columns: 230px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) }
+.c-empty { flex: 1; min-height: 0; overflow: auto; display: flex; flex-direction: column; align-items: center; gap: 18px; padding: 70px 24px 24px }
+.fakefield { width: min(560px, 100%); height: 44px; display: flex; align-items: center; gap: 10px; padding: 0 12px 0 14px; font-size: 16px; color: var(--muted);
+  border: 1px solid var(--line); border-radius: 10px; background: var(--bg); box-shadow: 0 1px 2px rgba(0,0,0,.04) }
+.fakefield span { flex: 1; text-align: left }
+.c-empty .recent { width: min(560px, 100%) }
+.c-empty .lh { padding-left: 8px }
+.ov-bg { position: absolute; inset: 0; z-index: 30; display: flex; justify-content: center; align-items: flex-start; padding-top: 46px; background: rgba(15,16,20,.22) }
+.ov { width: min(880px, calc(100% - 40px)); height: min(540px, calc(100% - 80px)); display: flex; flex-direction: column; overflow: hidden;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 14px; box-shadow: 0 24px 70px rgba(0,0,0,.28) }
+.ov-top { flex: none; display: flex; flex-direction: column; gap: 6px; padding: 8px 12px 10px; border-bottom: 1px solid var(--line) }
+.ov-body { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) }
+
+/* actions palette */
+.pal-bg { position: absolute; inset: 0; z-index: 40; background: rgba(15,16,20,.18) }
+.palette { position: absolute; z-index: 41; top: 56px; left: 50%; transform: translateX(-50%); width: min(540px, calc(100% - 32px)); overflow: hidden;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 24px 70px rgba(0,0,0,.28) }
+.pal-target { display: flex; align-items: center; gap: 8px; padding: 10px 14px 0; font-size: 12px; color: var(--muted) }
+.palette input { width: 100%; border: 0; outline: 0; background: transparent; color: var(--text); font: 16px var(--ui); padding: 8px 14px 12px; border-bottom: 1px solid var(--line) }
+.pal-list { max-height: 330px; overflow: auto; padding: 6px }
+.pal-row { display: flex; align-items: center; gap: 10px; padding: 7px 10px; border-radius: 7px }
+.pal-row.sel { background: var(--sel); color: var(--sel-text) }
+.pal-row small { color: var(--muted) }
+.pal-row .sc { margin-left: auto; color: var(--muted); font-size: 12px }
+
+/* prototype chrome (not part of the design) */
+#protobar { flex: none; height: 46px; display: flex; align-items: center; justify-content: center; gap: 10px; padding: 0 10px;
+  background: #141518; color: #e9e9ec; font: 12px var(--ui); border-top: 1px solid #000; position: relative; z-index: 60 }
+#protobar button { height: 28px; padding: 0 10px; border-radius: 999px; color: inherit }
+#protobar button:hover { background: #2c2d33 }
+#protobar button.on { background: #3a3c44 }
+.pb-pill { display: flex; align-items: center; gap: 2px; padding: 2px; border-radius: 999px; background: #232429 }
+.pb-pill .lab { padding: 0 8px; white-space: nowrap }
+.pb-pill .lab b { color: #8ab4ff; margin-right: 6px }
+.pb-pill .dim { color: #9a9ca5 }
+.pb-state { font: 11px var(--mono); color: #8d8f98; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; max-width: 40% }
+@media (max-width: 1100px) { .pb-state { display: none } }
+#help { position: absolute; right: 10px; bottom: 56px; z-index: 55; width: min(340px, calc(100% - 20px)); padding: 12px 14px;
+  background: #141518; color: #e9e9ec; border-radius: 12px; font: 12px/1.5 var(--ui); box-shadow: 0 12px 40px rgba(0,0,0,.3) }
+#help[hidden] { display: none }
+#help h4 { margin: 0 0 4px; font-size: 12.5px }
+#help p { margin: 0 0 8px; color: #c9cad0 }
+#help dl { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; margin: 0 0 8px }
+#help dt { font: 11px var(--mono); color: #8ab4ff; white-space: nowrap }
+#help dd { margin: 0; color: #c9cad0 }
+#help .foot { color: #8d8f98; margin: 0 }
+#help .x { position: absolute; top: 6px; right: 8px; width: 22px; height: 22px; border-radius: 6px; color: #9a9ca5 }
+#toasts { position: absolute; left: 50%; bottom: 58px; transform: translateX(-50%); z-index: 70; display: flex; flex-direction: column; gap: 6px; align-items: center; pointer-events: none }
+.toast { max-width: min(520px, 90vw); padding: 8px 14px; border-radius: 9px; background: #141518; color: #f0f0f2; font-size: 12.5px; text-align: center; box-shadow: 0 8px 24px rgba(0,0,0,.25); animation: tin .18s ease-out }
+@keyframes tin { from { opacity: 0; transform: translateY(6px) } }
+</style>
+</head>
+<body>
+<div class="frame" id="frame">
+  <div id="app"></div>
+  <div id="protobar"></div>
+  <div id="help"></div>
+  <div id="toasts"></div>
+</div>
+
+<!-- Simulated document contents. PDF pages are separated by "=== page ===". -->
+<script type="text/plain" data-doc="~/Proyectos/new-finder/README.md">
+# Crawler
+
+macOS Finder is slow and I don't like it. Never have.
+
+I built this for myself and I'm trying to make it as fast as possible. Or rather, as fast as I know how.
+
+## Two ways to use it
+
+- A search bar powered by **fff**, the fastest file finder I know of.
+- Yazi-style panels for reading a folder from the terminal.
+
+You can use Vim motions to move around the app.
+
+## Install
+
+```sh
+scripts/build.sh
+sudo ditto build/Crawler.app /Applications/Crawler.app
+```
+
+Link the CLI to open folders from a terminal:
+
+```sh
+ln -s "$PWD/scripts/crawler" ~/.local/bin/crawler
+crawler ~/Code
+```
+
+A file path opens the file directly in the reader.
+</script>
+<script type="text/plain" data-doc="~/Proyectos/new-finder/AGENTS.md">
+# Working on Crawler
+
+## Product and current scope
+
+Crawler is a native macOS Finder replacement built with Swift and AppKit. The shipping source is `Sources/Crawler/`. Scope funnel is the default workspace, with Columns as the other view mode.
+
+Favorites contain Downloads, Desktop and at most one user-pinned folder. The initial workspace is Home, with recent files inside the empty-query view.
+
+## Collaboration rules
+
+- Keep code and explanations simple and concrete.
+- Questions are read-only unless the user also requests implementation.
+- Preserve unrelated local changes.
+- Do not add test files without explicit approval.
+- Prefer native platform APIs and strong Swift types over new dependencies.
+
+## Build and run
+
+```sh
+scripts/build.sh
+open "$PWD/build/Crawler.app"
+```
+
+The script runs both dependency bootstraps, builds release, packages resources and VLCKit, strips the packaged executable and signs `build/Crawler.app`.
+
+## Preserve seamless search
+
+Never replace or bypass the resident fuzzy search engine when changing search scope, navigation, themes, or controls. This Mac and `$` current-folder mode must use the same fuzzy matcher; `$` changes only the scope filter.
+
+Do not substitute query-time Spotlight matching, add a debounce, or clear visible results while a replacement query is running.
+
+## Documents and PDF annotations
+
+Code, Markdown, plain text, PDFs and video share `DocumentPreview` between panes and the Space window. Keep file reads, Markdown parsing and Tree-sitter work off the main actor, bounded and cancellation-aware.
+
+Enter, double-click and search activation open PDFs in `PDFReader` inside the Crawler window. Markdown opens in `MarkdownReader` and shares the same cover and restore path.
+
+## Verification
+
+Match verification to the change. For native behavior changes, build the release app and exercise the affected UI; a build alone does not prove behavior. Use disposable data outside personal folders.
+</script>
+<script type="text/plain" data-doc="~/Proyectos/new-finder/THIRD_PARTY_NOTICES.md">
+# Third-party notices
+
+Crawler bundles the following components. Their licenses ship inside the app bundle.
+
+| Component | License |
+|---|---|
+| fff-search 0.11.0 | MIT |
+| Tree-sitter | MIT |
+| Swift Markdown | Apache-2.0 |
+| VLCKit | LGPL-2.1 |
+| IBM Plex Mono | OFL-1.1 |
+</script>
+<script type="text/plain" data-doc="~/Proyectos/new-finder/docs/system-settings-design.md">
+# System settings workspace
+
+Ten sections built with native controls. Private API calls live in `SystemSettingsBridge` behind symbol and signature checks.
+
+## Status
+
+This workspace is scheduled for removal in the search-and-read redesign.
+</script>
+<script type="text/plain" data-doc="~/Proyectos/new-finder/docs/ideas/search-and-read.md">
+# Buscar y leer
+
+Crawler se queda con dos pantallas. Lo demás son acciones sobre el fichero o ventanas aparte.
+
+## Buscar
+
+- Un campo, un selector de ámbito y filtros por tipo.
+- Sin barra lateral: favoritos y discos pasan a ser ámbitos.
+- Con la consulta vacía, documentos recientes.
+
+## Leer
+
+- El lector ocupa la ventana.
+- La lista de la izquierda viene de una búsqueda o de una carpeta.
+- `j` y `k` cambian de documento; `h` y `l` suben o entran en carpetas.
+
+## Acciones
+
+| Acción | Implementación |
+|---|---|
+| Copiar a… | `FileCopy.swift`, nunca sobrescribe |
+| Mover a… | rename en el mismo disco |
+| Enviar por AirDrop | `NSSharingService` nativo |
+
+## Fuera
+
+- Ajustes del sistema
+- Papelera de solo lectura
+- Pantalla propia de AirDrop
+</script>
+<script type="text/plain" data-doc="~/Proyectos/new-finder/docs/ideas/epub-reader.md">
+# EPUB en el lector
+
+Un EPUB es un zip con XHTML. El camino corto es el mismo que Word: convertir cada capítulo a Markdown y reutilizar `MarkdownReader`.
+
+## Qué se pierde
+
+- Maquetación fija
+- Fuentes incrustadas
+
+## Preguntas
+
+- [ ] ¿Índice lateral con capítulos?
+- [ ] ¿Recordar la posición de lectura por libro?
+</script>
+<script type="text/plain" data-doc="~/Proyectos/new-finder/Sources/Crawler/MarkdownReader.swift">
+import AppKit
+
+/// Full-window Markdown reader. Shares the cover/restore path with the PDF reader.
+final class MarkdownReader: NSView {
+  private let textView = NSTextView()
+  private var scale: CGFloat = 1.0
+
+  func load(_ url: URL) async {
+    let text = await PreviewTextLoader.read(url, budget: .reader)
+    let styled = MarkdownStyle.reader.render(text)
+    textView.textStorage?.setAttributedString(styled)
+  }
+
+  // Zoom moves in 10% steps between 70% and 200%.
+  func zoom(by step: CGFloat) {
+    scale = min(2.0, max(0.7, scale + step))
+    relayout()
+  }
+}
+</script>
+<script type="text/plain" data-doc="~/Proyectos/new-finder/Sources/Crawler/Workspace.swift">
+import AppKit
+
+@MainActor
+final class Workspace {
+  private(set) var tabs: [Tab] = []
+  private var library = FileSystemLibrary(capacity: 32)
+
+  /// Saves the departing folder's selection, then renders the new location.
+  func navigate(to folder: FolderID) {
+    remember(selection: currentSelection, in: activeTab.location)
+    activeTab.location = folder
+    render()
+  }
+}
+</script>
+<script type="text/plain" data-doc="~/Proyectos/new-finder/Sources/FFFBridge/engine.rs">
+use std::ffi::{c_char, CStr};
+
+/// Scores one query against a prepared snapshot and writes up to `limit` hits.
+#[no_mangle]
+pub extern "C" fn fff_search(
+    snapshot: *const Snapshot,
+    query: *const c_char,
+    limit: usize,
+    out: *mut Hit,
+) -> usize {
+    let query = unsafe { CStr::from_ptr(query) }.to_string_lossy();
+    let snapshot = unsafe { &*snapshot };
+    let hits = snapshot.matcher().search(&query, limit);
+    for (i, hit) in hits.iter().enumerate() {
+        unsafe { out.add(i).write(*hit) };
+    }
+    hits.len()
+}
+</script>
+<script type="text/plain" data-doc="~/Proyectos/new-finder/scripts/build.sh">
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Build, package and sign build/Crawler.app
+scripts/bootstrap-video.sh
+scripts/bootstrap-fff.sh
+swift build -c release
+
+identity="${CRAWLER_SIGNING_IDENTITY:-Crawler Local Development}"
+codesign --force --sign "$identity" build/Crawler.app
+echo "Signed with $identity"
+</script>
+<script type="text/plain" data-doc="~/Proyectos/fff/README.md">
+# fff
+
+A fast fuzzy file finder with frecency ranking and typo-tolerant matching.
+
+## Features
+
+- SIMD prepared path chunks
+- Access-history scoring
+- Literal multiword constraints with a fuzzy fallback
+
+## Usage
+
+```rust
+let index = Index::build("/")?;
+let hits = index.search("readme", 100);
+```
+</script>
+<script type="text/plain" data-doc="~/Proyectos/fff/docs/scoring.md">
+# Scoring
+
+Each hit combines the fuzzy score, a filename bonus and access-history frecency.
+
+1. Exact filename substring
+2. Word-boundary and camelCase matches
+3. Path matches, weighted lower
+
+> Trigram signatures only prioritize cache blocks. They never filter candidates.
+</script>
+<script type="text/plain" data-doc="~/Proyectos/notas/2026-11-10-reunion-producto.md">
+# Reunión de producto · 10 nov
+
+**Asistentes:** Lucía, Marcos, Ana
+
+## Decisiones
+
+- El lector de Markdown es la vista por defecto para `.md` y `.docx`.
+- Activity Monitor sale de la barra lateral y se abre en su propia ventana.
+- Ajustes del sistema se retira en la próxima versión.
+
+## Pendiente
+
+- [x] Medir el tiempo hasta el primer resultado con el índice frío
+- [ ] Prototipo de Buscar y Leer
+- [ ] Decidir atajos para cambiar de documento
+- [ ] Revisar el ranking de búsquedas de una sola palabra
+
+## Notas
+
+Marcos quiere que la lista de resultados siga visible mientras lee. Ana prefiere el lector a pantalla completa con una paleta encima.
+</script>
+<script type="text/plain" data-doc="~/Proyectos/notas/lecturas-pendientes.md">
+# Lecturas pendientes
+
+- *A Philosophy of Software Design*, capítulos 4 a 6
+- Artículo sobre índices de trigramas
+- Documentación de PDFKit sobre anotaciones
+- Guía de Apple sobre barras de herramientas unificadas
+</script>
+<script type="text/plain" data-doc="~/Proyectos/notas/TODO.txt">
+TODO
+
+[ ] Renovar el dominio antes del 30 nov
+[ ] Pasar las facturas de octubre
+[x] Copia de seguridad del disco externo
+[ ] Llamar al taller
+
+Ideas sueltas
+- Atajo para copiar la ruta del fichero
+- Abrir los PDF en la última página leída
+</script>
+<script type="text/plain" data-doc="~/Downloads/Informe-trimestral-Q3.pdf">
+# Informe trimestral
+## Tercer trimestre 2026
+
+Este informe resume la actividad del equipo entre julio y septiembre: entregas, incidencias y previsión para el último trimestre.
+
+| Indicador | T2 | T3 |
+|---|---|---|
+| Entregas | 18 | 23 |
+| Incidencias abiertas | 41 | 27 |
+| Tiempo medio de respuesta | 9 h | 6 h |
+=== page ===
+## Resultados por línea
+
+El volumen de incidencias bajó un 34 % tras automatizar la ingesta de listas. La línea de informes cerró tres de las cuatro entregas previstas.
+
+- Ingesta: 9 entregas, 2 con retraso
+- Informes: 3 de 4 entregas
+- Plataforma: migración de base de datos completada
+</script>
+<script type="text/plain" data-doc="~/Downloads/Propuesta-arquitectura-ingesta.pdf">
+# Propuesta de arquitectura
+## Servicio de ingesta
+
+Objetivo: separar la descarga de fuentes externas de su normalización, para poder reintentar cada fase por separado.
+
+1. Descarga y versionado de cada fuente
+2. Normalización a un esquema común
+3. Carga idempotente por hash de contenido
+</script>
+<script type="text/plain" data-doc="~/Downloads/Guia-onboarding-equipo.pdf">
+# Guía de onboarding
+## Primera semana
+
+Bienvenida al equipo. Esta guía cubre accesos, herramientas y lo que se espera de tu primera semana.
+</script>
+<script type="text/plain" data-doc="~/Downloads/factura-0042.pdf">
+# Factura 0042
+
+**Fecha:** 3 nov 2026 · **Ejemplo simulado**
+
+| Concepto | Importe |
+|---|---|
+| Desarrollo, octubre | 3.200,00 € |
+| IVA 21 % | 672,00 € |
+| **Total** | **3.872,00 €** |
+</script>
+<script type="text/plain" data-doc="~/Documents/Manual-de-estilo.pdf">
+# Manual de estilo
+## Versión 3 · 2026
+
+Cómo escribimos documentación, mensajes de la interfaz y notas de versión.
+</script>
+<script type="text/plain" data-doc="/Volumes/Samsung T7/Archivo/presupuesto-reforma.pdf">
+# Presupuesto de reforma
+## Cocina y baño
+
+Validez: 30 días.
+
+| Partida | Importe |
+|---|---|
+| Demolición | 1.100 € |
+| Fontanería | 2.450 € |
+| Alicatado | 1.980 € |
+</script>
+<script type="text/plain" data-doc="~/Downloads/Contrato-servicios-2026.docx">
+# Contrato de prestación de servicios
+
+## Partes
+
+De una parte, la empresa cliente. De otra, el prestador de servicios.
+
+## Cláusulas
+
+### Primera. Objeto
+
+El prestador desarrollará y mantendrá la aplicación descrita en el anexo I.
+
+### Segunda. Duración
+
+El contrato dura doce meses desde la firma y se renueva por periodos iguales salvo aviso con treinta días de antelación.
+
+### Tercera. Precio
+
+El cliente abonará una cuota mensual según el anexo II, mediante transferencia en los diez primeros días de cada mes.
+
+### Cuarta. Confidencialidad
+
+Ambas partes mantendrán la confidencialidad de la información intercambiada durante la vigencia del contrato y dos años después.
+</script>
+<script type="text/plain" data-doc="~/Downloads/acta-comite-octubre.docx">
+# Acta del comité · octubre
+
+**Fecha:** 28 oct 2026 · **Lugar:** sala 2
+
+## Orden del día
+
+1. Estado del presupuesto
+2. Contratación del segundo trimestre
+3. Ruegos y preguntas
+
+## Acuerdos
+
+- Se aprueba el presupuesto revisado.
+- La contratación se aplaza a enero.
+</script>
+<script type="text/plain" data-doc="~/Documents/CV-2026.docx">
+# Curriculum vitae
+
+## Experiencia
+
+### Desarrollo de producto · 2021 a hoy
+
+Aplicaciones nativas para macOS y servicios de ingesta de datos.
+
+## Formación
+
+Ingeniería informática.
+</script>
+<script type="text/plain" data-doc="~/Desktop/borrador-charla.md">
+# Borrador: buscar ficheros rápido
+
+Charla de 20 minutos sobre por qué Finder tarda y cómo lo resuelve un índice residente.
+
+## Guion
+
+1. Demo: buscar `readme` en todo el Mac
+2. Cómo funciona un índice de rutas en memoria
+3. Por qué no usar Spotlight para nombres de fichero
+4. Preguntas
+
+## Pendiente
+
+- [ ] Grabar la demo con la caché fría
+</script>
+<script type="text/plain" data-doc="~/Desktop/checklist-viaje.txt">
+Viaje · diciembre
+
+- Pasaporte
+- Cargador del portátil
+- Adaptador USB-C a HDMI
+- Reservar hotel la segunda noche
+</script>
+<script type="text/plain" data-doc="/Volumes/Samsung T7/Archivo/readme.txt">
+Copia de seguridad 2019-2024
+
+Fotos, facturas y proyectos antiguos.
+No borrar sin copiar antes al NAS.
+</script>
+
+<script>
+'use strict';
+
+// ---------- simulated file system ----------
+// [path, kind, size, modified, pdf pages]
+const FILES = [
+  ['~/Proyectos/new-finder/README.md', 'md', '3 KB', 'Today 09:12'],
+  ['~/Proyectos/new-finder/AGENTS.md', 'md', '38 KB', 'Yesterday 18:31'],
+  ['~/Proyectos/new-finder/THIRD_PARTY_NOTICES.md', 'md', '12 KB', '12 Nov'],
+  ['~/Proyectos/new-finder/docs/system-settings-design.md', 'md', '9 KB', '2 Nov'],
+  ['~/Proyectos/new-finder/docs/ideas/search-and-read.md', 'md', '2 KB', 'Today 10:04'],
+  ['~/Proyectos/new-finder/docs/ideas/epub-reader.md', 'md', '1 KB', '8 Nov'],
+  ['~/Proyectos/new-finder/Sources/Crawler/MarkdownReader.swift', 'code', '19 KB', 'Yesterday 17:50'],
+  ['~/Proyectos/new-finder/Sources/Crawler/Workspace.swift', 'code', '52 KB', 'Yesterday 17:50'],
+  ['~/Proyectos/new-finder/Sources/FFFBridge/engine.rs', 'code', '24 KB', '5 Nov'],
+  ['~/Proyectos/new-finder/scripts/build.sh', 'code', '4 KB', '12 Nov'],
+  ['~/Proyectos/fff/README.md', 'md', '6 KB', '30 Oct'],
+  ['~/Proyectos/fff/docs/scoring.md', 'md', '4 KB', '30 Oct'],
+  ['~/Proyectos/notas/2026-11-10-reunion-producto.md', 'md', '2 KB', '10 Nov'],
+  ['~/Proyectos/notas/lecturas-pendientes.md', 'md', '1 KB', '4 Nov'],
+  ['~/Proyectos/notas/TODO.txt', 'txt', '1 KB', 'Today 08:40'],
+  ['~/Downloads/Informe-trimestral-Q3.pdf', 'pdf', '2,4 MB', '11 Nov', 14],
+  ['~/Downloads/Propuesta-arquitectura-ingesta.pdf', 'pdf', '880 KB', '9 Nov', 6],
+  ['~/Downloads/Guia-onboarding-equipo.pdf', 'pdf', '6,1 MB', '21 Oct', 60],
+  ['~/Downloads/factura-0042.pdf', 'pdf', '96 KB', '3 Nov', 1],
+  ['~/Downloads/Contrato-servicios-2026.docx', 'docx', '64 KB', '12 Nov'],
+  ['~/Downloads/acta-comite-octubre.docx', 'docx', '41 KB', '29 Oct'],
+  ['~/Downloads/captura-2026-11-02.png', 'img', '1,2 MB', '2 Nov'],
+  ['~/Downloads/Rex.dmg', 'other', '84 MB', '1 Nov'],
+  ['~/Desktop/borrador-charla.md', 'md', '2 KB', '7 Nov'],
+  ['~/Desktop/checklist-viaje.txt', 'txt', '1 KB', '6 Nov'],
+  ['~/Documents/CV-2026.docx', 'docx', '58 KB', '15 Sep'],
+  ['~/Documents/Manual-de-estilo.pdf', 'pdf', '3,3 MB', '2 Sep', 42],
+  ['/Volumes/Samsung T7/Archivo/readme.txt', 'txt', '1 KB', '14 Feb 2024'],
+  ['/Volumes/Samsung T7/Archivo/presupuesto-reforma.pdf', 'pdf', '210 KB', '3 Mar 2024', 3],
+  // Split so embedded previewers don't try to inline it as a local image.
+  ['/Volumes/Samsung T7/Archivo/fotos-2019/IMG_0001' + '.jpg', 'img', '4,8 MB', '12 Aug 2019'],
+];
+const RECENTS = [
+  '~/Proyectos/new-finder/docs/ideas/search-and-read.md',
+  '~/Downloads/Informe-trimestral-Q3.pdf',
+  '~/Downloads/Contrato-servicios-2026.docx',
+  '~/Proyectos/new-finder/README.md',
+  '~/Proyectos/new-finder/Sources/FFFBridge/engine.rs',
+  '~/Proyectos/notas/2026-11-10-reunion-producto.md',
+  '~/Downloads/Propuesta-arquitectura-ingesta.pdf',
+  '~/Proyectos/notas/TODO.txt',
+];
+const ROOTS = ['~', '/Volumes/Samsung T7'];
+const FAVS = [
+  { label: 'This Mac', path: null },
+  { label: 'Downloads', path: '~/Downloads' },
+  { label: 'Desktop', path: '~/Desktop' },
+  { label: 'new-finder', path: '~/Proyectos/new-finder', note: 'pinned' },
+  { label: 'Samsung T7', path: '/Volumes/Samsung T7', note: 'drive' },
+];
+const KINDS = [['all', 'All'], ['md', 'Markdown'], ['pdf', 'PDF'], ['docx', 'Word'], ['code', 'Code'], ['txt', 'Text']];
+const KIND_NAME = { md: 'Markdown', pdf: 'PDF', docx: 'Word document', code: 'Source code', txt: 'Plain text', img: 'Image', other: 'Disk image', folder: 'Folder' };
+
+const CONTENT = {};
+for (const s of document.querySelectorAll('script[data-doc]')) CONTENT[s.dataset.doc] = s.textContent.replace(/^\n/, '').replace(/\s+$/, '');
+
+const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+const ENTRY = new Map();
+const KIDS = new Map();
+const baseName = p => p === '~' ? 'Home' : p.slice(p.lastIndexOf('/') + 1);
+const parentOf = p => ROOTS.includes(p) ? null : p.slice(0, p.lastIndexOf('/'));
+const dirOf = e => parentOf(e.path) ?? '';
+function addFolder(p) {
+  if (ENTRY.has(p)) return;
+  ENTRY.set(p, { path: p, name: baseName(p), dir: true, kind: 'folder' });
+  KIDS.set(p, []);
+  const up = parentOf(p);
+  if (up) { addFolder(up); KIDS.get(up).push(p); }
+}
+for (const [p, kind, size, mod, pages] of FILES) {
+  const up = parentOf(p);
+  addFolder(up);
+  ENTRY.set(p, { path: p, name: baseName(p), dir: false, kind, size, mod, pages: pages || 0, ext: p.split('.').pop().toLowerCase() });
+  KIDS.get(up).push(p);
+}
+for (const e of ENTRY.values()) if (e.dir) { const n = KIDS.get(e.path).length; e.size = `${n} item${n === 1 ? '' : 's'}`; }
+const children = p => (KIDS.get(p) || []).map(c => ENTRY.get(c)).sort((a, b) => (b.dir - a.dir) || collator.compare(a.name, b.name));
+const ALL = [...ENTRY.values()].filter(e => !ROOTS.includes(e.path));
+const FOLDERS = [...ENTRY.values()].filter(e => e.dir);
+
+// ---------- state ----------
+const params = new URLSearchParams(location.search);
+const S = {
+  variant: ['A', 'B', 'C'].includes(params.get('variant')) ? params.get('variant') : 'A',
+  launch: params.get('launch') === 'cli' ? 'cli' : 'app',
+  query: '', scope: null, local: false, kind: 'all', sel: 0, lastFolder: '~',
+  screen: 'search',   // A: search | read
+  focus: 'field',     // B: field | reader
+  overlay: false, overlayNewTab: false, tabs: [], active: 0,  // C
+  listOpen: true, zoom: 100, scopeMenu: false, palette: null, help: true,
+  selectAll: false, engaged: false,
+};
+
+// ---------- fuzzy matching (stand-in for FFF) ----------
+const BOUND = /[\s\-_./·()]/;
+function fuzzy(q, text) {
+  const t = text.toLowerCase();
+  const at = t.indexOf(q);
+  if (at >= 0) {
+    const b = at === 0 || BOUND.test(t[at - 1]);
+    return { score: 100 + q.length * 12 + (b ? 40 : 0) - at, idx: Array.from({ length: q.length }, (_, i) => at + i) };
+  }
+  let qi = 0, last = -2, score = 0;
+  const idx = [];
+  for (let i = 0; i < t.length && qi < q.length; i++) {
+    if (t[i] !== q[qi]) continue;
+    let s = 8;
+    if (last === i - 1) s += 12;
+    if (i === 0 || BOUND.test(t[i - 1])) s += 14;
+    else if (text[i] !== t[i] && text[i - 1] === t[i - 1]) s += 10;
+    score += s; idx.push(i); last = i; qi++;
+  }
+  if (qi < q.length) return null;
+  score -= (idx[idx.length - 1] - idx[0] - q.length + 1) * 1.5;
+  return score >= q.length * 10 ? { score, idx } : null;
+}
+const kindOK = e => S.kind === 'all' || e.kind === S.kind;
+function list() {
+  const q = S.query.trim().toLowerCase();
+  if (!q) {
+    if (!S.scope) return RECENTS.map(p => ENTRY.get(p)).filter(kindOK).map(e => ({ e }));
+    return children(S.scope).filter(e => e.dir || kindOK(e)).map(e => ({ e }));
+  }
+  const terms = q.split(/\s+/);
+  const out = [];
+  for (const e of ALL) {
+    if (S.scope && !e.path.startsWith(S.scope + '/')) continue;
+    if (e.dir ? S.kind !== 'all' : !kindOK(e)) continue;
+    let score = 0, ok = true;
+    const hl = new Set();
+    for (const term of terms) {
+      const n = fuzzy(term, e.name);
+      if (n) { score += n.score + 60; n.idx.forEach(i => hl.add(i)); continue; }
+      const p = fuzzy(term, e.path);
+      if (p) { score += p.score * 0.5; continue; }
+      ok = false; break;
+    }
+    if (!ok) continue;
+    if (RECENTS.includes(e.path)) score += 25;
+    if (e.dir) score -= 5;
+    out.push({ e, score, hl });
+  }
+  out.sort((a, b) => b.score - a.score || collator.compare(a.e.name, b.e.name));
+  return out.slice(0, 80);
+}
+const cur = () => list()[S.sel]?.e;
+const listKey = () => `${S.query}|${S.scope}|${S.kind}`;
+const scopeLabel = () => !S.scope ? 'This Mac' : (S.local ? '$ ' : '') + baseName(S.scope);
+function target() {
+  if (S.variant === 'C' && !S.overlay) { const p = S.tabs[S.active]; return p ? ENTRY.get(p) : null; }
+  return cur();
+}
+
+// ---------- small renderers ----------
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const SEARCH_SVG = '<svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M11 11l3.5 3.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>';
+const SIDEBAR_SVG = '<svg width="16" height="14" viewBox="0 0 16 14" aria-hidden="true"><rect x=".75" y=".75" width="14.5" height="12.5" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M5.5 1v12" stroke="currentColor" stroke-width="1.4"/></svg>';
+const FOLDER_SVG = '<svg width="20" height="17" viewBox="0 0 20 17" aria-hidden="true"><path d="M1 3.2C1 2 2 1 3.2 1h4.1l2 2.2h7.5C18 3.2 19 4.2 19 5.4v8.4c0 1.2-1 2.2-2.2 2.2H3.2C2 16 1 15 1 13.8z" fill="currentColor"/></svg>';
+const LIGHTS = '<span class="lights"><i></i><i></i><i></i></span>';
+const BADGE = { md: 'M↓', pdf: 'PDF', docx: 'W', txt: 'TXT', img: 'IMG', other: 'DMG' };
+function icon(e) {
+  if (e.dir) return `<span class="ico dir">${FOLDER_SVG}</span>`;
+  return `<span class="ico k-${e.kind}">${e.kind === 'code' ? e.ext.toUpperCase().slice(0, 3) : BADGE[e.kind]}</span>`;
+}
+function hlName(name, hl) {
+  if (!hl || !hl.size) return esc(name);
+  let o = '';
+  for (let i = 0; i < name.length; i++) o += hl.has(i) ? `<mark>${esc(name[i])}</mark>` : esc(name[i]);
+  return o.replace(/<\/mark><mark>/g, '');
+}
+const hints = items => `<div class="hints">${items.map(([k, l]) => `<span><kbd>${k}</kbd>${l}</span>`).join('')}</div>`;
+const toggleBtn = () => `<button class="tb ${S.listOpen ? 'on' : ''}" data-act="toggle-list" title="Toggle list (⌘\\)">${SIDEBAR_SVG}</button>`;
+
+function rowHTML({ e, hl }, i, compact) {
+  const browsing = !S.query.trim() && S.scope;
+  const path = !compact && !browsing ? `<div class="p">${esc(dirOf(e))}</div>` : '';
+  const meta = !compact && browsing ? `<span class="m">${esc(e.dir ? e.size : e.mod)}</span>` : '';
+  return `<div class="row ${i === S.sel ? 'sel' : ''}" data-act="row" data-i="${i}" title="${esc(e.path)}">${icon(e)}<div class="t"><div class="n">${hlName(e.name, hl)}</div>${path}</div>${meta}${e.dir ? '<span class="chev">›</span>' : ''}</div>`;
+}
+function listHTML(L, { compact = false, dim = false, key = '' } = {}) {
+  const body = L.length ? L.map((it, i) => rowHTML(it, i, compact)).join('') : `<div class="empty">${S.query.trim() ? 'No matches.' : 'Nothing here.'}</div>`;
+  return `<div class="list ${compact ? 'compact' : ''} ${dim ? 'dim' : ''}" data-scroll="list" data-key="${esc(key + listKey())}">${body}</div>`;
+}
+function crumbs(p) {
+  const parts = [];
+  for (let x = p; x; x = parentOf(x)) parts.unshift(x);
+  const shown = parts.slice(-3);
+  return (parts.length > 3 ? '<span>…</span>' : '') + shown.map((x, i) =>
+    `<button data-act="crumb" data-path="${esc(x)}" class="${i === shown.length - 1 ? 'last' : ''}">${esc(baseName(x))}</button>`).join('<span>›</span>');
+}
+function listHead(pill) {
+  const q = S.query.trim();
+  if (q) return pill
+    ? `<div class="lh"><span class="qpill">${SEARCH_SVG}${esc(q)}</span><span>in ${esc(scopeLabel())}</span></div>`
+    : `<div class="lh">Results in&nbsp;<b>${esc(scopeLabel())}</b></div>`;
+  if (!S.scope) return '<div class="lh">Recently opened</div>';
+  return `<div class="lh crumbs">${crumbs(S.scope)}</div>`;
+}
+function field(cls = '') {
+  const menu = S.scopeMenu ? `<div class="menu">${FAVS.map(f =>
+    `<button data-act="scope" data-path="${esc(f.path ?? '')}" class="${(f.path ?? null) === S.scope && !S.local ? 'cur' : ''}">${esc(f.label)}${f.note ? `<small>${f.note}</small>` : ''}</button>`).join('')}
+    <button data-act="scope-local">$ Current folder<small>${esc(baseName(S.lastFolder))}</small></button></div>` : '';
+  return `<div class="field ${cls} ${S.local ? 'local' : ''}">${SEARCH_SVG}<input id="q" value="${esc(S.query)}" placeholder="Find a file in ${esc(S.scope ? baseName(S.scope) : 'This Mac')}…" autocomplete="off" spellcheck="false"><button class="scope" data-act="scope-menu" title="Where to search">${esc(scopeLabel())} ▾</button>${menu}</div>`;
+}
+const chips = () => `<div class="chips">${KINDS.map(([k, l]) => `<button class="chip ${S.kind === k ? 'on' : ''}" data-act="kind" data-k="${k}">${l}</button>`).join('')}</div>`;
+
+// ---------- document renderers ----------
+function inl(s) {
+  return esc(s)
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|[^*])\*([^*\s][^*]*)\*/g, '$1<em>$2</em>')
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a>$1</a>');
+}
+function md(src) {
+  const lines = src.split('\n'), out = [];
+  let i = 0;
+  while (i < lines.length) {
+    const l = lines[i];
+    let m;
+    if (/^```/.test(l)) {
+      const buf = [];
+      i++;
+      while (i < lines.length && !/^```/.test(lines[i])) buf.push(lines[i++]);
+      i++;
+      out.push(`<pre><code>${esc(buf.join('\n'))}</code></pre>`);
+    } else if ((m = l.match(/^(#{1,3})\s+(.*)/))) {
+      out.push(`<h${m[1].length}>${inl(m[2])}</h${m[1].length}>`); i++;
+    } else if (/^\s*[-*]\s+/.test(l)) {
+      const items = [];
+      while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) items.push(lines[i++].replace(/^\s*[-*]\s+/, ''));
+      out.push('<ul>' + items.map(t => {
+        const c = t.match(/^\[( |x)\]\s+(.*)/);
+        return c ? `<li class="task"><input type="checkbox" disabled ${c[1] === 'x' ? 'checked' : ''}>${inl(c[2])}</li>` : `<li>${inl(t)}</li>`;
+      }).join('') + '</ul>');
+    } else if (/^\d+\.\s+/.test(l)) {
+      const items = [];
+      while (i < lines.length && /^\d+\.\s+/.test(lines[i])) items.push(lines[i++].replace(/^\d+\.\s+/, ''));
+      out.push('<ol>' + items.map(t => `<li>${inl(t)}</li>`).join('') + '</ol>');
+    } else if (/^>/.test(l)) {
+      const buf = [];
+      while (i < lines.length && /^>/.test(lines[i])) buf.push(lines[i++].replace(/^>\s?/, ''));
+      out.push(`<blockquote><p>${inl(buf.join(' '))}</p></blockquote>`);
+    } else if (/^\|/.test(l)) {
+      const rows = [];
+      while (i < lines.length && /^\|/.test(lines[i])) rows.push(lines[i++]);
+      const cells = r => r.replace(/^\||\|$/g, '').split('|').map(c => c.trim());
+      const [head, , ...body] = rows;
+      out.push(`<table><thead><tr>${cells(head).map(c => `<th>${inl(c)}</th>`).join('')}</tr></thead><tbody>${body.map(r => `<tr>${cells(r).map(c => `<td>${inl(c)}</td>`).join('')}</tr>`).join('')}</tbody></table>`);
+    } else if (!l.trim()) {
+      i++;
+    } else {
+      const buf = [lines[i++]];
+      while (i < lines.length && lines[i].trim() && !/^(#{1,3}\s|```|\s*[-*]\s|\d+\.\s|>|\|)/.test(lines[i])) buf.push(lines[i++]);
+      out.push(`<p>${inl(buf.join(' '))}</p>`);
+    }
+  }
+  return out.join('');
+}
+function filler(seed, count, headings) {
+  let s = seed * 7919 + 17, o = '';
+  const rnd = () => (s = (s * 9301 + 49297) % 233280) / 233280;
+  for (let i = 0; i < count; i++) {
+    if (headings && i % 7 === 0) { o += '<div class="fl h"></div>'; continue; }
+    o += `<div class="fl" style="width:${(i % 5 === 4 ? 40 + rnd() * 30 : 88 + rnd() * 12).toFixed(1)}%"></div>`;
+  }
+  return o;
+}
+function pdfHTML(e, mode) {
+  const pages = (CONTENT[e.path] ?? '').split(/\n=== page ===\n/);
+  const n = mode === 'preview' ? Math.min(2, e.pages) : Math.min(60, e.pages);
+  let out = '';
+  for (let i = 0; i < n; i++) {
+    const body = pages[i] ? md(pages[i]) + filler(i, 6) : filler(i, 20, true);
+    out += `<div class="page" data-page="${i + 1}">${body}<div class="pno">${i + 1}</div></div>`;
+  }
+  return `<div class="pages">${out}</div>`;
+}
+const KW = {
+  rs: new Set('fn let mut pub use struct impl for in if else return unsafe extern match as const Self self'.split(' ')),
+  swift: new Set('func let var final class struct enum case switch if else guard return import private public static async await self init override extension in for'.split(' ')),
+  sh: new Set('set if then fi for do done echo export local exit'.split(' ')),
+};
+function codeHTML(e, src) {
+  const kw = KW[e.ext] ?? new Set();
+  const re = e.ext === 'sh' ? /(#.*$)|("(?:[^"\\]|\\.)*")|\b([A-Za-z_][A-Za-z0-9_]*)\b/g : /(\/\/.*$)|("(?:[^"\\]|\\.)*")|\b([A-Za-z_][A-Za-z0-9_]*)\b/g;
+  return `<div class="codev">${src.split('\n').map((line, i) => {
+    let out = '', last = 0;
+    line.replace(re, (m, com, str, word, off) => {
+      out += esc(line.slice(last, off));
+      if (com) out += `<span class="c-com">${esc(com)}</span>`;
+      else if (str) out += `<span class="c-str">${esc(str)}</span>`;
+      else if (kw.has(word)) out += `<span class="c-kw">${word}</span>`;
+      else if (/^[A-Z]/.test(word)) out += `<span class="c-ty">${word}</span>`;
+      else out += word;
+      last = off + m.length;
+      return m;
+    });
+    return `<div class="l"><span class="no">${i + 1}</span><span>${(out + esc(line.slice(last))) || ' '}</span></div>`;
+  }).join('')}</div>`;
+}
+function folderHTML(e) {
+  const kids = children(e.path);
+  return `<div class="fpv"><div class="fpv-h">${icon(e)}<div><b>${esc(e.name)}</b><div class="mm">${esc(e.size)} · <kbd>l</kbd> or <kbd>↵</kbd> opens it</div></div></div>${kids.map(k =>
+    `<div class="fr">${icon(k)}<span>${esc(k.name)}</span><span class="m">${esc(k.dir ? k.size : k.mod)}</span></div>`).join('')}</div>`;
+}
+function docHTML(e, mode) {
+  if (!e) return '<div class="nopv">Nothing selected.</div>';
+  const src = CONTENT[e.path];
+  let inner;
+  if (e.dir) inner = folderHTML(e);
+  else if (e.kind === 'md') inner = `<article class="doc">${md(src ?? `# ${e.name}`)}</article>`;
+  else if (e.kind === 'docx') inner = `<article class="doc"><div class="badge">Word · converted to Markdown · read-only</div>${md(src ?? `# ${e.name}`)}</article>`;
+  else if (e.kind === 'pdf') inner = pdfHTML(e, mode);
+  else if (e.kind === 'code') inner = codeHTML(e, src ?? '');
+  else if (e.kind === 'txt') inner = `<pre class="plaintext">${esc(src ?? '')}</pre>`;
+  else if (e.kind === 'img') inner = `<div class="imgph">${esc(e.name)}</div><p class="meta-card">${esc(e.size)} · ${esc(e.mod)}</p>`;
+  else inner = `<div class="nopv">${icon(e)}<div><b>${esc(e.name)}</b><br>${esc(KIND_NAME[e.kind])} · ${esc(e.size)}</div><div>No preview. <kbd>⌘↵</kbd> opens it with its default app.</div></div>`;
+  return `<div class="dv ${mode}">${inner}</div>`;
+}
+function readerHead(e, { lead = '', cls = '' } = {}) {
+  const pdf = e && e.kind === 'pdf';
+  return `<div class="bar ${cls}">${lead}<div class="rt"><b>${esc(e ? e.name : '')}</b><span>${esc(e ? dirOf(e) : '')}</span></div><span class="sp"></span>${pdf ? `<span class="pageind" id="pageind" data-total="${e.pages}">Page 1 of ${e.pages}</span>` : ''}<button class="tb" data-act="find" title="Find (⌘F)">${SEARCH_SVG}</button><span class="zoom"><button class="tb" data-act="zoom" data-d="-10" title="Zoom out (⌘−)">−</button><span>${S.zoom}%</span><button class="tb" data-act="zoom" data-d="10" title="Zoom in (⌘+)">+</button></span><button class="tb" data-act="editor" title="Open in editor (⌘↵)">Editor</button><button class="tb" data-act="actions" title="Actions (⌘K)">⋯</button><div class="prog" id="prog"></div></div>`;
+}
+const readerBody = e => `<div class="reader-body" data-scroll="reader" data-key="${esc(e?.path ?? '')}" data-act="focus-reader" style="--z:${S.zoom / 100}">${docHTML(e, 'read')}</div>`;
+function previewPane(e) {
+  if (!e) return '<div class="pv"><div class="nopv">Nothing selected.</div></div>';
+  const meta = KIND_NAME[e.kind] + (e.dir ? ` · ${e.size}` : ` · ${e.size} · ${e.mod}`);
+  return `<div class="pv"><div class="pv-head">${icon(e)}<div class="t"><div class="n">${esc(e.name)}</div><div class="mm">${esc(meta)}</div></div><span class="mm"><kbd>↵</kbd> ${e.dir ? 'Open' : 'Read'}</span></div><div class="pv-body" data-scroll="pv" data-key="${esc(e.path)}">${docHTML(e, 'preview')}</div></div>`;
+}
+
+// ---------- variant A: two screens ----------
+function renderA(L) {
+  const e = L[S.sel]?.e;
+  if (S.screen === 'search') return `<div class="bar flat">${LIGHTS}<span class="sp"></span><button class="tb" data-act="actions">Actions <kbd>⌘K</kbd></button></div>
+    <div class="a-search">
+      <div class="a-top">${field()}${chips()}</div>
+      <div class="a-body"><div class="col">${listHead()}${listHTML(L)}</div>${previewPane(e)}</div>
+      ${hints([['↵', e?.dir ? 'Open folder' : 'Read'], ['⌘↵', 'Editor'], ['⇥', 'Show folder'], ['$', 'Current folder'], ['⌘K', 'Actions']])}
+    </div>`;
+  return `${readerHead(e, { lead: LIGHTS + '<button class="tb" data-act="back" title="Back to search (Esc)">‹ Search</button>' + toggleBtn() })}
+    <div class="a-read ${S.listOpen ? '' : 'nolist'}"><aside class="side">${listHead(true)}${listHTML(L, { compact: true })}</aside><section class="reader">${readerBody(e)}</section></div>`;
+}
+function keyA(ev, typing) {
+  if (S.screen === 'search') {
+    if (fieldKey(ev, () => { S.screen = 'read'; render(); })) return;
+    if (ev.key === 'Escape' && S.query) { S.query = ''; S.sel = 0; render(); }
+    else if (!typing && ev.key.length === 1 && !ev.metaKey && !ev.ctrlKey) document.getElementById('q')?.focus();
+    return;
+  }
+  if (typing) return;
+  if (ev.key === 'Escape') { S.screen = 'search'; render(); return; }
+  readerKey(ev);
+}
+
+// ---------- variant B: one screen ----------
+function renderB(L) {
+  const e = L[S.sel]?.e, reading = S.focus === 'reader';
+  return `<div class="b ${S.listOpen ? '' : 'nolist'}">
+    <aside class="b-left">
+      <div class="b-top">${LIGHTS}</div>
+      <div class="b-search">${field('sm')}${chips()}</div>
+      ${listHead()}${listHTML(L, { dim: reading })}
+      ${hints([['↵', 'Read'], ['⇥', 'Folder'], ['⌘K', 'Actions']])}
+    </aside>
+    <section class="reader ${reading ? 'focused' : ''}">${readerHead(e, { lead: (S.listOpen ? '' : LIGHTS) + toggleBtn() })}${readerBody(e)}</section>
+  </div>`;
+}
+function keyB(ev, typing) {
+  if (S.focus === 'field') {
+    if (fieldKey(ev, () => { S.focus = 'reader'; render(); })) return;
+    if (ev.key === 'Escape' && S.query) { S.query = ''; S.sel = 0; render(); }
+    else if (!typing && ev.key.length === 1 && !ev.metaKey && !ev.ctrlKey) document.getElementById('q')?.focus();
+    return;
+  }
+  if (typing) return;
+  if (ev.key === 'Escape' || ev.key === '/') { ev.preventDefault(); S.focus = 'field'; render(); return; }
+  readerKey(ev);
+}
+
+// ---------- variant C: reader first, search palette ----------
+function renderC(L) {
+  const path = S.tabs[S.active], e = path ? ENTRY.get(path) : null;
+  const tabs = S.tabs.map((p, i) => {
+    const t = ENTRY.get(p);
+    return `<div class="tab ${i === S.active ? 'on' : ''}" data-act="tab" data-i="${i}" title="${esc(t.path)}">${icon(t)}<span class="tn">${esc(t.name)}</span><button class="x" data-act="tab-close" data-i="${i}" title="Close tab">×</button></div>`;
+  }).join('');
+  const main = e ? readerHead(e, { lead: toggleBtn(), cls: 'light' }) + readerBody(e) : emptyC();
+  return `<div class="tabsbar">${LIGHTS}${tabs}<button class="tb" data-act="new-tab" title="New tab (search)">+</button><button class="searchbtn" data-act="open-overlay">${SEARCH_SVG}<span>Search files</span><kbd>⌘P</kbd></button></div>
+    <div class="c-main ${S.listOpen && e ? '' : 'nodrawer'}"><aside class="side">${listHead(true)}${listHTML(L, { compact: true })}</aside><section class="reader">${main}</section></div>
+    ${S.overlay ? overlayC(L) : ''}`;
+}
+function emptyC() {
+  return `<div class="c-empty"><button class="fakefield" data-act="open-overlay">${SEARCH_SVG}<span>Find a file…</span><kbd>⌘P</kbd></button>
+    <div class="recent"><div class="lh">Recently opened</div>${RECENTS.map(p => ENTRY.get(p)).map(r =>
+      `<div class="row" data-act="open-recent" data-path="${esc(r.path)}">${icon(r)}<div class="t"><div class="n">${esc(r.name)}</div><div class="p">${esc(dirOf(r))}</div></div><span class="m">${esc(r.mod)}</span></div>`).join('')}</div></div>`;
+}
+function overlayC(L) {
+  return `<div class="ov-bg" data-act="ov-bg"><div class="ov">
+    <div class="ov-top">${field('ovf')}${chips()}</div>
+    <div class="ov-body"><div class="col">${listHead()}${listHTML(L, { key: 'ov|' })}</div>${previewPane(L[S.sel]?.e)}</div>
+    ${hints([['↵', S.overlayNewTab ? 'Open in new tab' : 'Open'], ['⌥↵', 'New tab'], ['⇥', 'Show folder'], ['Esc', 'Close']])}
+  </div></div>`;
+}
+function keyC(ev, typing) {
+  if (S.overlay) {
+    if (ev.key === 'Tab') {
+      ev.preventDefault();
+      const e = cur();
+      if (e) { reveal(e); S.overlay = false; S.listOpen = true; if (!e.dir) openTab(e.path); render(); }
+      return;
+    }
+    if (fieldKey(ev, (e, kev) => { openTab(e.path, kev.altKey || S.overlayNewTab); closeOverlay(); })) return;
+    if (ev.key === 'Escape') closeOverlay();
+    else if (!typing && ev.key.length === 1 && !ev.metaKey && !ev.ctrlKey) document.getElementById('q')?.focus();
+    return;
+  }
+  if (typing || !S.tabs.length) return;
+  if (ev.key === '/') { ev.preventDefault(); openOverlay(); return; }
+  readerKey(ev);
+}
+function openTab(path, newTab) {
+  const at = S.tabs.indexOf(path);
+  if (at >= 0) { S.active = at; return; }
+  if (newTab || !S.tabs.length) { S.tabs.push(path); S.active = S.tabs.length - 1; }
+  else S.tabs[S.active] = path;
+}
+function openOverlay(newTab = false) { S.overlay = true; S.overlayNewTab = newTab; S.selectAll = true; S.engaged = true; render(); }
+function closeOverlay() { S.overlay = false; S.overlayNewTab = false; render(); }
+
+const VARIANTS = {
+  A: { name: 'Dos pantallas', render: renderA, key: keyA },
+  B: { name: 'Una pantalla', render: renderB, key: keyB },
+  C: { name: 'Lector + paleta', render: renderC, key: keyC },
+};
+
+// ---------- shared navigation ----------
+function move(d) {
+  const n = list().length;
+  if (!n) return;
+  S.sel = Math.min(n - 1, Math.max(0, S.sel + d));
+  if (S.variant === 'C' && !S.overlay) { const e = cur(); if (e && !e.dir) openTab(e.path); }
+  render();
+}
+function browse(path) { Object.assign(S, { scope: path, local: false, query: '', sel: 0, scopeMenu: false, lastFolder: path }); }
+function enter(e) { browse(e.path); render(); }
+function up() {
+  if (!S.scope || S.query.trim()) return;
+  const from = S.scope, p = parentOf(from);
+  if (!p) return;
+  browse(p);
+  S.sel = Math.max(0, list().findIndex(it => it.e.path === from));
+  render();
+}
+function reveal(e) {
+  browse(e.dir ? e.path : parentOf(e.path));
+  S.sel = Math.max(0, list().findIndex(it => it.e.path === e.path));
+}
+function openFile(e) {
+  if (S.variant === 'A') S.screen = 'read';
+  else if (S.variant === 'B') S.focus = 'reader';
+  else { openTab(e.path); S.overlay = false; }
+}
+function editor(e) {
+  if (!e || e.dir) return;
+  toast(`Would hand “${e.name}” to ${['md', 'code', 'txt'].includes(e.kind) ? 'your editor' : 'its default app'}.`);
+}
+function zoom(d) { S.zoom = Math.min(200, Math.max(70, S.zoom + d)); render(); }
+// Keys while the search field drives the list.
+function fieldKey(ev, onEnter) {
+  const k = ev.key, e = cur();
+  if (k === 'ArrowDown' || (ev.ctrlKey && (k === 'j' || k === 'n'))) { ev.preventDefault(); move(1); return true; }
+  if (k === 'ArrowUp' || (ev.ctrlKey && (k === 'k' || k === 'p'))) { ev.preventDefault(); move(-1); return true; }
+  if (k === 'Enter' && ev.metaKey) { ev.preventDefault(); editor(e); return true; }
+  if (k === 'Enter') { ev.preventDefault(); if (e) e.dir ? enter(e) : onEnter(e, ev); return true; }
+  if (k === 'Tab') { ev.preventDefault(); if (e) { reveal(e); render(); } return true; }
+  if (ev.metaKey && k === 'ArrowUp') { ev.preventDefault(); up(); return true; }
+  if (k === 'Backspace' && !S.query && S.scope) { ev.preventDefault(); Object.assign(S, { scope: null, local: false, sel: 0 }); render(); return true; }
+  return false;
+}
+// Vim-style keys while reading: j/k change document, h/l walk folders, arrows/space scroll.
+function readerKey(ev) {
+  const k = ev.key, e = cur();
+  if (ev.metaKey || ev.ctrlKey) { if (k === 'Enter') editor(target()); return; }
+  if (k === 'j') return move(1);
+  if (k === 'k') return move(-1);
+  if (k === 'h') return up();
+  if ((k === 'l' || k === 'Enter') && e?.dir) return enter(e);
+  const rb = app.querySelector('[data-scroll="reader"]');
+  if (!rb) return;
+  if (k === 'ArrowDown' || k === 'ArrowUp') { ev.preventDefault(); rb.scrollBy(0, k === 'ArrowDown' ? 64 : -64); }
+  else if (k === ' ') { ev.preventDefault(); rb.scrollBy(0, (ev.shiftKey ? -1 : 1) * rb.clientHeight * 0.85); }
+}
+
+// ---------- actions palette (⌘K / ⌘⇧P) ----------
+const ACTIONS = [
+  { id: 'read', label: 'Read', sc: '↵', ok: t => t && !t.dir },
+  { id: 'open', label: 'Open folder', sc: '↵', ok: t => t && t.dir },
+  { id: 'editor', label: 'Open in editor', sc: '⌘↵', ok: t => t && !t.dir },
+  { id: 'default', label: 'Open with default app', ok: t => t && !t.dir },
+  { id: 'reveal', label: 'Show in folder', sc: '⇥', ok: t => !!t },
+  { id: 'path', label: 'Copy path', sc: '⌥⌘C', ok: t => !!t },
+  { id: 'copy', label: 'Copy to…', ok: t => !!t },
+  { id: 'move', label: 'Move to…', ok: t => !!t },
+  { id: 'airdrop', label: 'Send with AirDrop', ok: t => t && !t.dir },
+  { id: 'activity', label: 'Activity Monitor', note: 'own window', sc: '⌥⌘A', ok: () => true },
+  { id: 'theme', label: 'Toggle light / dark', ok: () => true },
+];
+function openPalette() { S.palette = { step: 'actions', query: '', sel: 0, t: target() }; S.engaged = true; render(); }
+function paletteItems() {
+  const P = S.palette, q = P.query.trim().toLowerCase();
+  if (P.step === 'actions') return ACTIONS.filter(a => a.ok(P.t) && (!q || fuzzy(q, a.label)))
+    .map(a => ({ label: a.label, sc: a.sc, note: a.note, run: () => runAction(a.id, P.t) }));
+  const here = parentOf(P.t.path);
+  return FOLDERS.filter(f => f.path !== here && f.path !== P.t.path && !f.path.startsWith(P.t.path + '/'))
+    .map(f => ({ f, m: q ? fuzzy(q, f.path) : { score: 0 } })).filter(x => x.m)
+    .sort((a, b) => b.m.score - a.m.score).slice(0, 40)
+    .map(({ f }) => ({ label: f.path, icon: icon(f), run: () => finishTransfer(P.action, P.t, f.path) }));
+}
+function paletteHTML() {
+  const P = S.palette, items = paletteItems();
+  if (P.sel >= items.length) P.sel = Math.max(0, items.length - 1);
+  const title = P.step === 'actions'
+    ? (P.t ? `${icon(P.t)}<span>${esc(P.t.name)}</span>` : '<span>No file selected</span>')
+    : `<span>${P.action === 'copy' ? 'Copy' : 'Move'} “${esc(P.t.name)}” to…</span>`;
+  const rows = items.map((it, i) => `<div class="pal-row ${i === P.sel ? 'sel' : ''}" data-act="pal-row" data-i="${i}">${it.icon ?? ''}<span>${esc(it.label)}</span>${it.note ? `<small>${esc(it.note)}</small>` : ''}<span class="sc">${esc(it.sc ?? '')}</span></div>`).join('');
+  return `<div class="pal-bg" data-act="pal-bg"></div><div class="palette"><div class="pal-target">${title}</div><input id="pq" value="${esc(P.query)}" placeholder="${P.step === 'actions' ? 'Type an action…' : 'Type a folder…'}" autocomplete="off" spellcheck="false"><div class="pal-list">${rows || '<div class="empty">Nothing matches.</div>'}</div></div>`;
+}
+function paletteKey(ev) {
+  const k = ev.key, P = S.palette, n = paletteItems().length;
+  if (k === 'Escape') { ev.preventDefault(); S.palette = P.step === 'actions' ? null : { step: 'actions', query: '', sel: 0, t: P.t }; render(); }
+  else if (k === 'ArrowDown' || (ev.ctrlKey && (k === 'j' || k === 'n'))) { ev.preventDefault(); P.sel = Math.min(n - 1, P.sel + 1); render(); }
+  else if (k === 'ArrowUp' || (ev.ctrlKey && (k === 'k' || k === 'p'))) { ev.preventDefault(); P.sel = Math.max(0, P.sel - 1); render(); }
+  else if (k === 'Enter') { ev.preventDefault(); paletteItems()[P.sel]?.run(); }
+}
+function runAction(id, t) {
+  S.palette = null;
+  if (id === 'read') openFile(t);
+  else if (id === 'open') browse(t.path);
+  else if (id === 'editor') editor(t);
+  else if (id === 'default') toast(`Would open “${t.name}” with its default app.`);
+  else if (id === 'reveal') { reveal(t); if (S.variant === 'C') S.listOpen = true; }
+  else if (id === 'path') { try { navigator.clipboard.writeText(t.path).catch(() => {}); } catch {} toast(`Copied ${t.path}`); }
+  else if (id === 'copy' || id === 'move') S.palette = { step: 'dest', action: id, query: '', sel: 0, t };
+  else if (id === 'airdrop') toast(`Would open the native AirDrop picker for “${t.name}”.`);
+  else if (id === 'activity') toast('Activity Monitor opens in its own window. Not part of this prototype.');
+  else if (id === 'theme') toggleTheme();
+  render();
+}
+function finishTransfer(action, t, dest) {
+  S.palette = null;
+  const vol = p => p.startsWith('/Volumes/') ? p.split('/').slice(0, 3).join('/') : '~';
+  if (action === 'copy') toast(`Prototype: would copy “${t.name}” to ${dest}. Existing names are skipped, never replaced.`);
+  else if (vol(t.path) === vol(dest)) toast(`Prototype: would move “${t.name}” to ${dest} (a rename on the same disk).`);
+  else toast('Moving to another disk means copy, then delete. Left for a later phase.');
+  render();
+}
+
+// ---------- render loop ----------
+const app = document.getElementById('app');
+function wantField() { return S.variant === 'A' ? S.screen === 'search' : S.variant === 'B' ? S.focus === 'field' : S.overlay; }
+function keepVisible(row) {
+  const box = row.parentElement, top = row.offsetTop, bottom = top + row.offsetHeight;
+  if (top < box.scrollTop) box.scrollTop = top - 6;
+  else if (bottom > box.scrollTop + box.clientHeight) box.scrollTop = bottom - box.clientHeight + 6;
+}
+function onReaderScroll(el) {
+  const max = el.scrollHeight - el.clientHeight;
+  const prog = document.getElementById('prog');
+  if (prog) prog.style.width = (max > 0 ? el.scrollTop / max * 100 : 0) + '%';
+  const ind = document.getElementById('pageind');
+  if (!ind) return;
+  const y = el.scrollTop + el.clientHeight * 0.3;
+  let page = 1;
+  for (const p of el.querySelectorAll('.page')) { if (p.offsetTop <= y) page = +p.dataset.page; else break; }
+  ind.textContent = `Page ${page} of ${ind.dataset.total}`;
+}
+function render() {
+  const saved = {};
+  for (const el of app.querySelectorAll('[data-scroll]')) saved[el.dataset.scroll + '|' + el.dataset.key] = el.scrollTop;
+  const q = document.getElementById('q');
+  const caret = q && document.activeElement === q ? q.selectionStart : null;
+  const L = list();
+  if (S.sel >= L.length) S.sel = Math.max(0, L.length - 1);
+  app.innerHTML = VARIANTS[S.variant].render(L) + (S.palette ? paletteHTML() : '');
+  for (const el of app.querySelectorAll('[data-scroll]')) {
+    const key = el.dataset.scroll + '|' + el.dataset.key;
+    if (key in saved) el.scrollTop = saved[key];
+  }
+  for (const row of app.querySelectorAll('[data-scroll="list"] .row.sel')) keepVisible(row);
+  for (const el of app.querySelectorAll('[data-scroll="reader"]')) { el.onscroll = () => onReaderScroll(el); onReaderScroll(el); }
+  if (S.engaged && S.palette) document.getElementById('pq')?.focus({ preventScroll: true });
+  else if (S.engaged && wantField()) {
+    const nq = document.getElementById('q');
+    if (nq) {
+      nq.focus({ preventScroll: true });
+      if (S.selectAll) { nq.select(); S.selectAll = false; }
+      else { const c = Math.min(caret ?? nq.value.length, nq.value.length); nq.setSelectionRange(c, c); }
+    }
+  } else if (app.contains(document.activeElement)) document.activeElement.blur();
+  renderBar();
+}
+
+// ---------- events ----------
+document.addEventListener('pointerdown', () => { S.engaged = true; }, true);
+app.addEventListener('click', ev => {
+  const a = ev.target.closest('[data-act]');
+  if (!a) { if (S.scopeMenu) { S.scopeMenu = false; render(); } return; }
+  const act = a.dataset.act, i = +a.dataset.i;
+  if (act !== 'scope-menu' && act !== 'scope' && act !== 'scope-local') S.scopeMenu = false;
+  switch (act) {
+    case 'row':
+      S.sel = i;
+      if (S.variant === 'C' && !S.overlay) { const e = cur(); if (e && !e.dir) openTab(e.path); }
+      break;
+    case 'scope-menu': S.scopeMenu = !S.scopeMenu; break;
+    case 'scope': { const p = a.dataset.path || null; Object.assign(S, { scope: p, local: false, sel: 0, scopeMenu: false }); if (p) S.lastFolder = p; break; }
+    case 'scope-local': Object.assign(S, { scope: S.lastFolder, local: true, sel: 0, scopeMenu: false }); break;
+    case 'kind': S.kind = a.dataset.k; S.sel = 0; break;
+    case 'crumb': browse(a.dataset.path); break;
+    case 'back': S.screen = 'search'; break;
+    case 'toggle-list': S.listOpen = !S.listOpen; break;
+    case 'zoom': return zoom(+a.dataset.d);
+    case 'editor': return editor(target());
+    case 'actions': return openPalette();
+    case 'find': return toast('Find in document: not simulated in this prototype.');
+    case 'focus-reader': if (S.variant !== 'B' || S.focus === 'reader') return; S.focus = 'reader'; break;
+    case 'tab': S.active = i; break;
+    case 'tab-close': S.tabs.splice(i, 1); S.active = Math.max(0, Math.min(S.active, S.tabs.length - 1)); break;
+    case 'open-overlay': return openOverlay();
+    case 'new-tab': return openOverlay(true);
+    case 'ov-bg': if (ev.target !== a) return; S.overlay = false; break;
+    case 'open-recent': openTab(a.dataset.path); break;
+    case 'pal-bg': S.palette = null; break;
+    case 'pal-row': S.palette.sel = i; return paletteItems()[i]?.run();
+  }
+  render();
+});
+app.addEventListener('dblclick', ev => {
+  if (!ev.target.closest('[data-act="row"]')) return;
+  const e = cur();
+  if (!e) return;
+  if (e.dir) enter(e); else { openFile(e); render(); }
+});
+app.addEventListener('input', ev => {
+  if (ev.target.id === 'q') {
+    const raw = ev.target.value;
+    let v = raw;
+    if (v.startsWith('$')) { v = v.slice(1); Object.assign(S, { scope: S.lastFolder, local: true }); }
+    if (!v && S.local && !raw.startsWith('$')) Object.assign(S, { scope: null, local: false }); // clearing a $ search restores This Mac
+    Object.assign(S, { query: v, sel: 0, scopeMenu: false });
+    render();
+  } else if (ev.target.id === 'pq') {
+    S.palette.query = ev.target.value; S.palette.sel = 0; render();
+  }
+});
+app.addEventListener('focusin', ev => {
+  if (ev.target.id === 'q' && S.variant === 'B' && S.focus !== 'field') { S.focus = 'field'; render(); }
+});
+document.addEventListener('keydown', ev => {
+  const k = ev.key, meta = ev.metaKey;
+  if (ev.altKey && /^Digit[123]$/.test(ev.code)) { ev.preventDefault(); return switchVariant('ABC'[+ev.code.slice(5) - 1]); }
+  if (S.palette) return paletteKey(ev);
+  if (meta && (k.toLowerCase() === 'k' || (ev.shiftKey && k.toLowerCase() === 'p'))) { ev.preventDefault(); return openPalette(); }
+  if (meta && k.toLowerCase() === 'p') { ev.preventDefault(); return focusSearch(); }
+  if (meta && k === '\\') { ev.preventDefault(); S.listOpen = !S.listOpen; return render(); }
+  if (meta && (k === '=' || k === '+')) { ev.preventDefault(); return zoom(10); }
+  if (meta && k === '-') { ev.preventDefault(); return zoom(-10); }
+  if (meta && k === '0') { ev.preventDefault(); S.zoom = 100; return render(); }
+  if (meta && k.toLowerCase() === 'f') { ev.preventDefault(); return toast('Find in document: not simulated in this prototype.'); }
+  if (S.scopeMenu && k === 'Escape') { S.scopeMenu = false; return render(); }
+  VARIANTS[S.variant].key(ev, ev.target instanceof HTMLInputElement);
+});
+function focusSearch() {
+  S.engaged = true;
+  if (S.variant === 'C') return openOverlay();
+  if (S.variant === 'A') S.screen = 'search'; else S.focus = 'field';
+  S.selectAll = true;
+  render();
+}
+
+// ---------- prototype chrome ----------
+function toast(msg) {
+  const el = document.createElement('div');
+  el.className = 'toast';
+  el.textContent = msg;
+  document.getElementById('toasts').appendChild(el);
+  setTimeout(() => el.remove(), 2800);
+}
+function toggleTheme() {
+  const dark = getComputedStyle(document.documentElement).getPropertyValue('--is-dark').trim() === '1';
+  document.documentElement.dataset.theme = dark ? 'light' : 'dark';
+}
+function launch(mode) {
+  Object.assign(S, { launch: mode, query: '', scope: null, local: false, kind: 'all', sel: 0, scopeMenu: false, palette: null, overlay: false, zoom: 100, tabs: [], active: 0, lastFolder: '~' });
+  if (mode === 'cli') {
+    browse('~/Proyectos/new-finder');
+    S.sel = Math.max(0, list().findIndex(it => it.e.name === 'README.md'));
+    Object.assign(S, { screen: 'read', focus: 'reader', tabs: [cur().path], listOpen: true });
+  } else {
+    Object.assign(S, { screen: 'search', focus: 'field', listOpen: S.variant !== 'C' });
+  }
+  render();
+}
+function switchVariant(v) {
+  if (v === S.variant) return;
+  const e = target();
+  const reading = S.variant === 'A' ? S.screen === 'read' : S.variant === 'B' ? S.focus === 'reader' : S.tabs.length > 0 && !S.overlay;
+  Object.assign(S, { variant: v, overlay: false, palette: null, scopeMenu: false, screen: reading ? 'read' : 'search', focus: reading ? 'reader' : 'field' });
+  if (v === 'C') Object.assign(S, { tabs: reading && e && !e.dir ? [e.path] : [], active: 0, listOpen: reading && S.launch === 'cli' });
+  else S.listOpen = true;
+  render();
+}
+const HELP = {
+  A: { idea: 'Buscar ocupa la ventana: campo, filtros, lista y vista previa. ↵ abre Leer a pantalla completa con una lista estrecha a la izquierda. Esc vuelve a Buscar con la misma selección.',
+    keys: [['↑↓ ⌃J ⌃K', 'mover en la lista'], ['↵', 'leer · entrar en carpeta'], ['⇥', 'ver la carpeta del fichero'], ['$', 'buscar en la carpeta actual'], ['⌫', 'con el campo vacío, volver a This Mac'],
+      ['j k', 'en Leer: documento siguiente / anterior'], ['h l', 'en Leer: subir / entrar en carpeta'], ['↑↓ espacio', 'en Leer: scroll'], ['⌘\\', 'mostrar u ocultar la lista'], ['Esc', 'volver a Buscar']] },
+  B: { idea: 'Una sola pantalla: lista a la izquierda y lector a la derecha, siempre. No hay vista previa aparte; lo que seleccionas ya está abierto en el lector. ↵ pasa el foco al lector y Esc lo devuelve al campo.',
+    keys: [['↑↓ ⌃J ⌃K', 'mover (foco en el campo)'], ['↵', 'foco al lector · entrar en carpeta'], ['⇥', 'ver la carpeta del fichero'], ['$', 'buscar en la carpeta actual'],
+      ['j k', 'en el lector: documento siguiente / anterior'], ['h l', 'en el lector: subir / entrar en carpeta'], ['↑↓ espacio', 'en el lector: scroll'], ['Esc /', 'volver al campo'], ['⌘\\', 'ocultar la lista']] },
+  C: { idea: 'El lector es la ventana y cada documento es una pestaña. Buscar es una paleta encima (⌘P o el botón). La lista lateral (⌘\\) muestra la última búsqueda o la carpeta.',
+    keys: [['⌘P /', 'abrir la paleta de búsqueda'], ['↵', 'abrir en la pestaña actual'], ['⌥↵ +', 'abrir en pestaña nueva'], ['⇥', 'ver la carpeta en el lateral'],
+      ['j k', 'documento siguiente / anterior'], ['h l', 'subir / entrar en carpeta'], ['⌘\\', 'mostrar u ocultar el lateral'], ['Esc', 'cerrar la paleta']] },
+};
+const COMMON_KEYS = [['⌘K ⌘⇧P', 'acciones: copiar a…, mover a…, AirDrop'], ['⌘+ ⌘− ⌘0', 'zoom'], ['⌥1 ⌥2 ⌥3', 'cambiar de variante']];
+const bar = document.getElementById('protobar');
+const help = document.getElementById('help');
+function renderBar() {
+  const e = target();
+  const where = S.variant === 'A' ? `pantalla=${S.screen === 'search' ? 'buscar' : 'leer'}`
+    : S.variant === 'B' ? `foco=${S.focus === 'field' ? 'campo' : 'lector'}`
+    : `paleta=${S.overlay ? 'abierta' : 'cerrada'} pestañas=${S.tabs.length}`;
+  bar.innerHTML = `<div class="pb-pill"><button data-pb="prev" title="Variante anterior (⌥1-3)">‹</button><span class="lab"><b>${S.variant}</b>${VARIANTS[S.variant].name}</span><button data-pb="next" title="Variante siguiente">›</button></div>
+    <div class="pb-pill"><span class="lab dim">Arranque</span><button data-pb="launch" data-m="app" class="${S.launch === 'app' ? 'on' : ''}">App</button><button data-pb="launch" data-m="cli" class="${S.launch === 'cli' ? 'on' : ''}" title="Simula abrir una carpeta desde terminal">crawler ~/…/new-finder</button></div>
+    <button data-pb="theme" title="Tema claro u oscuro">◐</button><button data-pb="help" class="${S.help ? 'on' : ''}" title="Idea y teclas de la variante">?</button>
+    <code class="pb-state">${esc(where)} · ámbito=${esc(scopeLabel())} · consulta="${esc(S.query)}" · tipo=${S.kind} · sel=${esc(e?.name ?? '—')}</code>`;
+  help.hidden = !S.help;
+  if (S.help) {
+    const H = HELP[S.variant];
+    help.innerHTML = `<button class="x" data-pb="help" title="Cerrar">×</button><h4>${S.variant} · ${VARIANTS[S.variant].name}</h4><p>${esc(H.idea)}</p><dl>${[...H.keys, ...COMMON_KEYS].map(([k, d]) => `<dt>${esc(k)}</dt><dd>${esc(d)}</dd>`).join('')}</dl><p class="foot">Datos simulados: nada toca el disco. «crawler ~/…/new-finder» simula abrir una carpeta desde terminal.</p>`;
+  }
+  try {
+    const u = new URL(location.href);
+    u.searchParams.set('variant', S.variant);
+    u.searchParams.set('launch', S.launch);
+    history.replaceState(null, '', u);
+  } catch {}
+}
+function onBarClick(ev) {
+  const b = ev.target.closest('[data-pb]');
+  if (!b) return;
+  const act = b.dataset.pb;
+  if (act === 'prev' || act === 'next') switchVariant('ABC'[('ABC'.indexOf(S.variant) + (act === 'next' ? 1 : 2)) % 3]);
+  else if (act === 'launch') launch(b.dataset.m);
+  else if (act === 'theme') toggleTheme();
+  else if (act === 'help') { S.help = !S.help; renderBar(); }
+}
+bar.addEventListener('click', onBarClick);
+help.addEventListener('click', onBarClick);
+
+// Full window when opened directly in a browser; fixed height when embedded.
+if (window.self === window.top && window.innerWidth >= 1000) {
+  document.documentElement.classList.add('standalone');
+  const fit = () => document.documentElement.style.setProperty('--frame-h', innerHeight + 'px');
+  fit();
+  addEventListener('resize', fit);
+  S.engaged = true;
+}
+launch(S.launch);
+</script>
+</body>
+</html>

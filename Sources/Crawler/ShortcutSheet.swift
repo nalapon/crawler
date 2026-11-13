@@ -4,36 +4,31 @@ import AppKit
 final class ShortcutSheet: Surface {
   var dismiss: (() -> Void)?
   private var activity = false
+  private let sectionEntries = [
+    ("⌘1 … ⌘4", "Search, Folders, Activity, Transfers"),
+    ("⌘,", "Settings"),
+    ("⌘K / ⌘⇧P", "Commands"),
+  ]
   private let fileEntries = [
+    ("⌘P", "Search This Mac"),
     ("↑ ↓  /  j k", "Select file"),
-    ("← →  /  h l", "Previous / narrow scope"),
+    ("← →  /  h l", "Parent folder / open folder"),
     ("⌃D / ⌃U", "Half page of results"),
     ("gg / G", "First / last result"),
     ("/ or i", "Focus search"),
-    ("⌘↵", "Reveal parent folder"),
-    ("⇧V", "Start / finish range selection"),
-    ("x", "Mark individual item"),
+    ("$", "Search the current folder"),
     ("↵", "Open file / enter folder"),
-    ("Esc Esc", "Close PDF reader"),
-    ("Esc", "Cancel / close shortcuts"),
+    ("⌘↵", "Show in Folders"),
     ("Space", "Preview file"),
-    ("⌘T", "New tab at current folder"),
-    ("⌃Tab / ⌃⇧Tab", "Next / previous tab"),
-    ("⌘⌥1…9", "Jump to tab 1–9"),
-    ("⌘W", "Close current tab"),
-    ("⌘⇧P", "Command palette"),
-    ("⌘P", "Focus file search"),
-    ("⌘R", "Refresh folder"),
-    ("⌘L", "Edit folder path"),
-    ("⌘B", "Toggle sidebar"),
-    ("Hold ⌘", "Peek at sidebar shortcuts"),
-    ("⌘1…4", "Favorites and locations"),
-    ("⌘⇧1…5", "Utilities"),
+    ("Esc Esc", "Close the reader"),
+    ("⌘[ / ⌘]", "Back / forward in Folders"),
+    ("⌘L", "Go to a folder path"),
+    ("⌘R", "Refresh"),
     ("⌘?", "Toggle this sheet"),
   ]
   private var entries: [(String, String)] {
-    guard activity else { return fileEntries }
-    return [
+    guard activity else { return sectionEntries + fileEntries }
+    return sectionEntries + [
       ("↑ ↓ / j k", "Select process or box"),
       ("Tab", "Switch process list / map"),
       ("↵ / l / →", "Expand group / explore box"),
@@ -49,12 +44,6 @@ final class ShortcutSheet: Surface {
       ("⌘R", "Refresh sample"),
       ("⌘I", "Inspect process / group"),
       ("⌘⌫", "Quit selected process…"),
-      ("⌘T / ⌘W", "New / close tab"),
-      ("⌃Tab / ⌃⇧Tab", "Next / previous tab"),
-      ("⌘⌥1…9", "Jump to tab"),
-      ("⌘⇧P", "Command palette"),
-      ("⌘B", "Toggle sidebar"),
-      ("⌘⇧1…5", "Utilities"),
       ("⌘?", "Toggle this sheet"),
     ]
   }

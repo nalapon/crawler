@@ -44,13 +44,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
   /// URLs delivered before the workspace exists (cold launch through `open`).
   private var pendingURLs: [URL] = []
   /// Folders and files sent by `open`, the `crawler` CLI, Finder or the Dock icon.
-  /// Folders open in the workspace; files follow the normal Enter policy.
+  /// Folders open in Folders; files follow the normal Enter policy.
   func application(_ sender: NSApplication, open urls: [URL]) {
     guard let workspace else { pendingURLs += urls; return }
     for url in urls {
       let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey])
       if values?.isDirectory == true, values?.isPackage != true {
-        workspace.navigate(.folder(FolderID(url.path)))
+        workspace.openFolder(FolderID(url.path))
       } else {
         workspace.openFile(url)
       }
@@ -75,8 +75,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     window.isReleasedWhenClosed = false
     window.delegate = self
     window.backgroundColor = Design.background
-    let initialFolder = argument("--folder").map { FolderID(($0 as NSString).expandingTildeInPath) } ?? .home
-    let root = Workspace(frame: NSRect(origin: .zero, size: size), initialFolder: initialFolder, searchRoot: argument("--search-root").map { FolderID($0) } ?? .home, initialLocation: CommandLine.arguments.contains("--settings") ? .systemSettings : CommandLine.arguments.contains("--activity") ? .activity : nil)
+    let initialFolder = argument("--folder").map { FolderID(($0 as NSString).expandingTildeInPath) }
+    let arguments = CommandLine.arguments
+    let named = argument("--section").flatMap { name in Section.allCases.first { $0.rawValue.lowercased() == name.lowercased() } }
+    let section: Section = named ?? (arguments.contains("--activity") ? .activity : arguments.contains("--settings") ? .settings
+      : initialFolder != nil ? .folders : .search)
+    let root = Workspace(frame: NSRect(origin: .zero, size: size), section: section, folder: initialFolder ?? .home,
+      searchRoot: argument("--search-root").map { FolderID($0) } ?? .home)
     self.workspace = root
     self.window = window
     window.contentView = root
@@ -94,6 +99,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     window.makeKeyAndOrderFront(nil)
     window.makeFirstResponder(root)
+    root.focusSection()
     NSApp.activate(ignoringOtherApps: true)
     window.displayIfNeeded()
     CATransaction.flush()
@@ -115,7 +121,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         self.pendingURLs = []
       }
       if let path = self.argument("--snapshot") {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { self.saveSnapshot(path) }
+        let delay = self.argument("--snapshot-delay").flatMap(Double.init) ?? 0.2
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { self.saveSnapshot(path) }
       }
     }
     if let delay = argument("--quit-after").flatMap(Double.init) {
@@ -155,14 +162,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
   func reportState(_ path: String) {
     guard let root = workspace else { return }
     let state: [String: Any] = [
-      "activity_monitor": root.utility.activity.diagnostics,
-      "location": root.library.title(root.tab.location),
-      "path": root.currentFolder.map { root.library.path($0) } ?? "", "view": root.mode.rawValue,
-      "query": root.tab.query, "scope": root.filter.scope.rawValue,
-      "search_gathering": root.fileSearch.gathering,
-      "selection": root.selected?.name ?? "", "sidebar_collapsed": root.sidebarCollapsed,
-      "command_held": root.commandHeld, "pending_count": root.moving?.ids.count ?? 0,
-      "marked_count": root.marked.count,
+      "activity_monitor": root.activity.diagnostics,
+      "section": root.section.rawValue,
+      "folder": root.folder.rawValue,
+      "folder_history": ["back": root.canGoBack, "forward": root.canGoForward],
+      "path_editing": root.isEditingPath,
+      "selection": root.selected?.name ?? "",
       "shortcuts_visible": root.shortcuts.isPresented,
       "palette_visible": root.palette.isPresented,
       "file_search_engine": "fff",
@@ -205,14 +210,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
       "file_search_results": root.filePalette.search.response.hits.map(\.entry.path),
       "file_search_displayed_results": root.filePalette.displayedHits.map(\.entry.path),
       "file_search_selected": root.filePalette.selectedHit?.entry.path ?? "",
-      "active_tab": root.activeTab,
-      "tabs": root.tabs.map { root.library.title($0.location) },
       "ui_font": Design.font(13).fontName,
-      "pane_widths": root.paneViews.map { $0.frame.width },
-      "preview_width": root.previewPane.frame.width,
-      "items": root.items().map(\.name), "theme": Design.theme.rawValue,
-      "active_pane": root.paneViews.firstIndex { $0.active && !$0.isHidden } ?? -1,
-      "preview_visible": !root.previewPane.isHidden,
+      "theme": Design.theme.rawValue,
     ]
     if let data = try? JSONSerialization.data(
       withJSONObject: state, options: [.prettyPrinted, .sortedKeys])
@@ -237,10 +236,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     if let data = rep.representation(using: .png, properties: [:]) {
       try? data.write(to: URL(fileURLWithPath: path))
     }
-  }
-  func windowDidResignKey(_ notification: Notification) { workspace?.releaseCommand() }
-  func applicationDidResignActive(_ notification: Notification) {
-    workspace?.releaseCommand()
   }
   func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
   func windowShouldClose(_ sender: NSWindow) -> Bool {
@@ -269,32 +264,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let app = menu("Crawler")
     app.addItem(
       AppMenuItem("About Crawler") { [weak root] in
-        root?.message(
-          "Crawler",
-          "Native file browsing and AirDrop sharing in Swift and AppKit. Utilities and file changes are work in progress."
-        )
+        root?.message("Crawler", "Native file search, reading and AirDrop sharing in Swift and AppKit.")
       })
     app.addItem(.separator())
-    app.addItem(AppMenuItem("Settings…", key: ",") { [weak root] in root?.navigate(.preferences) })
+    app.addItem(AppMenuItem("Settings…", key: ",") { [weak root] in root?.show(.settings) })
     app.addItem(.separator())
     app.addItem(AppMenuItem("Hide Crawler", key: "h") { NSApp.hide(nil) })
     app.addItem(AppMenuItem("Quit Crawler", key: "q") { NSApp.terminate(nil) })
     let file = menu("File")
-    file.addItem(AppMenuItem("New tab", key: "t") { [weak root] in root?.newTab() })
     file.addItem(AppMenuItem("Find files…", key: "p") { [weak root] in root?.showFileSearch() })
+    file.addItem(AppMenuItem("Go to folder…", key: "l") { [weak root] in root?.editPath() })
+    file.addItem(AppMenuItem("Send with AirDrop…") { [weak root] in root?.showShare() })
+    file.addItem(.separator())
     file.addItem(AppMenuItem("Save PDF", key: "s") { [weak root] in root?.pdfReader?.save() })
     file.addItem(AppMenuItem("Save PDF as…", key: "s", modifiers: [.command, .shift]) { [weak root] in root?.pdfReader?.save(asCopy: true) })
-    file.addItem(
-      AppMenuItem("New folder", key: "N") { [weak root] in root?.nameDialog(rename: false) })
-    file.addItem(AppMenuItem("Move selected…") { [weak root] in root?.startMove() })
-    file.addItem(AppMenuItem("Rename…") { [weak root] in root?.nameDialog(rename: true) })
-    file.addItem(AppMenuItem("Share…") { [weak root] in root?.showShare() })
-    file.addItem(AppMenuItem("Move to Trash") { [weak root] in root?.trashSelection() })
     let edit = menu("Edit")
     edit.addItem(AppMenuItem("Undo", key: "z") { [weak root] in
       if let text = NSApp.keyWindow?.firstResponder as? NSTextView, text.isEditable { text.undoManager?.undo() }
-      else if let reader = root?.pdfReader { reader.undoAnnotation() }
-      else { root?.undoLast() }
+      else { root?.pdfReader?.undoAnnotation() }
     })
     edit.addItem(AppMenuItem("Redo", key: "z", modifiers: [.command, .shift]) { [weak root] in
       if let text = NSApp.keyWindow?.firstResponder as? NSTextView, text.isEditable { text.undoManager?.redo() }
@@ -307,17 +294,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     edit.addItem(
       NSMenuItem(title: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a"))
     let view = menu("View")
-    view.addItem(
-      AppMenuItem("Columns") { [weak root] in
-        root?.mode = .columns
-        root?.render()
-      })
-    view.addItem(
-      AppMenuItem("Scope funnel") { [weak root] in
-        root?.mode = .list
-        root?.render()
-      })
-    view.addItem(AppMenuItem("Toggle sidebar", key: "b") { [weak root] in root?.toggleSidebar() })
+    for section in Section.allCases where section != .settings {
+      view.addItem(AppMenuItem(section.rawValue, key: section.key) { [weak root] in root?.show(section) })
+    }
+    view.addItem(.separator())
+    view.addItem(AppMenuItem("Back", key: "[") { [weak root] in root?.historyStep(-1) })
+    view.addItem(AppMenuItem("Forward", key: "]") { [weak root] in root?.historyStep(1) })
     view.addItem(.separator())
     for theme in Theme.allCases {
       view.addItem(

@@ -217,9 +217,8 @@ final class FileScrollView: NSScrollView {
 final class FilePane: Surface, NSTableViewDataSource, NSTableViewDelegate {
   let table = FileTable()
   let scroll = FileScrollView()
-  let header = Surface()
-  let heading: ActionButton
-  let border = BorderOverlay()
+  /// The pane's title; its active style shows that keyboard navigation goes to this pane.
+  let titleBar = PaneTitle()
   private let topEdge = ScrollEdge(), bottomEdge = ScrollEdge()
   let empty = label("Empty folder", size: 12, color: Design.muted)
   var rows: [DisplayRow] = []
@@ -230,25 +229,13 @@ final class FilePane: Surface, NSTableViewDataSource, NSTableViewDelegate {
   var openItem: ((ItemID) -> Void)?
   var focusFolder: ((FolderID) -> Void)?
   var sortChanged: ((SortField) -> Void)?
-  var sortButtons: [ActionButton] = []
   private var updating = false
   private var fittingColumns = false
   private var configured = false
   private var context: String = ""
   init() {
-    heading = ActionButton("", action: {})
     super.init(frame: .zero)
-    header.bottomLine = true
-    addSubview(header)
-    header.addSubview(heading)
-    for (title, field) in [
-      ("Name", SortField.name), ("Date modified", .date), ("Kind", .kind), ("Size", .size),
-    ] {
-      let button = ActionButton(title, action: { [weak self] in self?.sortChanged?(field) })
-      button.alignment = .left
-      header.addSubview(button)
-      sortButtons.append(button)
-    }
+    addSubview(titleBar)
     scroll.hasVerticalScroller = false
     scroll.hasHorizontalScroller = false
     scroll.horizontalScrollElasticity = .none
@@ -277,7 +264,7 @@ final class FilePane: Surface, NSTableViewDataSource, NSTableViewDelegate {
     table.delegate = self
     table.target = self
     table.doubleAction = #selector(doubleClick)
-    // Drags carry the file URL; other apps and the sidebar only ever copy it.
+    // Drags carry the file URL; other apps and the Folders places only ever copy it.
     table.setDraggingSourceOperationMask(.copy, forLocal: true)
     table.setDraggingSourceOperationMask(.copy, forLocal: false)
     scroll.documentView = table
@@ -290,8 +277,7 @@ final class FilePane: Surface, NSTableViewDataSource, NSTableViewDelegate {
     bottomEdge.bottom = true
     addSubview(topEdge)
     addSubview(bottomEdge)
-    addSubview(border)
-    heading.invoke = { [weak self] in
+    titleBar.click = { [weak self] in
       guard let self, let location = self.location else { return }
       self.focusFolder?(location)
     }
@@ -302,7 +288,7 @@ final class FilePane: Surface, NSTableViewDataSource, NSTableViewDelegate {
   }
   required init?(coder: NSCoder) { nil }
   func configure(
-    title: String, location: FolderID?, rows: [DisplayRow], selected: ItemID?, active: Bool,
+    title: String, subtitle: String = "", location: FolderID?, rows: [DisplayRow], selected: ItemID?, active: Bool,
     detailed: Bool = false, context: String = ""
   ) {
     updating = true
@@ -331,17 +317,13 @@ final class FilePane: Surface, NSTableViewDataSource, NSTableViewDelegate {
       table.rowHeight = detailed ? 32 : 44
     }
     self.context = context
-    heading.isHidden = detailed
-    sortButtons.forEach { $0.isHidden = true }
-    header.isHidden = detailed
-    if detailed { sortButtons[1].title = context == "search" ? "Location" : "Date modified" }
-    heading.title = title
-    heading.font = Design.font(12, .medium)
-    heading.contentTintColor = Design.text
-    header.fill = Design.background
+    titleBar.isHidden = detailed
+    titleBar.title = title
+    titleBar.subtitle = subtitle
+    titleBar.active = active
+    titleBar.needsDisplay = true
     fill = Design.background
     table.backgroundColor = Design.background
-    border.active = active
     empty.font = Design.font(12)
     empty.textColor = Design.muted
     empty.isHidden = !rows.isEmpty
@@ -403,18 +385,15 @@ final class FilePane: Surface, NSTableViewDataSource, NSTableViewDelegate {
   }
   override func layout() {
     super.layout()
-    header.frame = NSRect(x: 0, y: 0, width: bounds.width, height: 42)
-    heading.frame = NSRect(x: 15, y: 8, width: bounds.width - 30, height: 26)
-    heading.alignment = .left
-    let top: CGFloat = detailed ? 0 : 48
+    titleBar.frame = NSRect(x: 0, y: 0, width: bounds.width, height: PaneTitle.height)
+    let top: CGFloat = detailed ? 0 : PaneTitle.height + 4
     scroll.frame = NSRect(x: 8, y: top, width: bounds.width - 16, height: max(0, bounds.height - top))
     let contentWidth = max(0, scroll.contentSize.width)
     if !detailed { table.tableColumns.first?.width = contentWidth }
     else if abs(table.frame.width - contentWidth) > 1 { table.sizeToFit() }
     table.setFrameSize(NSSize(width: contentWidth, height: table.frame.height))
-    empty.frame = NSRect(x: 20, y: 104, width: bounds.width - 40, height: 100)
-    border.frame = NSRect(x: 0, y: detailed ? 0 : 42, width: bounds.width, height: max(0, bounds.height - (detailed ? 0 : 42)))
-    topEdge.frame = NSRect(x: 8, y: 48, width: bounds.width - 16, height: 9)
+    empty.frame = NSRect(x: 20, y: top + 56, width: bounds.width - 40, height: 100)
+    topEdge.frame = NSRect(x: 8, y: top, width: bounds.width - 16, height: 9)
     bottomEdge.frame = NSRect(x: 8, y: bounds.height - 9, width: bounds.width - 16, height: 9)
     scrolled()
   }

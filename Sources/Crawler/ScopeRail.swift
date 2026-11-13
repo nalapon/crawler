@@ -13,15 +13,14 @@ final class ScopeRail: Surface, NSTableViewDataSource, NSTableViewDelegate {
     let selected: Bool
     let target: Target?
   }
-  private let heading = label("", size: 12, weight: .semibold)
-  private let subtitle = label("", size: 10)
+  private let heading = PaneTitle()
   private let scroll = NSScrollView()
   private let table = NSTableView()
   private var rows: [Row] = []
   var choose: ((Row.Target) -> Void)?
   init(title: String) {
     super.init(frame: .zero)
-    heading.stringValue = title
+    heading.title = title
     let column = NSTableColumn(identifier: .init("scope"))
     table.addTableColumn(column)
     table.headerView = nil
@@ -41,23 +40,19 @@ final class ScopeRail: Surface, NSTableViewDataSource, NSTableViewDelegate {
     scroll.scrollerStyle = .overlay
     scroll.hasHorizontalScroller = false
     scroll.horizontalScrollElasticity = .none
-    for view in [heading, subtitle, scroll] { addSubview(view) }
+    for view in [heading, scroll] { addSubview(view) }
   }
   required init?(coder: NSCoder) { nil }
   func configure(_ rows: [Row], subtitle: String) {
-    self.subtitle.stringValue = subtitle
-    self.subtitle.toolTip = subtitle
-    heading.textColor = Design.text
-    self.subtitle.textColor = Design.muted
+    heading.subtitle = subtitle
+    heading.toolTip = subtitle
+    heading.needsDisplay = true
     fill = Design.raised
     if self.rows != rows { self.rows = rows; table.reloadData() }
     needsLayout = true
   }
   func refreshTheme() {
-    heading.font = Design.font(12, .semibold)
-    subtitle.font = Design.font(10)
-    heading.textColor = Design.text
-    subtitle.textColor = Design.muted
+    heading.needsDisplay = true
     fill = Design.raised
     table.reloadData()
   }
@@ -76,9 +71,8 @@ final class ScopeRail: Surface, NSTableViewDataSource, NSTableViewDelegate {
   }
   override func layout() {
     super.layout()
-    heading.frame = NSRect(x: 16, y: 18, width: bounds.width - 32, height: 19)
-    subtitle.frame = NSRect(x: 16, y: 41, width: bounds.width - 32, height: 17)
-    scroll.frame = NSRect(x: 7, y: 68, width: bounds.width - 14, height: max(0, bounds.height - 75))
+    heading.frame = NSRect(x: 0, y: 0, width: bounds.width, height: PaneTitle.height)
+    scroll.frame = NSRect(x: 7, y: PaneTitle.height + 4, width: bounds.width - 14, height: max(0, bounds.height - PaneTitle.height - 8))
     table.tableColumns.first?.width = scroll.contentSize.width
   }
 }

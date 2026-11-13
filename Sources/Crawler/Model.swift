@@ -54,13 +54,6 @@ struct FileItem: Identifiable, Equatable, Sendable {
     return ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
   }
 }
-enum Location: Hashable, Sendable {
-  case folder(FolderID)
-  case locations, trash, airDrop, activity, systemSettings, preferences
-  var folder: FolderID? { if case .folder(let id) = self { return id }; return nil }
-  var isUtility: Bool { folder == nil }
-}
-enum ViewMode: String, CaseIterable { case columns = "Columns", list = "Scope funnel" }
 enum Theme: String, CaseIterable {
   case cupertino = "Cupertino", dark = "Dark", catppuccin = "Catppuccin Mocha"
   case github = "GitHub", vercel = "Vercel", system7 = "System 7"
@@ -84,19 +77,14 @@ enum Theme: String, CaseIterable {
   }
 }
 enum SortField: String { case name, date, created, kind, size }
-enum SearchScope: String, CaseIterable { case folder = "This folder", all = "This Mac" }
-struct SearchFilter {
-  var scope: SearchScope = .folder
-  var kind = "Any kind"
-  var thisWeek = false
-  var large = false
-}
 enum FileSearchMode: Int { case computer, folder }
 
+/// The funnel state the workspace keeps for Search or Folders while the other is visible.
 struct ScopeSession {
   var searchMode: FileSearchMode = .computer
   var computerScope: FolderID? = nil
   var volumeRoot: FolderID? = nil
+  var listsRoot = false
   let root: FolderID
   let scope: FolderID?
   let query: String
@@ -104,25 +92,4 @@ struct ScopeSession {
   let chosenNeighbor: SearchHit?
   let history: [FolderID]
   let scroll: CGFloat
-}
-struct WorkspaceTab: Identifiable {
-  var scopeSession: ScopeSession?
-  let id = UUID()
-  var location: Location
-  var selected: ItemID?
-  var query = ""
-  var history: [Location]
-  var historyIndex = 0
-  var folderSelection: [FolderID: ItemID] = [:]
-  var folderScroll: [FolderID: CGFloat] = [:]
-  init(_ location: Location, selected: ItemID? = nil) {
-    self.location = location; self.selected = selected; history = [location]
-  }
-}
-struct MoveDraft { let ids: [ItemID]; let source: FolderID }
-struct SavedSearch {
-  var name: String
-  var query: String
-  var filter: SearchFilter
-  var location: Location
 }

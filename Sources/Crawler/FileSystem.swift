@@ -147,17 +147,6 @@ final class FileSystemLibrary {
     pinned = folder
     UserDefaults.standard.set(folder.rawValue, forKey: "pinnedFolder")
   }
-  func title(_ location: Location) -> String {
-    switch location {
-    case .folder(let id): id.rawValue == "/" ? "/" : id.url.lastPathComponent
-    case .locations: "Locations"
-    case .trash: "Trash"
-    case .airDrop: "AirDrop"
-    case .activity: "Activity Monitor"
-    case .systemSettings: "System Settings"
-    case .preferences: "Crawler Settings"
-    }
-  }
   func path(_ folder: FolderID) -> String { folder.rawValue }
   func parent(_ folder: FolderID) -> FolderID? {
     folder.rawValue == "/" ? nil : FolderID(folder.url.deletingLastPathComponent().path)

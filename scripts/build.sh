@@ -35,10 +35,6 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>NSDesktopFolderUsageDescription</key><string>Crawler needs access to show and open files and folders on your Desktop.</string>
 <key>NSDocumentsFolderUsageDescription</key><string>Crawler needs access to show and open files and folders in Documents.</string>
 <key>NSDownloadsFolderUsageDescription</key><string>Crawler needs access to show and open files and folders in Downloads.</string>
-<key>NSLocationUsageDescription</key><string>Crawler needs Location permission to show nearby Wi-Fi network names and connect to the network you choose.</string>
-<key>NSLocationWhenInUseUsageDescription</key><string>Crawler needs Location permission to show nearby Wi-Fi network names and connect to the network you choose.</string>
-<key>NSAppleEventsUsageDescription</key><string>Crawler controls System Events to apply the appearance and Dock settings you choose.</string>
-<key>NSBluetoothAlwaysUsageDescription</key><string>Crawler shows your paired Bluetooth devices and their connection status in System Settings.</string>
 <key>NSLocalNetworkUsageDescription</key><string>Crawler discovers nearby AirDrop devices so you can choose where to send files.</string>
 <key>NSBonjourServices</key><array><string>_airdrop._tcp</string></array>
 <key>CFBundleDocumentTypes</key><array><dict>

@@ -14,28 +14,33 @@ extension Workspace {
           self.palette.finish { action(self) }
         }))
     }
-    add("downloads", "Go to Downloads", aliases: "navigate", symbol: "arrow.down.circle") { $0.navigate(.folder(.downloads)) }
-    add("desktop", "Go to Desktop", aliases: "navigate", symbol: "desktopcomputer") { $0.navigate(.folder(.desktop)) }
+    for (target, symbol) in [(Section.search, "magnifyingglass"), (.folders, "folder"), (.activity, "waveform.path.ecg"),
+                             (.transfers, "airplayaudio"), (.settings, "slider.horizontal.3")] where target != section {
+      add("section-\(target.rawValue)", "Go to \(target.rawValue)", aliases: "section navigate", shortcut: "⌘\(target.key)", symbol: symbol) { $0.show(target) }
+    }
+    add("home", "Go to Home folder", aliases: "navigate folders", symbol: "house") { $0.openFolder(.home) }
+    add("downloads", "Go to Downloads", aliases: "navigate folders", symbol: "arrow.down.circle") { $0.openFolder(.downloads) }
+    add("desktop", "Go to Desktop", aliases: "navigate folders", symbol: "desktopcomputer") { $0.openFolder(.desktop) }
     if let pinned = library.pinned {
-      add("pinned", "Go to pinned folder: \(pinned.url.lastPathComponent)", aliases: "favorite", symbol: "pin") { $0.navigate(.folder(pinned)) }
+      add("pinned", "Go to pinned folder: \(pinned.url.lastPathComponent)", aliases: "favorite folders", symbol: "pin") { $0.openFolder(pinned) }
     }
     commands.append(.init(id: "drives", title: "Go to connected drive…", aliases: "volume disk locations", symbol: "externaldrive", action: { [weak self] in
       guard let self else { return }
       self.palette.showChoices("Connected drives", commands: self.mountedVolumes.volumes.map { volume in
         .init(id: volume.folder.rawValue, title: volume.name, symbol: "externaldrive", action: { [weak self] in
-          self?.palette.finish { self?.sidebar.navigate?(.folder(volume.folder)) }
+          self?.palette.finish { self?.openFolder(volume.folder) }
         })
       })
     }))
     add("path", "Enter a folder path…", aliases: "go location", shortcut: "⌘L", symbol: "folder") { $0.editPath() }
-    if tab.historyIndex > 0 { add("back", "Go back", symbol: "arrow.left") { $0.historyStep(-1) } }
-    if tab.historyIndex + 1 < tab.history.count { add("forward", "Go forward", symbol: "arrow.right") { $0.historyStep(1) } }
+    if canGoBack { add("back", "Go back in Folders", shortcut: "⌘[", symbol: "arrow.left") { $0.historyStep(-1) } }
+    if canGoForward { add("forward", "Go forward in Folders", shortcut: "⌘]", symbol: "arrow.right") { $0.historyStep(1) } }
     if let folder, folder.rawValue != "/" {
       add("parent", "Go to parent folder", aliases: "up", symbol: "arrow.up") { $0.up() }
     }
     if let file {
       add("open", "Open \(file.name)", shortcut: "↵", symbol: "arrow.up.forward.square") {
-        if let folder = file.kind.folder { $0.navigate(.folder(folder)) } else { $0.openFile(file.url) }
+        if let folder = file.kind.folder { $0.openFolder(folder) } else { $0.openFile(file.url) }
       }
       if file.kind.folder == nil {
         commands.append(.init(id: "openWith", title: "Open \(file.name) with…", aliases: "open with editor", symbol: "doc", action: { [weak self] in
@@ -55,22 +60,14 @@ extension Workspace {
       add("reveal", "Reveal \(file.name) in Finder", aliases: "show file", symbol: "folder") { _ in
         NSWorkspace.shared.activateFileViewerSelecting([file.url])
       }
+      if file.kind.folder == nil {
+        add("airdrop", "Send \(file.name) with AirDrop", aliases: "share transfers", symbol: "airplayaudio") { $0.showShare() }
+      }
     }
-    add("newTab", "New tab", shortcut: "⌘T", symbol: "plus") { $0.newTab() }
-    add("closeTab", "Close tab", shortcut: "⌘W", symbol: "xmark") {
-      if $0.tabs.count > 1 { $0.closeTab($0.activeTab) } else { $0.window?.close() }
-    }
-    if tabs.count > 1 {
-      add("nextTab", "Next tab", shortcut: "⌃Tab", symbol: "arrow.right") { $0.cycleTab(1) }
-      add("previousTab", "Previous tab", shortcut: "⌃⇧Tab", symbol: "arrow.left") { $0.cycleTab(-1) }
-    }
-    add("sidebar", "Toggle sidebar", aliases: "hide show", shortcut: "⌘B", symbol: "sidebar.left") { $0.toggleSidebar() }
-    if mode != .columns { add("columns", "Switch to Columns", aliases: "view", symbol: "rectangle.split.3x1") { $0.mode = .columns; $0.render() } }
-    if mode != .list { add("funnel", "Switch to Scope funnel", aliases: "view search", symbol: "line.3.horizontal.decrease") { $0.mode = .list; $0.render() } }
     if let folder {
       add("refresh", "Refresh folder", aliases: "reload", shortcut: "⌘R", symbol: "arrow.clockwise") { $0.refreshFolder() }
       if library.pinned != folder {
-        add("pin", "Pin \(folder.url.lastPathComponent)", aliases: "favorite current folder", symbol: "pin") { $0.library.pin(folder); $0.render() }
+        add("pin", "Pin \(folder.url.lastPathComponent)", aliases: "favorite current folder places", symbol: "pin") { $0.library.pin(folder); $0.render() }
       }
       add("terminal", "Open current folder in Terminal", aliases: "shell console", symbol: "terminal") { workspace in
         guard let terminal = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal") else {
@@ -84,15 +81,6 @@ extension Workspace {
     }
     add("choosePin", "Change pinned folder…", aliases: "favorite", symbol: "pin") { $0.choosePinnedFolder() }
     commands.append(.init(id: "theme", title: "Change theme…", aliases: "skin appearance color dark light", symbol: "paintpalette", action: { [weak self] in self?.palette.showThemes() }))
-    for (id, title, location, symbol) in [
-      ("airdrop", "AirDrop", Location.airDrop, "airplay.audio"),
-      ("activity", "Activity Monitor", .activity, "waveform.path.ecg"),
-      ("system", "System Settings", .systemSettings, "gearshape"),
-      ("preferences", "Crawler Settings", .preferences, "slider.horizontal.3"),
-      ("trash", "Trash", .trash, "trash")
-    ] {
-      add(id, title, aliases: "utilities settings", symbol: symbol) { $0.navigate(location) }
-    }
     add("help", "Keyboard shortcuts", aliases: "help keys", shortcut: "⌘⇧/", symbol: "questionmark.circle") { $0.showHelp() }
     palette.commands = commands
   }

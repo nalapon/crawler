@@ -1,21 +1,21 @@
 import AppKit
 
-// Destinations identify what an icon means; the theme owns how it looks.
-enum SidebarIcon: CaseIterable {
-  case downloads, desktop, pin, drive, airDrop, activity, systemSettings, preferences, trash
+// Sections and places identify what an icon means; the theme owns how it looks.
+enum ShellIcon: CaseIterable {
+  case home, folder, downloads, desktop, pin, drive, airDrop, activity, preferences
   case add, search, eject
 
   var symbol: String {
     switch self {
+    case .home: "house"
+    case .folder: "folder"
     case .downloads: "arrow.down.circle"
     case .desktop: "desktopcomputer"
     case .pin: "pin"
     case .drive: "externaldrive"
     case .airDrop: "airplayaudio"
     case .activity: "waveform.path.ecg"
-    case .systemSettings: "gearshape"
     case .preferences: "slider.horizontal.3"
-    case .trash: "trash"
     case .add: "plus"
     case .search: "magnifyingglass"
     case .eject: "eject"
@@ -27,25 +27,25 @@ enum SidebarIcon: CaseIterable {
     case .downloads: "arrow.down.circle.fill"
     case .pin: "pin.fill"
     case .drive: "externaldrive.fill"
+    case .home: "house.fill"
+    case .folder: "folder.fill"
     case .activity: "waveform.path.ecg.rectangle.fill"
-    case .systemSettings: "gearshape.fill"
-    case .trash: "trash.fill"
     default: symbol
     }
   }
 }
 
 @MainActor
-enum SidebarIcons {
+enum ShellIcons {
   private struct Key: Hashable {
-    let icon: SidebarIcon
+    let icon: ShellIcon
     let theme: Theme
     let selected: Bool
   }
   // Bounded by the twelve roles, eleven themes, and two selection states.
   private static var images: [Key: NSImage] = [:]
 
-  static func image(_ icon: SidebarIcon, theme: Theme = Design.theme, selected: Bool = false) -> NSImage {
+  static func image(_ icon: ShellIcon, theme: Theme = Design.theme, selected: Bool = false) -> NSImage {
     let key = Key(icon: icon, theme: theme, selected: selected)
     if let image = images[key] { return image }
     let image = NSImage(size: NSSize(width: 20, height: 20))
@@ -110,7 +110,7 @@ enum SidebarIcons {
       if let fill { fill.setFill(); path.fill() }
       (color ?? ink).setStroke(); path.lineWidth = width; path.stroke()
     }
-    func color(_ icon: SidebarIcon) -> NSColor {
+    func color(_ icon: ShellIcon) -> NSColor {
       if selected { return ink }
       switch theme {
       case .catppuccin:
@@ -119,7 +119,6 @@ enum SidebarIcons {
         case .desktop, .drive: return Design.color(0x89b4fa)
         case .airDrop: return Design.color(0x94e2d5)
         case .activity: return Design.color(0xa6e3a1)
-        case .trash: return Design.color(0xf38ba8)
         default: return Design.color(0xcba6f7)
         }
       case .windows, .windowsRetro: return Design.color(icon == .downloads || icon == .pin ? 0xe2b537 : 0x167ac6)
@@ -129,7 +128,7 @@ enum SidebarIcons {
       default: return accent
       }
     }
-    func fill(_ icon: SidebarIcon) -> NSColor? {
+    func fill(_ icon: ShellIcon) -> NSColor? {
       if outlineOnly { return nil }
       if selected { return background }
       if theme == .system7 { return .white }
@@ -140,7 +139,7 @@ enum SidebarIcons {
       line([(rect.minX + 1, rect.maxY - 1), (rect.minX + 1, rect.minY + 1), (rect.maxX - 1, rect.minY + 1)], color: .white)
       line([(rect.maxX - 1, rect.minY + 2), (rect.maxX - 1, rect.maxY - 1), (rect.minX + 2, rect.maxY - 1)], color: Design.color(0x555555))
     }
-    func draw(_ icon: SidebarIcon) {
+    func draw(_ icon: ShellIcon) {
       NSGraphicsContext.current?.shouldAntialias = !retro && theme != .terminal
       if theme == .cupertino || theme == .dark {
         drawNative(icon)
@@ -154,6 +153,12 @@ enum SidebarIcons {
         NSGraphicsContext.current?.cgContext.scaleBy(x: 0.75, y: 0.75)
       }
       switch icon {
+      case .home:
+        let body = NSRect(x: 5, y: 10, width: 14, height: 11)
+        box(body, fill: fill(icon), rounding: 0); bevel(body)
+        stroke([NSPoint(x: 2, y: 12), NSPoint(x: 12, y: 3), NSPoint(x: 22, y: 12)], color: color(icon))
+        box(NSRect(x: 10, y: 14, width: 4, height: 7), fill: background, rounding: 0)
+      case .folder: folder(icon)
       case .downloads: drawDownloads()
       case .desktop:
         let rect = NSRect(x: 3, y: 4, width: 18, height: retro ? 13 : 12)
@@ -190,29 +195,11 @@ enum SidebarIcons {
       case .activity:
         if theme != .vercel { box(NSRect(x: 2, y: 4, width: 20, height: 16), fill: outlineOnly ? nil : background); bevel(NSRect(x: 2, y: 4, width: 20, height: 16)) }
         line([(4, 13), (7, 13), (10, 8), (13, 17), (16, 11), (20, 11)], color: color(icon))
-      case .systemSettings:
-        if retro || theme == .terminal || theme == .vercel {
-          // Angular cog with visible teeth on the cardinal axes.
-          stroke([(9, 2), (15, 2), (15, 6), (18, 6), (18, 9), (22, 9), (22, 15), (18, 15), (18, 18), (15, 18), (15, 22), (9, 22), (9, 18), (6, 18), (6, 15), (2, 15), (2, 9), (6, 9), (6, 6), (9, 6)].map { NSPoint(x: $0.0, y: $0.1) }, close: true, fill: fill(icon))
-        } else {
-          circle(NSRect(x: 4, y: 4, width: 16, height: 16), fill: fill(icon), color: color(icon))
-          for n in 0..<8 {
-            let angle = CGFloat(n) * .pi / 4
-            line([(12 + cos(angle) * 8, 12 + sin(angle) * 8), (12 + cos(angle) * 10, 12 + sin(angle) * 10)], color: color(icon))
-          }
-        }
-        circle(NSRect(x: 9, y: 9, width: 6, height: 6), fill: background)
       case .preferences:
         for (x, y): (CGFloat, CGFloat) in [(5, 8), (12, 16), (19, 10)] {
           line([(x, 3), (x, 21)], color: outlineOnly ? ink : color(icon))
           box(NSRect(x: x - 2, y: y - 2, width: 4, height: 4), fill: outlineOnly ? background : color(icon), rounding: theme == .catppuccin ? 2 : 0)
         }
-      case .trash:
-        box(NSRect(x: 6, y: 7, width: 12, height: 14), fill: fill(icon))
-        line([(4, 6), (20, 6)])
-        box(NSRect(x: 9, y: 3, width: 6, height: 3), fill: outlineOnly ? nil : color(icon), rounding: 0)
-        line([(10, 10), (10, 18)], color: interiorInk); line([(14, 10), (14, 18)], color: interiorInk)
-        if retro { bevel(NSRect(x: 6, y: 7, width: 12, height: 14)) }
       case .add:
         if theme == .catppuccin || theme == .linux { circle(NSRect(x: 3, y: 3, width: 18, height: 18), fill: background, color: color(icon)) }
         line([(12, 6), (12, 18)], color: color(icon)); line([(6, 12), (18, 12)], color: color(icon))
@@ -227,7 +214,7 @@ enum SidebarIcons {
       if theme == .linuxRetro { NSGraphicsContext.restoreGraphicsState() }
     }
 
-    func folder(_ icon: SidebarIcon) {
+    func folder(_ icon: ShellIcon) {
       let tone = color(icon)
       if theme == .catppuccin || theme == .linux {
         box(NSRect(x: 3, y: 4, width: 9, height: 6), fill: tone, color: tone)
@@ -255,7 +242,7 @@ enum SidebarIcons {
       line([(12, outlineOnly ? 5 : 10), (12, 17)], color: foreground)
       line([(8, 13), (12, 17), (16, 13)], color: foreground)
     }
-    func drawNative(_ icon: SidebarIcon) {
+    func drawNative(_ icon: ShellIcon) {
       if theme == .dark, icon == .downloads {
         circle(NSRect(x: 2, y: 2, width: 20, height: 20), fill: accent, color: accent)
         line([(12, 6), (12, 17)], color: background)

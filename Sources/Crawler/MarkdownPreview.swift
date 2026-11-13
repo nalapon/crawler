@@ -190,7 +190,7 @@ enum MarkdownStyle {
     plain.lineBreakMode = .byWordWrapping
     let text = NSMutableAttributedString(
       string: content.text,
-      attributes: [.font: Design.font(type.body), .foregroundColor: Design.text, .paragraphStyle: plain])
+      attributes: [.font: Design.readingFont(type.body), .foregroundColor: Design.text, .paragraphStyle: plain])
     let string = text.string as NSString
     let mono = NSFont.monospacedSystemFont(ofSize: type.code, weight: .regular)
     var tables: [Int: NSTextTable] = [:]
@@ -231,7 +231,7 @@ enum MarkdownStyle {
         text.addAttribute(.foregroundColor, value: color, range: range)
       case .heading(let level):
         text.addAttributes([
-          .font: Design.font(type.heading(level), level <= 2 ? .bold : .semibold),
+          .font: Design.readingFont(type.heading(level), level <= 2 ? .bold : .semibold),
           .foregroundColor: level == 6 ? Design.muted : Design.text,
         ], range: range)
         paragraphs(range) {
@@ -339,7 +339,7 @@ enum MarkdownStyle {
         }
         block.setWidth(1, type: .absoluteValueType, for: .border)
         block.setBorderColor(Design.line)
-        text.addAttribute(.font, value: Design.font(type.cell, row == 0 ? .semibold : .regular), range: range)
+        text.addAttribute(.font, value: Design.readingFont(type.cell, row == 0 ? .semibold : .regular), range: range)
         if row == 0 { block.backgroundColor = Design.line.withAlphaComponent(0.4) }
         paragraphs(range) {
           enter(block, $0)
@@ -386,7 +386,7 @@ enum MarkdownStyle {
     var measured: [Int: [(word: CGFloat, line: CGFloat)]] = [:]
     for span in content.spans where NSMaxRange(span.range) <= string.length {
       guard case .cell(let id, let row, let column, let columns, _) = span.style, column < columns else { continue }
-      let attributes: [NSAttributedString.Key: Any] = [.font: Design.font(type.cell, row == 0 ? .semibold : .regular)]
+      let attributes: [NSAttributedString.Key: Any] = [.font: Design.readingFont(type.cell, row == 0 ? .semibold : .regular)]
       func widest(_ parts: [Substring]) -> CGFloat {
         parts.map { (String($0) as NSString).size(withAttributes: attributes).width }.max() ?? 0
       }

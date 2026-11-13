@@ -53,8 +53,7 @@ final class DocumentArtwork: Surface {
 }
 @MainActor
 final class PreviewPane: Surface {
-  let header = Surface(), titleField = label("", size: 11, weight: .semibold),
-    caption = label("Preview", size: 9, color: Design.muted)
+  let header = PaneTitle()
   let document = DocumentPreview()
   var scroll: FileScrollView { document.textScroll }
   let details = Surface()
@@ -63,10 +62,7 @@ final class PreviewPane: Surface {
   var share: (() -> Void)?, open: (() -> Void)?
   override init(frame: NSRect) {
     super.init(frame: frame)
-    header.bottomLine = true
     addSubview(header)
-    header.addSubview(caption)
-    header.addSubview(titleField)
     addSubview(document)
     addSubview(details)
   }
@@ -76,14 +72,10 @@ final class PreviewPane: Surface {
     self.inspector = inspector
     document.configure(file)
     fill = Design.raised
-    header.fill = Design.raised
     details.fill = Design.raised
-    titleField.stringValue = file?.name ?? "No file selected"
-    titleField.font = Design.font(11, .semibold)
-    titleField.textColor = Design.text
-    caption.stringValue = inspector ? "Details" : "Preview"
-    caption.font = Design.font(9)
-    caption.textColor = Design.muted
+    header.title = file?.name ?? "No file selected"
+    header.subtitle = file.map { inspector ? "Details" : $0.kind.label } ?? ""
+    header.needsDisplay = true
     details.subviews.forEach { $0.removeFromSuperview() }
     if inspector, let file {
       let name = label(file.name, size: 12, weight: .semibold)
@@ -118,12 +110,10 @@ final class PreviewPane: Surface {
   }
   override func layout() {
     super.layout()
-    header.frame = NSRect(x: 0, y: 0, width: bounds.width, height: 42)
-    caption.frame = NSRect(x: 16, y: 5, width: bounds.width - 32, height: 13)
-    titleField.frame = NSRect(x: 16, y: 21, width: bounds.width - 32, height: 18)
+    header.frame = NSRect(x: 0, y: 0, width: bounds.width, height: PaneTitle.height)
     let detailsH: CGFloat = inspector ? 230 : 0
-    let artH = max(100, bounds.height - 42 - detailsH)
-    document.frame = NSRect(x: 0, y: 42, width: bounds.width, height: artH)
-    details.frame = NSRect(x: 0, y: 42 + artH, width: bounds.width, height: detailsH)
+    let artH = max(100, bounds.height - PaneTitle.height - detailsH)
+    document.frame = NSRect(x: 0, y: PaneTitle.height, width: bounds.width, height: artH)
+    details.frame = NSRect(x: 0, y: PaneTitle.height + artH, width: bounds.width, height: detailsH)
   }
 }

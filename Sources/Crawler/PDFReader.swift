@@ -327,7 +327,7 @@ extension Workspace {
   func showPDF(_ url: URL, succeeded: (() -> Void)? = nil) {
     guard reader == nil else { return }
     let id = ItemID(rawValue: url.standardizedFileURL.path)
-    let preview = [filePalette.preview, previewPane, inspector].first { $0.item?.id == id }
+    let preview = filePalette.preview.item?.id == id ? filePalette.preview : nil
     let file = preview?.item ?? library.item(id) ?? FileItem(
       id: id, name: url.lastPathComponent, parent: FolderID(url.deletingLastPathComponent().path),
       kind: .document(.pdf), bytes: nil, modified: nil, created: nil)

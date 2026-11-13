@@ -100,65 +100,103 @@ enum FileCopy {
   }
 }
 
-/// Bottom card with the current copy's name, byte progress and a Cancel button.
+/// One finished copy for the Transfers list.
+struct CopyRecord {
+  enum Outcome { case copied, cancelled, failed }
+  let title: String
+  let detail: String
+  let outcome: Outcome
+  let date = Date()
+}
+
+/// The Copies pane in Transfers: the running copy with its progress, then this session's copies.
 @MainActor
-final class CopyProgressPanel: Surface {
-  private let title = label("", size: 11)
-  private let detail = label("", size: 10)
-  private let bar = NSProgressIndicator()
+final class CopiesView: Surface {
   let cancel = ActionButton("Cancel", action: {})
+  private let title = PaneTitle()
+  private let rows = Surface()
+  private let bar = ProgressBar()
 
   override init(frame: NSRect) {
     super.init(frame: frame)
-    fill = Design.color(0x303747)
-    wantsLayer = true
-    layer?.cornerRadius = 7
-    title.textColor = .white
-    title.lineBreakMode = .byTruncatingMiddle
-    detail.textColor = NSColor.white.withAlphaComponent(0.7)
-    bar.isIndeterminate = false
-    bar.minValue = 0
-    bar.maxValue = 1
-    bar.controlSize = .small
-    cancel.contentTintColor = .white
-    for view in [title, detail, bar, cancel] { addSubview(view) }
+    title.title = "Copies"
+    for view in [title, rows] { addSubview(view) }
   }
   required init?(coder: NSCoder) { nil }
 
-  func show(_ progress: FileCopyProgress, place: String) {
-    let copied = progress.copied, total = max(progress.total, 1)
-    title.stringValue = "Copying \(progress.name) to \(place)"
-    detail.stringValue = "\(Self.bytes(min(copied, total))) of \(Self.bytes(total))"
-    bar.doubleValue = min(1, Double(copied) / Double(total))
+  func configure(running: (progress: FileCopyProgress, place: String)?, records: [CopyRecord]) {
+    fill = Design.background
+    rows.fill = Design.background
+    rows.subviews.forEach { $0.removeFromSuperview() }
+    title.subtitle = running == nil ? "Drop files on a Folders place to copy them" : "One copy runs at a time"
+    title.needsDisplay = true
+    var y: CGFloat = 12
+    let width = max(0, bounds.width - 32)
+    func row(_ heading: String, _ detail: String, color: NSColor) {
+      let name = label(heading, size: 12, weight: .semibold, color: color)
+      name.frame = NSRect(x: 16, y: y, width: width, height: 18)
+      name.lineBreakMode = .byTruncatingMiddle
+      let info = label(detail, size: 11, color: Design.muted)
+      info.frame = NSRect(x: 16, y: y + 19, width: width, height: 30)
+      info.maximumNumberOfLines = 2
+      info.lineBreakMode = .byWordWrapping
+      rows.addSubview(name)
+      rows.addSubview(info)
+    }
+    if let running {
+      let progress = running.progress
+      let copied = progress.copied, total = max(progress.total, 1)
+      let bytes = { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) }
+      row("Copying \(progress.name) to \(running.place)", "\(bytes(min(copied, total))) of \(bytes(total)) · existing names are skipped, never replaced", color: Design.text)
+      bar.value = min(1, Double(copied) / Double(total))
+      bar.frame = NSRect(x: 16, y: y + 52, width: max(0, width - 80), height: Design.square ? 12 : 8)
+      cancel.frame = NSRect(x: bounds.width - 86, y: y + 44, width: 70, height: 24)
+      rows.addSubview(bar)
+      rows.addSubview(cancel)
+      y += 84
+    }
+    for record in records {
+      let color = record.outcome == .failed ? NSColor.systemRed : Design.text
+      row(record.title, record.date.formatted(date: .omitted, time: .shortened) + (record.detail.isEmpty ? "" : " · " + record.detail), color: color)
+      y += 58
+    }
+    if running == nil && records.isEmpty {
+      let empty = label("No copies yet. Drag files from Search or Folders onto a place in Folders to copy them there.", size: 12, color: Design.muted)
+      empty.maximumNumberOfLines = 3
+      empty.lineBreakMode = .byWordWrapping
+      empty.frame = NSRect(x: 16, y: y, width: width, height: 48)
+      rows.addSubview(empty)
+    }
+    needsLayout = true
+    needsDisplay = true
   }
-
-  private static func bytes(_ value: Int64) -> String {
-    ByteCountFormatter.string(fromByteCount: value, countStyle: .file)
+  override func draw(_ dirtyRect: NSRect) {
+    super.draw(dirtyRect)
+    (Design.classic ? NSColor.black : Design.line).setFill()
+    NSRect(x: 0, y: 0, width: 1, height: bounds.height).fill()
   }
-
   override func layout() {
     super.layout()
-    title.frame = NSRect(x: 14, y: 9, width: bounds.width - 104, height: 17)
-    detail.frame = NSRect(x: 14, y: 26, width: bounds.width - 104, height: 15)
-    bar.frame = NSRect(x: 14, y: 42, width: bounds.width - 104, height: 8)
-    cancel.frame = NSRect(x: bounds.width - 82, y: 14, width: 70, height: 28)
+    title.frame = NSRect(x: 1, y: 0, width: bounds.width - 1, height: PaneTitle.height)
+    rows.frame = NSRect(x: 1, y: PaneTitle.height, width: bounds.width - 1, height: max(0, bounds.height - PaneTitle.height))
   }
-  override var isFlipped: Bool { true }
 }
 
 extension Workspace {
-  /// Copies dropped files into a folder in the background, showing byte progress until done.
+  /// Copies dropped files into a folder in the background. The status bar and Transfers show
+  /// byte progress until it finishes; the outcome joins the Transfers list.
   func copy(_ urls: [URL], to folder: FolderID) {
     guard copying == nil else { toast("Wait for the current copy to finish"); return }
     let place = mountedVolumes.volumes.first { $0.folder == folder }?.name ?? folder.url.lastPathComponent
     let progress = FileCopyProgress()
-    copying = progress
-    copyPanel.cancel.invoke = { progress.cancel() }
+    copying = (progress, place)
+    statusBar.cancel.invoke = { progress.cancel() }
+    copies.cancel.invoke = { progress.cancel() }
     let timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
       MainActor.assumeIsolated {
         guard let self, progress.total > 0 else { return }
-        self.copyPanel.show(progress, place: place)
-        if self.copyPanel.isHidden { self.copyPanel.isHidden = false; self.needsLayout = true }
+        self.statusBar.showCopy(progress, place: place)
+        if self.section == .transfers { self.copies.configure(running: self.copying, records: self.copyRecords) }
       }
     }
     Task { [weak self] in
@@ -168,11 +206,22 @@ extension Workspace {
       timer.invalidate()
       guard let self else { return }
       self.copying = nil
-      self.copyPanel.isHidden = true
-      self.needsLayout = true
-      if let first = failures.first { self.toast(failures.count > 1 ? "\(first) (+\(failures.count - 1) more)" : first) }
-      else if progress.isCancelled { self.toast("Copy to \(place) cancelled") }
-      else { self.toast(urls.count == 1 ? "Copied \(urls[0].lastPathComponent) to \(place)" : "Copied \(urls.count) items to \(place)") }
+      self.statusBar.showCopy(nil)
+      let items = urls.count == 1 ? urls[0].lastPathComponent : "\(urls.count) items"
+      let record: CopyRecord
+      if let first = failures.first {
+        let message = failures.count > 1 ? "\(first) (+\(failures.count - 1) more)" : first
+        record = CopyRecord(title: "Could not copy all of \(items) to \(place)", detail: message, outcome: .failed)
+        self.toast(message)
+      } else if progress.isCancelled {
+        record = CopyRecord(title: "Copy of \(items) to \(place) cancelled", detail: "The partial item was removed.", outcome: .cancelled)
+        self.toast("Copy to \(place) cancelled")
+      } else {
+        record = CopyRecord(title: "Copied \(items) to \(place)", detail: ByteCountFormatter.string(fromByteCount: progress.copied, countStyle: .file), outcome: .copied)
+        self.toast(urls.count == 1 ? "Copied \(urls[0].lastPathComponent) to \(place)" : "Copied \(urls.count) items to \(place)")
+      }
+      self.copyRecords.insert(record, at: 0)
+      self.render()
     }
   }
 }
