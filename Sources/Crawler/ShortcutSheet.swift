@@ -13,6 +13,8 @@ final class ShortcutSheet: Surface {
     ("⌘P", "Search This Mac"),
     ("↑ ↓  /  j k", "Select file"),
     ("← →  /  h l", "Parent folder / open folder"),
+    ("⇧↑ ⇧↓  /  ⇧J ⇧K", "Extend selection in Folders"),
+    ("⌘A", "Select all in Folders"),
     ("⌃D / ⌃U", "Half page of results"),
     ("gg / G", "First / last result"),
     ("/ or i", "Focus search"),

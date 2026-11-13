@@ -43,9 +43,9 @@ extension Workspace {
     panel.makeKeyAndOrderFront(nil)
   }
 
-  /// Stages the selected file in Transfers for AirDrop.
+  /// Stages the selected files in Transfers for AirDrop.
   func showShare() {
-    var urls = selected.map { [$0.url] } ?? []
+    var urls = (section == .search || section == .folders ? filePalette.selectedFiles : []).map(\.url)
     if let hit = filePalette.selectedHit, let root = filePalette.search.resultRoot {
       urls = [root.url.appendingPathComponent(hit.entry.path)]
     }

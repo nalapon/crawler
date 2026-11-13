@@ -229,6 +229,15 @@ final class FilePane: Surface, NSTableViewDataSource, NSTableViewDelegate {
   var openItem: ((ItemID) -> Void)?
   var focusFolder: ((FolderID) -> Void)?
   var sortChanged: ((SortField) -> Void)?
+  /// Allows Command-click, Shift-click, Shift-J/K and Command-A selections. Dragging any
+  /// selected row carries every selected file.
+  var multipleSelection = false { didSet { table.allowsMultipleSelection = multipleSelection } }
+  /// The row a Shift range starts from, and the row keyboard movement continues from.
+  private var anchorRow: Int?, focusRow: Int?
+  /// The selected files, in list order.
+  var selectedItems: [FileItem] {
+    table.selectedRowIndexes.compactMap { rows.indices.contains($0) && !rows[$0].pending ? rows[$0].item : nil }
+  }
   private var updating = false
   private var fittingColumns = false
   private var configured = false
@@ -294,6 +303,8 @@ final class FilePane: Surface, NSTableViewDataSource, NSTableViewDelegate {
     updating = true
     defer { updating = false }
     let resetScroll = self.location != location || self.context != context || self.detailed != detailed
+    // A multiple selection survives reloads and preview updates while it still contains the focus.
+    let kept = multipleSelection && !resetScroll ? Set(selectedItems.map(\.id)) : []
     self.location = location
     self.active = active
     let changedMode = self.detailed != detailed
@@ -333,9 +344,18 @@ final class FilePane: Surface, NSTableViewDataSource, NSTableViewDelegate {
       configured = true
     }
     if let selected, let index = rows.firstIndex(where: { $0.item.id == selected && !$0.pending }) {
-      table.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+      var indexes = IndexSet(integer: index)
+      if kept.count > 1 && kept.contains(selected) {
+        indexes.formUnion(IndexSet(rows.indices.filter { kept.contains(rows[$0].item.id) && !rows[$0].pending }))
+      } else {
+        anchorRow = index
+      }
+      focusRow = index
+      if table.selectedRowIndexes != indexes { table.selectRowIndexes(indexes, byExtendingSelection: false) }
     } else {
       table.deselectAll(nil)
+      anchorRow = nil
+      focusRow = nil
     }
     table.enumerateAvailableRowViews { view, index in
       (view as? FileRowView)?.activePane = active
@@ -349,6 +369,36 @@ final class FilePane: Surface, NSTableViewDataSource, NSTableViewDelegate {
     }
     needsLayout = true
     needsDisplay = true
+  }
+  /// Moves the focus by `delta` and selects every row between it and the anchor, as Shift-arrow
+  /// does in Finder. Returns the newly focused item.
+  func extendSelection(by delta: Int) -> ItemID? {
+    guard multipleSelection, !rows.isEmpty else { return nil }
+    let focus = focusRow ?? max(0, table.selectedRow)
+    let next = max(0, min(rows.count - 1, focus + delta))
+    let anchor = anchorRow ?? focus
+    anchorRow = anchor
+    focusRow = next
+    updating = true
+    table.selectRowIndexes(IndexSet(integersIn: min(anchor, next)...max(anchor, next)), byExtendingSelection: false)
+    updating = false
+    table.scrollRowToVisible(next)
+    return rows[next].item.id
+  }
+  /// Selects every row and keeps the focus where it is.
+  func selectAll() {
+    guard multipleSelection, !rows.isEmpty else { return }
+    updating = true
+    table.selectAll(nil)
+    updating = false
+    anchorRow = 0
+  }
+  /// Drops a multiple selection so the next update selects only the focused row.
+  func collapseSelection() {
+    guard table.selectedRowIndexes.count > 1 else { return }
+    updating = true
+    table.deselectAll(nil)
+    updating = false
   }
   func updateSize(_ item: FileItem) {
     guard let index = rows.firstIndex(where: { $0.item.id == item.id }) else { return }
@@ -437,6 +487,8 @@ final class FilePane: Surface, NSTableViewDataSource, NSTableViewDelegate {
   }
   func tableViewSelectionDidChange(_ notification: Notification) {
     guard !updating, rows.indices.contains(table.selectedRow) else { return }
+    focusRow = table.selectedRow
+    if table.selectedRowIndexes.count == 1 { anchorRow = table.selectedRow }
     selectionChanged?(
       rows[table.selectedRow].item.id, location, NSApp.currentEvent?.modifierFlags ?? [])
   }

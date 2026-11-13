@@ -60,8 +60,10 @@ extension Workspace {
       add("reveal", "Reveal \(file.name) in Finder", aliases: "show file", symbol: "folder") { _ in
         NSWorkspace.shared.activateFileViewerSelecting([file.url])
       }
-      if file.kind.folder == nil {
-        add("airdrop", "Send \(file.name) with AirDrop", aliases: "share transfers", symbol: "airplayaudio") { $0.showShare() }
+      let sending = filePalette.selectedFiles.count
+      if file.kind.folder == nil || sending > 1 {
+        add("airdrop", sending > 1 ? "Send \(sending) selected items with AirDrop" : "Send \(file.name) with AirDrop",
+          aliases: "share transfers", symbol: "airplayaudio") { $0.showShare() }
       }
     }
     if let folder {

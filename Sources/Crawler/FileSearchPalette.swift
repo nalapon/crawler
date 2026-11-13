@@ -96,6 +96,10 @@ final class FileSearchPalette: Surface, NSTextFieldDelegate, NSTableViewDataSour
     !isHome && !isBrowsing && search.responseIsCurrent && resultsMode == search.mode && resultsQuery == search.query && resultsScope == search.activeSearchScope && displayedHits.indices.contains(table.selectedRow)
       ? displayedHits[table.selectedRow] : nil
   }
+  /// Every file selected in the current folder while browsing; otherwise the selected file.
+  var selectedFiles: [FileItem] {
+    isBrowsing ? currentFolderPane.selectedItems : selectedFile.map { [$0] } ?? []
+  }
   var selectedFile: FileItem? {
     if isBrowsing { return browsingItem }
     if isHome { return recentFiles.indices.contains(table.selectedRow) ? recentFiles[table.selectedRow] : nil }
@@ -148,6 +152,7 @@ final class FileSearchPalette: Surface, NSTextFieldDelegate, NSTableViewDataSour
       else { self.updateSelectionPreview() }
     }
     folderLibrary.didUpdateSize = { [weak self] item in self?.currentFolderPane.updateSize(item) }
+    currentFolderPane.multipleSelection = true
     for pane in [currentFolderPane, childFolderPane] {
       pane.selectionChanged = { [weak self] id, folder, _ in
         guard let self, let folder else { return }
@@ -539,6 +544,8 @@ final class FileSearchPalette: Surface, NSTextFieldDelegate, NSTableViewDataSour
       preview.isHidden = false
       preview.configure(item)
     }
+    let count = currentFolderPane.selectedItems.count
+    statusLine = count > 1 ? "\(count) items selected · drag them to another app or onto a place to copy" : ""
     folderLibrary.watch(watched)
     // Folder totals for the listed folder only; the child pane never starts its own scan.
     folderLibrary.calculateSizes(in: folder)
@@ -573,6 +580,7 @@ final class FileSearchPalette: Surface, NSTextFieldDelegate, NSTableViewDataSour
     guard let folder = browsingFolder else { return }
     let files = folderLibrary.children(folder)
     guard !files.isEmpty else { return }
+    currentFolderPane.collapseSelection()
     let index = files.firstIndex { $0.id == folderSelections[folder] } ?? 0
     folderSelections[folder] = files[max(0, min(files.count - 1, index + delta))].id
     updateFolderPanels()
@@ -676,6 +684,20 @@ final class FileSearchPalette: Surface, NSTextFieldDelegate, NSTableViewDataSour
       }
     }
     if isBrowsing && !editing && !flags.contains(.command) && !flags.contains(.option) {
+      // Shift extends the selection from its anchor, as in Finder.
+      if flags.contains(.shift) && ["J", "K"].contains(key) || flags.contains(.shift) && [125, 126].contains(event.keyCode) {
+        let delta = key == "J" || event.keyCode == 125 ? 1 : -1
+        if let folder = browsingFolder, let id = currentFolderPane.extendSelection(by: delta) {
+          folderSelections[folder] = id
+          updateFolderPanels()
+        }
+        return true
+      }
+      if event.keyCode == 53 && currentFolderPane.selectedItems.count > 1 {
+        currentFolderPane.collapseSelection()
+        updateFolderPanels()
+        return true
+      }
       if key == "h" || event.keyCode == 123 {
         if let folder = browsingFolder, let parent = folderLibrary.parent(folder) {
           folderSelections[parent] = ItemID(rawValue: folder.rawValue)
@@ -693,6 +715,11 @@ final class FileSearchPalette: Surface, NSTextFieldDelegate, NSTableViewDataSour
     if flags.contains(.command) {
       if key.lowercased() == "r" {
         refresh(); return true
+      }
+      if key.lowercased() == "a", isBrowsing, !editing {
+        currentFolderPane.selectAll()
+        updateFolderPanels()
+        return true
       }
       if event.keyCode == 36, isBrowsing, let file = browsingItem { openRecent?(file, true); return true }
       if event.keyCode == 36, isHome, recentFiles.indices.contains(table.selectedRow) {
