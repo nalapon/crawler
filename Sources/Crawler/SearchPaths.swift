@@ -46,16 +46,6 @@ enum SearchEntries: RandomAccessCollection, Sendable {
     guard isASCII(at: i), prefix.utf8.allSatisfy({ $0 < 128 }) else { return self[i].path.hasPrefix(prefix) }
     return withBytes(at: i) { $0.starts(with: prefix.utf8) }
   }
-  func isAncestor(of path: String, at i: Int) -> Bool {
-    guard isASCII(at: i), path.utf8.allSatisfy({ $0 < 128 }) else { return path.hasPrefix(self[i].path + "/") }
-    var path = path
-    return path.withUTF8 { candidate in
-      withBytes(at: i) { bytes in
-        candidate.count > bytes.count && candidate[bytes.count] == 47
-          && candidate.starts(with: bytes)
-      }
-    }
-  }
   func equal(at i: Int, to other: SearchEntries, at j: Int) -> Bool {
     if isASCII(at: i) && other.isASCII(at: j) {
       return withBytes(at: i) { a in other.withBytes(at: j) { a.elementsEqual($0) } }
@@ -80,7 +70,7 @@ enum SearchEntries: RandomAccessCollection, Sendable {
     var canonical = path.precomposedStringWithCanonicalMapping
     return canonical.withUTF8 { hash(UnsafeRawBufferPointer($0)) }
   }
-  private static func hash(_ bytes: UnsafeRawBufferPointer) -> Int {
+  fileprivate static func hash(_ bytes: UnsafeRawBufferPointer) -> Int {
     var hasher = Hasher()
     hasher.combine(bytes: bytes)
     return hasher.finalize()
@@ -110,8 +100,8 @@ struct SearchPathTable {
   private var collisions: [Int: [Location]] = [:]
   private(set) var count = 0
   var isEmpty: Bool { count == 0 }
-  init(previous: [SearchIndex], prefixes: [String]? = nil) {
-    for index in previous { _ = insert(index.entries, prefixes: prefixes) }
+  init(previous: [SearchIndex], within scope: SearchPathScope? = nil) {
+    for index in previous { _ = insert(index.entries, within: scope) }
   }
   private func matches(_ location: Location, entries: SearchEntries, row: Int) -> Bool {
     sources[Int(location.batch)].equal(at: Int(location.row), to: entries, at: row)
@@ -121,14 +111,12 @@ struct SearchPathTable {
     if let location = locations[key], matches(location, entries: entries, row: row) { return true }
     return collisions[key]?.contains { matches($0, entries: entries, row: row) } ?? false
   }
-  mutating func insert(_ entries: SearchEntries, prefixes: [String]? = nil) -> [Int] {
+  mutating func insert(_ entries: SearchEntries, within scope: SearchPathScope? = nil) -> [Int] {
     let batch = UInt32(sources.count)
     sources.append(entries)
     var added: [Int] = []
     for row in entries.indices {
-      if let prefixes, !prefixes.contains(where: {
-        entries.equal(at: row, to: $0) || entries.hasPrefix($0 + "/", at: row)
-      }) { continue }
+      if let scope, !scope.contains(entries, row: row) { continue }
       let key = entries.fingerprint(at: row)
       if let location = locations[key] {
         if matches(location, entries: entries, row: row)
@@ -160,5 +148,43 @@ struct SearchPathTable {
     }
     count -= 1
     return sources[Int(removed.batch)].isFolder(at: Int(removed.row))
+  }
+}
+
+// Changed paths for reconciliation. A row is inside the scope when its own path
+// or one of its ancestors is a changed path. Each row costs one lookup per
+// ancestor, not one comparison per changed path, so thousands of changes stay cheap.
+struct SearchPathScope {
+  private var paths: [Int: [String]] = [:]
+  // UTF-8 lengths of the changed paths: ancestors of other lengths need no lookup.
+  private var lengths = Set<Int>()
+  init(_ changed: [String]) {
+    for path in changed {
+      paths[SearchEntries.fingerprint(path), default: []].append(path)
+      lengths.insert(path.precomposedStringWithCanonicalMapping.utf8.count)
+    }
+  }
+  func contains(_ entries: SearchEntries, row: Int) -> Bool {
+    let ascii = entries.withBytes(at: row) { bytes -> Bool? in
+      guard bytes.allSatisfy({ $0 < 128 }) else { return nil }
+      guard !bytes.isEmpty else { return false }
+      for end in 1...bytes.count where (end == bytes.count || bytes[end] == 47) && lengths.contains(end) {
+        let prefix = UnsafeRawBufferPointer(rebasing: bytes[..<end])
+        if paths[SearchEntries.hash(prefix)]?.contains(where: {
+          $0.utf8.count == end ? prefix.elementsEqual($0.utf8) : String(decoding: prefix, as: UTF8.self) == $0
+        }) == true { return true }
+      }
+      return false
+    }
+    if let ascii { return ascii }
+    // Non-ASCII rows compare canonically equivalent paths, as path equality does elsewhere.
+    let path = entries[row].path
+    var end = path.endIndex
+    while true {
+      let prefix = String(path[..<end])
+      if paths[SearchEntries.fingerprint(prefix)]?.contains(prefix) == true { return true }
+      guard let slash = path[..<end].lastIndex(of: "/") else { return false }
+      end = slash
+    }
   }
 }

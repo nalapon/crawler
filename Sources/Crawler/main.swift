@@ -206,6 +206,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         "hits": root.filePalette.search.queryCacheHits, "misses": root.filePalette.search.queryCacheMisses],
       "file_search_workers": QuickFileSearch.workerLimit,
       "file_search_index_ms": root.filePalette.search.indexMilliseconds,
+      "file_search_catch_up": root.filePalette.search.catchUp,
       "file_search_displayed_count": root.filePalette.displayedHits.count,
       "file_search_results": root.filePalette.search.response.hits.map(\.entry.path),
       "file_search_displayed_results": root.filePalette.displayedHits.map(\.entry.path),

@@ -9,6 +9,15 @@ struct SearchSnapshot: Sendable {
   var batches: [SearchIndex]
   var warning: String?
   var changed = false
+  /// The newest file-system event these batches reflect. Nil means only a full walk can bring them up to date.
+  var event: IndexEvent?
+}
+
+/// An FSEvents ID and when it was current. Batches marked with it include every earlier change,
+/// so the next search start can replay the events after it instead of walking the whole disk.
+struct IndexEvent: Sendable {
+  let id: FSEventStreamEventId
+  let date: Date
 }
 
 struct SearchReloadMeasurement: Codable {
@@ -75,61 +84,50 @@ enum SearchIndexReader {
     excluding: @escaping @Sendable ([String]) async -> Void = { _ in },
     batch: @escaping @Sendable (SearchIndex) async -> Void
   ) async throws -> SearchSnapshot {
-    let prefixes = changed.map { paths in
-      paths.sorted { $0.count < $1.count }.reduce(into: [String]()) { result, path in
-        if !result.contains(where: { path == $0 || path.hasPrefix($0 + "/") }) {
-          result.append(path)
-        }
-      }
-    }
     var result = SearchSnapshot(batches: [], warning: changed == nil ? nil : warning)
     var directories: [String] = []
     var seeds: [(String, Bool)] = []
+    var prefixes: [String]?
     let keys: Set<URLResourceKey> = [
       .isDirectoryKey, .isPackageKey, .isSymbolicLinkKey, .isHiddenKey,
     ]
-    for prefix in prefixes ?? [""] {
-      if prefix.isEmpty {
-        directories.append(prefix)
-        continue
-      }
-      if previous.contains(where: { index in
-        index.entries.indices.contains {
-          !index.entries.isFolder(at: $0) && index.entries.isAncestor(of: prefix, at: $0)
-        }
-      }) {
-        continue
-      }
-      let url = root.url.appendingPathComponent(prefix)
-      do {
+    if let changed {
+      var kept: [String] = []
+      var excluded = Set<String>()
+      var closed: [String: Ancestor] = [:]
+      for prefix in outermost(changed) {
+        try Task.checkCancellation()
         // A file event can arrive beneath an excluded directory without an event for its parent.
-        var ancestor = root.url
-        var excluded = false
-        for component in prefix.split(separator: "/").dropLast() {
-          ancestor.appendPathComponent(String(component))
-          let values = try ancestor.resourceValues(forKeys: keys)
-          if values.isHidden == true || values.isPackage == true || values.isSymbolicLink == true {
-            excluded = true
-            break
-          }
-        }
-        if excluded { continue }
-        let values = try url.resourceValues(forKeys: keys)
-        if values.isHidden == true {
-          await excluding([prefix])
+        if let ancestor = closedAncestor(of: prefix, root: root, keys: keys, memo: &closed) {
+          if ancestor.hidden { excluded.insert(ancestor.path) }
           continue
         }
-        let target =
-          values.isSymbolicLink == true
-          ? try? url.resolvingSymlinksInPath().resourceValues(forKeys: keys) : values
-        let folder = target?.isDirectory == true && target?.isPackage != true
-        seeds.append((prefix, folder))
-        if folder && values.isSymbolicLink != true { directories.append(prefix) }
-      } catch let error as NSError {
-        if error.domain != NSCocoaErrorDomain || error.code != NSFileReadNoSuchFileError {
-          result.warning = "Some paths could not be read: \(error.localizedDescription)"
+        kept.append(prefix)
+        let url = root.url.appendingPathComponent(prefix)
+        do {
+          let values = try url.resourceValues(forKeys: keys)
+          if values.isHidden == true {
+            excluded.insert(prefix)
+            continue
+          }
+          let target =
+            values.isSymbolicLink == true
+            ? try? url.resolvingSymlinksInPath().resourceValues(forKeys: keys) : values
+          let folder = target?.isDirectory == true && target?.isPackage != true
+          seeds.append((prefix, folder))
+          if folder && values.isSymbolicLink != true { directories.append(prefix) }
+        } catch let error as NSError {
+          if error.domain != NSCocoaErrorDomain || error.code != NSFileReadNoSuchFileError {
+            result.warning = "Some paths could not be read: \(error.localizedDescription)"
+          }
         }
       }
+      if !excluded.isEmpty { await excluding(Array(excluded)) }
+      // Nothing indexed can change beneath excluded folders alone.
+      if kept.isEmpty { return SearchSnapshot(batches: previous, warning: result.warning) }
+      prefixes = kept
+    } else {
+      directories = [""]
     }
     let collector = Batches(root: root, previous: previous, prefixes: prefixes, publish: batch)
     await collector.add(seeds)
@@ -169,6 +167,63 @@ enum SearchIndexReader {
     return result
   }
 
+  /// Drops paths inside another changed path: reading a changed folder covers its contents.
+  private static func outermost(_ paths: [String]) -> [String] {
+    var seen = Set<String>()
+    var result: [String] = []
+    for path in paths.sorted(by: { $0.utf8.count < $1.utf8.count }) {
+      var covered = seen.contains(path)
+      var end = path.endIndex
+      while !covered, let slash = path[..<end].lastIndex(of: "/") {
+        covered = seen.contains(String(path[..<slash]))
+        end = slash
+      }
+      if !covered {
+        seen.insert(path)
+        result.append(path)
+      }
+    }
+    return result
+  }
+
+  private enum Ancestor { case open, hidden, closed, missing }
+  /// The first ancestor that keeps a changed path out of the index: a hidden folder or one the
+  /// walk never enters (`hidden`, reported so later events beneath it are ignored, as after a
+  /// full walk), or a package or folder symlink. `memo` is shared by the paths of one read.
+  private static func closedAncestor(
+    of path: String, root: FolderID, keys: Set<URLResourceKey>, memo: inout [String: Ancestor]
+  ) -> (path: String, hidden: Bool)? {
+    var ancestor = ""
+    for component in path.split(separator: "/").dropLast() {
+      ancestor = ancestor.isEmpty ? String(component) : ancestor + "/" + component
+      let kind: Ancestor
+      if let known = memo[ancestor] {
+        kind = known
+      } else if unentered(root, ancestor) {
+        kind = .hidden
+      } else if let values = try? root.url.appendingPathComponent(ancestor).resourceValues(forKeys: keys) {
+        kind = values.isHidden == true ? .hidden
+          : values.isPackage == true || values.isSymbolicLink == true ? .closed : .open
+      } else {
+        kind = .missing
+      }
+      memo[ancestor] = kind
+      switch kind {
+      case .open: continue
+      // A removed folder keeps the path in scope, so its indexed contents are removed too.
+      case .missing: return nil
+      case .hidden: return (ancestor, true)
+      case .closed: return (ancestor, false)
+      }
+    }
+    return nil
+  }
+
+  /// Folders the Mac-wide index lists but never enters: device files and the duplicate mount hierarchy.
+  private static func unentered(_ root: FolderID, _ relative: String) -> Bool {
+    root.rawValue == "/" && (relative == "System/Volumes" || relative == "dev")
+  }
+
   private struct Directory: Sendable {
     var excluded: [String] = []
     var children: [String] = []
@@ -179,7 +234,7 @@ enum SearchIndexReader {
     _ root: FolderID, relative: String, collector: Batches
   ) async throws -> Directory {
     var result = Directory()
-    if root.rawValue == "/", relative == "System/Volumes" || relative == "dev" {
+    if unentered(root, relative) {
       result.excluded = [relative]
       return result
     }
@@ -187,6 +242,9 @@ enum SearchIndexReader {
     let descriptor: Int32
     do { descriptor = try await openDirectory(url) } catch {
       if relative.isEmpty { throw error }
+      // A folder that did not answer in time still exists: keep what was indexed beneath it.
+      // Otherwise the saved index would lose it until the next full walk.
+      if (error as NSError).code == Int(ETIMEDOUT) { await collector.keepContents(of: relative) }
       result.warning = "Some folders are unavailable: \(error.localizedDescription) · ⌘R to retry"
       return result
     }
@@ -194,6 +252,7 @@ enum SearchIndexReader {
       let error = NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
       close(descriptor)
       if relative.isEmpty { throw error }
+      if error.code == Int(ETIMEDOUT) { await collector.keepContents(of: relative) }
       result.warning = "Some folders could not be read: \(error.localizedDescription)"
       return result
     }
@@ -211,6 +270,7 @@ enum SearchIndexReader {
         if errno != 0 {
           let error = NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
           if relative.isEmpty { throw error }
+          if error.code == Int(ETIMEDOUT) { await collector.keepContents(of: relative) }
           result.warning = "Some folders could not be read: \(error.localizedDescription)"
         }
         break
@@ -321,6 +381,7 @@ enum SearchIndexReader {
     let prefixes: [String]?
     var remaining: SearchPathTable
     var replaced = Set<String>()
+    var unread: [String] = []
     var changed: Bool { !remaining.isEmpty || !replaced.isEmpty || !indexes.isEmpty }
     init(
       root: FolderID, previous: [SearchIndex], prefixes: [String]?,
@@ -330,7 +391,7 @@ enum SearchIndexReader {
       self.publish = publish
       self.previous = previous
       self.prefixes = prefixes
-      remaining = SearchPathTable(previous: previous, prefixes: prefixes)
+      remaining = SearchPathTable(previous: previous, within: prefixes.map(SearchPathScope.init))
     }
     func add(_ paths: [(String, Bool)], flush: Bool = false) async {
       for (path, folder) in paths {
@@ -357,13 +418,15 @@ enum SearchIndexReader {
         }
       }
     }
+    func keepContents(of folder: String) { unread.append(folder) }
     func finish() async -> [SearchIndex] {
       await add([], flush: true)
+      let unread = unread.isEmpty ? nil : SearchPathScope(unread)
       var retained: [SearchIndex] = []
       for old in previous {
         if Task.isCancelled { return [] }
         let rows = old.entries.indices.filter {
-          !remaining.contains(old.entries, row: $0)
+          (!remaining.contains(old.entries, row: $0) || unread?.contains(old.entries, row: $0) == true)
             && (replaced.isEmpty || !replaced.contains(old.entries[$0].path))
         }
         if rows.count == old.entries.count {
@@ -403,14 +466,66 @@ private enum SearchIndexCache {
   static func hasPreparedCache(_ root: FolderID) -> Bool {
     FileManager.default.fileExists(atPath: preparedURL(root).path)
   }
-  private static let fffMagic = Data("CrawlerFFF000003".utf8)
+  // Version 4 adds the saved event to the header. Versions 3 and 4 align prepared tables.
+  private static let fffMagic = Data("CrawlerFFF000004".utf8)
+  private static let alignedMagic = Data("CrawlerFFF000003".utf8)
+  private static let unalignedMagic = ["CrawlerFFF000002", "CrawlerFFF000001"].map { Data($0.utf8) }
+  private struct Header {
+    let aligned: Bool
+    let event: IndexEvent?
+    let blocks: Int
+    let size: Int
+  }
+  private static func header(_ data: Data, root: FolderID) throws -> Header {
+    var position = 16
+    func take(_ count: Int) throws -> Range<Int> {
+      guard count >= 0, position <= data.count, count <= data.count - position else {
+        throw CocoaError(.fileReadCorruptFile)
+      }
+      let range = position..<(position + count)
+      position += count
+      return range
+    }
+    func number<T: FixedWidthInteger>(_ type: T.Type) throws -> T {
+      let range = try take(MemoryLayout<T>.size)
+      return data.withUnsafeBytes { T(littleEndian: $0.loadUnaligned(fromByteOffset: range.lowerBound, as: T.self)) }
+    }
+    let magic = data.prefix(16)
+    guard data.count >= 32, magic == fffMagic || magic == alignedMagic || unalignedMagic.contains(magic) else {
+      throw CocoaError(.fileReadCorruptFile)
+    }
+    let rootLength = Int(try number(UInt32.self)), revisionLength = Int(try number(UInt32.self))
+    let blocks = Int(try number(UInt32.self))
+    guard try number(UInt32.self) == 0 else { throw CocoaError(.fileReadCorruptFile) }
+    var event: IndexEvent?
+    if magic == fffMagic {
+      let id = try number(UInt64.self), seconds = try number(UInt64.self)
+      if id > 0 { event = IndexEvent(id: id, date: Date(timeIntervalSince1970: TimeInterval(seconds))) }
+    }
+    let rootRange = try take(rootLength), revisionRange = try take(revisionLength)
+    guard String(data: data[rootRange], encoding: .utf8) == root.rawValue,
+      String(data: data[revisionRange], encoding: .utf8) == FFFSearch.revision else { throw CocoaError(.fileReadCorruptFile) }
+    _ = try take((16 - position % 16) % 16)
+    return Header(aligned: magic == fffMagic || magic == alignedMagic, event: event, blocks: blocks, size: position)
+  }
+  /// The event saved with the prepared cache, read from its header alone.
+  static func savedEvent(_ root: FolderID) -> IndexEvent? {
+    guard let file = try? FileHandle(forReadingFrom: preparedURL(root)) else { return nil }
+    defer { try? file.close() }
+    guard let data = try? file.read(upToCount: 4096) else { return nil }
+    return (try? header(data, root: root))?.event
+  }
 
+  /// Returns the event saved with this cache, if its format records one.
   private static func loadFFF(_ root: FolderID, from url: URL, query: String,
-    batch: @Sendable (SearchIndex) async -> Void) async throws {
+    batch: @Sendable (SearchIndex) async -> Void) async throws -> IndexEvent? {
     let cache = try FFFMappedCache(url: url)
     defer { withExtendedLifetime(cache) {} }
     let data = cache.data
-    var position = 0
+    let header = try header(data, root: root)
+    guard header.blocks <= data.count / 16 else { throw CocoaError(.fileReadCorruptFile) }
+    let alignedBlocks = header.aligned, blocks = header.blocks
+    var position = header.size
     func take(_ count: Int) throws -> Range<Int> {
       guard count >= 0, position <= data.count, count <= data.count - position else {
         throw CocoaError(.fileReadCorruptFile)
@@ -423,15 +538,6 @@ private enum SearchIndexCache {
       let range = try take(4)
       return data.withUnsafeBytes { Int(UInt32(littleEndian: $0.loadUnaligned(fromByteOffset: range.lowerBound, as: UInt32.self))) }
     }
-    guard data.count >= 32, data.prefix(16) == fffMagic || data.prefix(16) == Data("CrawlerFFF000002".utf8) || data.prefix(16) == Data("CrawlerFFF000001".utf8) else { throw CocoaError(.fileReadCorruptFile) }
-    let alignedBlocks = data.prefix(16) == fffMagic
-    position = 16
-    let rootLength = try number(), revisionLength = try number(), blocks = try number()
-    guard try number() == 0, blocks <= data.count / 16 else { throw CocoaError(.fileReadCorruptFile) }
-    let rootRange = try take(rootLength), revisionRange = try take(revisionLength)
-    guard String(data: data[rootRange], encoding: .utf8) == root.rawValue,
-      String(data: data[revisionRange], encoding: .utf8) == FFFSearch.revision else { throw CocoaError(.fileReadCorruptFile) }
-    _ = try take((16 - position % 16) % 16)
     let queryBytes = Array(SearchText.normalized(query).utf8)
     var queryBits = Set<Int>()
     if queryBytes.count >= 3 {
@@ -491,6 +597,7 @@ private enum SearchIndexCache {
       }
       await batch(try SearchIndex(root: root, entries: .mapped(cache, paths, entries), cache: cache, range: prepared))
     }
+    return header.event
   }
   private static func validRelativePath(_ bytes: UnsafeRawBufferPointer) -> Bool {
     guard !bytes.isEmpty, bytes[0] != 47 else { return false }
@@ -597,36 +704,36 @@ private enum SearchIndexCache {
     }
     guard position == data.count else { throw CocoaError(.fileReadCorruptFile) }
   }
+  /// Returns the event saved with the loaded cache; older formats and fallbacks have none.
+  @discardableResult
   static func load(
     _ root: FolderID, from cacheURL: URL? = nil, query: String = "", batch: @Sendable (SearchIndex) async -> Void
-  ) async throws {
+  ) async throws -> IndexEvent? {
     let prepared = cacheURL ?? preparedURL(root)
     let isFFF = ["fff.bin", "fff2.bin", "fff3.bin"].contains { prepared.lastPathComponent.hasSuffix($0) }
     if isFFF, FileManager.default.fileExists(atPath: prepared.path) {
       do {
-        try await loadFFF(root, from: prepared, query: query, batch: batch)
-        return
+        return try await loadFFF(root, from: prepared, query: query, batch: batch)
       } catch is CancellationError { throw CancellationError() }
       catch { if cacheURL != nil { throw error } }
       // A damaged or old-version app cache falls back to its original paths.
     }
     if !isFFF, prepared.pathExtension == "bin", FileManager.default.fileExists(atPath: prepared.path) {
       try await loadPrepared(root, from: prepared, batch: batch)
-      return
+      return nil
     }
     if cacheURL == nil, !FileManager.default.fileExists(atPath: prepared.path) {
       for suffix in ["fff2.bin", "fff.bin"] {
         let earlierFFF = url(root).deletingPathExtension().appendingPathExtension(suffix)
         if FileManager.default.fileExists(atPath: earlierFFF.path) {
-          try await loadFFF(root, from: earlierFFF, query: query, batch: batch)
-          return
+          return try await loadFFF(root, from: earlierFFF, query: query, batch: batch)
         }
       }
       let legacy = url(root).deletingPathExtension().appendingPathExtension("bin")
       let jsonFFF = url(root).deletingPathExtension().appendingPathExtension("fff.jsonl")
       if !FileManager.default.fileExists(atPath: jsonFFF.path), FileManager.default.fileExists(atPath: legacy.path) {
         try await loadPrepared(root, from: legacy, batch: batch)
-        return
+        return nil
       }
     }
     let jsonFFF = url(root).deletingPathExtension().appendingPathExtension("fff.jsonl")
@@ -639,7 +746,7 @@ private enum SearchIndexCache {
           await batch(SearchIndex(root: root, paths: index.entries.map { (prefix + $0.path, $0.isFolder) }))
         }
       }
-      return
+      return nil
     }
     defer { try? file.close() }
     var buffer = Data()
@@ -654,11 +761,12 @@ private enum SearchIndexCache {
             !row.path.isEmpty && !row.path.hasPrefix("/")
               && !row.path.split(separator: "/").contains(where: { $0 == ".." || $0 == "." })
           })
-        else { return }
+        else { return nil }
         await batch(SearchIndex(root: root, paths: record.rows.map { ($0.path, $0.folder) }))
         buffer.removeSubrange(...end)
       }
     }
+    return nil
   }
   static func save(_ snapshot: SearchSnapshot, root: FolderID) throws {
     let target = preparedURL(root)
@@ -677,6 +785,9 @@ private enum SearchIndexCache {
     let rootBytes = Data(root.rawValue.utf8), revision = Data(FFFSearch.revision.utf8)
     appendNumber(rootBytes.count, to: &header); appendNumber(revision.count, to: &header)
     appendNumber(snapshot.batches.count, to: &header); appendNumber(0, to: &header)
+    for value in [snapshot.event?.id ?? 0, UInt64(max(0, snapshot.event?.date.timeIntervalSince1970 ?? 0))] {
+      withUnsafeBytes(of: value.littleEndian) { header.append(contentsOf: $0) }
+    }
     header.append(rootBytes); header.append(revision)
     header.append(contentsOf: repeatElement(UInt8(0), count: (16 - header.count % 16) % 16))
     try file.write(contentsOf: header)
@@ -728,21 +839,28 @@ private enum SearchIndexCache {
 
 // One recursive FSEvents stream, rather than a descriptor for every directory.
 // The stream uses the main queue; its callback only schedules background work.
+// Started from a saved event, it first replays the changes made since then and
+// calls `historyDone` once it reaches the present.
 @MainActor
 private final class SearchWatcher {
   private var stream: FSEventStreamRef?
   let changed: ([String]?) -> Void
-  private let root: String
+  private let historyDone: () -> Void
+  let root: String
   var excludedPaths = Set<String>()
+  /// The newest event delivered, including ones the filters below ignore.
+  private(set) var lastEventID: FSEventStreamEventId = 0
   private let cachePath = FolderID.home.url
     .appendingPathComponent("Library/Caches/studio.crawler.native-prototype").path
-  init(physicalRoot: String, changed: @escaping ([String]?) -> Void) {
+  init(physicalRoot: String, since: FSEventStreamEventId? = nil,
+    changed: @escaping ([String]?) -> Void, historyDone: @escaping () -> Void = {}) {
     self.changed = changed
+    self.historyDone = historyDone
     self.root = physicalRoot
     var context = FSEventStreamContext(
       version: 0, info: Unmanaged.passUnretained(self).toOpaque(),
       retain: nil, release: nil, copyDescription: nil)
-    let callback: FSEventStreamCallback = { _, info, count, paths, flags, _ in
+    let callback: FSEventStreamCallback = { _, info, count, paths, flags, ids in
       guard let info else { return }
       let watcher = Unmanaged<SearchWatcher>.fromOpaque(info).takeUnretainedValue()
       let paths = unsafeBitCast(paths, to: NSArray.self)
@@ -752,8 +870,15 @@ private final class SearchWatcher {
             | kFSEventStreamEventFlagRootChanged | kFSEventStreamEventFlagUserDropped
             | kFSEventStreamEventFlagKernelDropped)
         var changed: [String] = []
+        var rescan = false
+        var caughtUp = false
         for i in 0..<count {
-          guard let path = paths[i] as? String else { continue }
+          if flags[i] & FSEventStreamEventFlags(kFSEventStreamEventFlagHistoryDone) != 0 {
+            caughtUp = true
+            continue
+          }
+          watcher.lastEventID = max(watcher.lastEventID, ids[i])
+          guard !rescan, let path = paths[i] as? String else { continue }
           if path == watcher.cachePath || path.hasPrefix(watcher.cachePath + "/") { continue }
           let rootPrefix = watcher.root == "/" ? "/" : watcher.root + "/"
           let relative = path.hasPrefix(rootPrefix) ? String(path.dropFirst(rootPrefix.count)) : ""
@@ -761,8 +886,8 @@ private final class SearchWatcher {
             continue
           }
           if flags[i] & needsScan != 0 {
-            watcher.changed(nil)
-            return
+            rescan = true
+            continue
           }
           let canonical = path.hasSuffix("/") && path != "/" ? String(path.dropLast()) : path
           let relevant = FSEventStreamEventFlags(
@@ -772,8 +897,8 @@ private final class SearchWatcher {
           // The index contains names and kinds, so content-only writes require no rescan.
           if flags[i] & relevant == 0 { continue }
           if canonical == watcher.root {
-            watcher.changed(nil)
-            return
+            rescan = true
+            continue
           }
           let prefix = watcher.root == "/" ? "/" : watcher.root + "/"
           if canonical.hasPrefix(prefix) {
@@ -784,12 +909,17 @@ private final class SearchWatcher {
             }
           }
         }
-        if !changed.isEmpty { watcher.changed(changed) }
+        if rescan {
+          watcher.changed(nil)
+        } else if !changed.isEmpty {
+          watcher.changed(changed)
+        }
+        if caughtUp { watcher.historyDone() }
       }
     }
     stream = FSEventStreamCreate(
       nil, callback, &context, [self.root] as CFArray,
-      FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 0.2,
+      since ?? FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 0.2,
       FSEventStreamCreateFlags(
         kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagFileEvents
           | kFSEventStreamCreateFlagWatchRoot | kFSEventStreamCreateFlagNoDefer))
@@ -922,9 +1052,26 @@ final class QuickFileSearch {
   private var scanID = UUID(), queryID = UUID()
   private var pendingFullScan = false
   private var pendingPaths = Set<String>()
+  /// Changed paths of the running scan (nil for a full walk) and the event it brings the index up to.
+  private var scanRequest: [String]?
+  private var scanThrough: IndexEvent?
+  /// Batches reflect every change up to this event. Saved with the cache, it lets the next
+  /// start replay later events instead of walking the disk; nil until a walk completes.
+  private var indexEvent: IndexEvent?
+  /// The event in the cache file, so an unchanged index still refreshes a stale one.
+  private var savedEvent: IndexEvent?
+  /// Saved history still arriving after a resumed start, and the task enforcing its time limit.
+  private var replay: (start: ContinuousClock.Instant, limit: Task<Void, Never>)?
+  /// Saved events older than this cost about as much to replay as a walk.
+  private static let replayAge: TimeInterval = 24 * 3600
+  /// The longest wait for saved history before walking the disk instead.
+  private static let replayLimit: Duration = .seconds(30)
+  /// Pending changed paths beyond this are covered by one full walk, bounding memory and reconciliation time.
+  private static let pendingLimit = 50_000
+  /// How the index last caught up with the disk, for the state report.
+  private(set) var catchUp: [String: Any] = [:]
   private var presented = false
   private var idleTask: Task<Void, Never>?
-  private var discoveryInterrupted = false
   private var measuring = false
   private struct CachedQuery {
     let text: String
@@ -989,7 +1136,10 @@ final class QuickFileSearch {
     searchTask = nil
     queryID = UUID()
     searching = false
-    if scanTask != nil || watcherTask != nil { discoveryInterrupted = true }
+    // Keep an interrupted scan's work; the next search start resumes it.
+    if scanTask != nil {
+      if let paths = scanRequest { pendingPaths.formUnion(paths) } else { pendingFullScan = true }
+    }
     scanTask?.cancel()
     scanTask = nil
     scanID = UUID()
@@ -1054,7 +1204,9 @@ final class QuickFileSearch {
     responseIsCurrent = false
     pendingPaths.removeAll()
     pendingFullScan = false
-    discoveryInterrupted = false
+    endReplay()
+    indexEvent = nil
+    savedEvent = nil
     // Request return of free allocator pages only after cache writing has released its snapshot.
     Task.detached(priority: .utility) {
       await writer?.value
@@ -1245,10 +1397,11 @@ final class QuickFileSearch {
         while !Task.isCancelled {
           do { try await Task.sleep(for: .seconds(5)) } catch { return }
           guard let self else { return }
-          if self.cacheDirty && self.indexedCount != savedCount {
+          // A partly loaded cache is never saved: it would replace the complete one.
+          if self.cacheLoaded && self.cacheDirty && self.indexedCount != savedCount {
             savedCount = self.indexedCount
             self.cacheDirty = false
-            self.persist(SearchSnapshot(batches: self.batches, warning: self.warning))
+            self.persist(self.batches)
           }
         }
       }
@@ -1263,19 +1416,87 @@ final class QuickFileSearch {
           defer { free(resolved) }
           return String(cString: resolved)
         }
+        let saved = SearchIndexCache.savedEvent(root)
         guard !Task.isCancelled else { return }
-        await self?.startWatcher(root: root, physicalRoot: physicalRoot, id: id)
+        await self?.startWatcher(root: root, physicalRoot: physicalRoot, id: id, saved: saved)
       }
       didChange?()
     }
   }
-  private func startWatcher(root: FolderID, physicalRoot: String, id: UUID) {
+  private func startWatcher(root: FolderID, physicalRoot: String, id: UUID, saved: IndexEvent?) {
     guard indexRoot == root, watcherID == id else { return }
     watcherTask = nil
-    watcher = SearchWatcher(physicalRoot: physicalRoot) { [weak self] paths in
-      self?.scheduleRefresh(paths)
+    let reason: String
+    if let saved, saved.id <= FSEventsGetCurrentEventId(), -saved.date.timeIntervalSinceNow < Self.replayAge {
+      let watcher = makeWatcher(physicalRoot, since: saved.id)
+      if watcher.active {
+        // Load the saved cache and replay the changes made since, instead of walking the disk.
+        self.watcher = watcher
+        indexEvent = saved
+        savedEvent = saved
+        let limit = Task { [weak self] in
+          do { try await Task.sleep(for: Self.replayLimit) } catch { return }
+          self?.walkEverything(because: "history took too long")
+        }
+        replay = (.now, limit)
+        catchUp = ["method": "replay", "saved_hours_ago": -saved.date.timeIntervalSinceNow / 3600]
+        scan(changed: [])
+        return
+      }
+      watcher.stop()
+      reason = "history unavailable"
+    } else {
+      reason = saved == nil ? "no saved event" : "saved event too old"
     }
+    watcher = makeWatcher(physicalRoot, since: nil)
+    catchUp = ["method": "walk", "reason": reason]
     scan()
+  }
+  private func makeWatcher(_ physicalRoot: String, since: FSEventStreamEventId?) -> SearchWatcher {
+    SearchWatcher(physicalRoot: physicalRoot, since: since) { [weak self] paths in
+      self?.scheduleRefresh(paths)
+    } historyDone: { [weak self] in
+      self?.finishReplay()
+    }
+  }
+  /// Saved history reached the present: reconcile its changed paths together.
+  private func finishReplay() {
+    guard let replay else { return }
+    endReplay()
+    let duration = replay.start.duration(to: .now).components
+    catchUp["replay_ms"] = Double(duration.seconds) * 1000 + Double(duration.attoseconds) / 1e15
+    catchUp["replayed_paths"] = pendingPaths.count
+    // A running scan picks up the pending paths when it finishes.
+    guard scanTask == nil else { return }
+    if pendingFullScan || !pendingPaths.isEmpty || !cacheLoaded {
+      scanPending()
+    } else {
+      state = .ready
+      didChange?()
+    }
+  }
+  private func endReplay() {
+    replay?.limit.cancel()
+    replay = nil
+  }
+  /// Gives up on saved history: watch from now on and walk the whole disk once.
+  private func walkEverything(because reason: String) {
+    if replay != nil {
+      endReplay()
+      if let old = watcher {
+        old.stop()
+        watcher = makeWatcher(old.root, since: nil)
+      }
+    }
+    // Neither the index nor a running scan can claim any event until the walk completes.
+    indexEvent = nil
+    scanThrough = nil
+    pendingPaths.removeAll()
+    pendingFullScan = true
+    catchUp["method"] = "walk"
+    catchUp["reason"] = reason
+    // A running scan starts the walk when it finishes.
+    if scanTask == nil { scanPending() }
   }
   func resume() {
     presented = true
@@ -1315,6 +1536,11 @@ final class QuickFileSearch {
     cacheTask?.cancel()
     cacheTask = nil
     pendingCache = nil
+    endReplay()
+    indexEvent = nil
+    savedEvent = nil
+    scanRequest = nil
+    scanThrough = nil
     root = nil
     volumeWatcher?.stop()
     volumeWatcher = nil
@@ -1400,12 +1626,7 @@ final class QuickFileSearch {
       idleTask?.cancel()
       idleTask = nil
       startDiscovery()
-      if watcher != nil, scanTask == nil, discoveryInterrupted {
-        discoveryInterrupted = false
-        scan()
-      } else if watcher != nil, scanTask == nil {
-        scanPending()
-      }
+      if watcher != nil, scanTask == nil { scanPending() }
       if let volumeRoot, volumeWatcher == nil {
         volumeWatcher = SearchWatcher(physicalRoot: volumeRoot.rawValue) { [weak self] _ in
           self?.scheduleVolumeRefresh()
@@ -1713,16 +1934,27 @@ final class QuickFileSearch {
   }
   private func scheduleRefresh(_ paths: [String]?) {
     if let paths, !pendingFullScan {
-      pendingPaths.formUnion(paths)
-      // Large event bursts are cheaper to enumerate once than to compare every
-      // event against every indexed path during incremental reconciliation.
-      if pendingPaths.count > 64 {
+      // Reading a pending folder covers everything beneath it.
+      for path in paths where !hasPendingAncestor(path) { pendingPaths.insert(path) }
+      if pendingPaths.count > Self.pendingLimit {
         pendingFullScan = true
         pendingPaths.removeAll()
       }
     } else if paths == nil {
       pendingFullScan = true
       pendingPaths.removeAll()
+    }
+    if replay != nil {
+      // Replayed paths are reconciled together once the history ends. A full walk makes the rest
+      // of the history useless; the stream is replaced after this callback returns.
+      if pendingFullScan {
+        let reason = paths == nil ? "history needs a full scan" : "too many changes"
+        Task { [weak self] in
+          guard let self, self.replay != nil else { return }
+          self.walkEverything(because: reason)
+        }
+      }
+      return
     }
     refreshTask?.cancel()
     guard indexNeeded else { return }
@@ -1732,12 +1964,28 @@ final class QuickFileSearch {
       self.scanPending()
     }
   }
+  private func hasPendingAncestor(_ path: String) -> Bool {
+    var end = path.endIndex
+    while let slash = path[..<end].lastIndex(of: "/") {
+      if pendingPaths.contains(String(path[..<slash])) { return true }
+      end = slash
+    }
+    return false
+  }
   private func scanPending() {
-    guard indexNeeded, pendingFullScan || !pendingPaths.isEmpty else { return }
-    let changes = pendingFullScan ? nil : Array(pendingPaths)
-    pendingFullScan = false
-    pendingPaths.removeAll()
-    scan(changed: changes)
+    guard indexNeeded else { return }
+    if pendingFullScan {
+      pendingFullScan = false
+      pendingPaths.removeAll()
+      scan()
+    } else if replay != nil {
+      // History is still arriving: load the cache now and reconcile its paths when it ends.
+      if !cacheLoaded { scan(changed: []) }
+    } else if !pendingPaths.isEmpty || !cacheLoaded {
+      let changes = Array(pendingPaths)
+      pendingPaths.removeAll()
+      scan(changed: changes)
+    }
   }
   private func scan(changed: [String]? = nil) {
     guard indexNeeded else { return }
@@ -1749,6 +1997,16 @@ final class QuickFileSearch {
       watcher?.excludedPaths.subtract(changed)
     } else {
       watcher?.excludedPaths.removeAll()
+    }
+    scanRequest = changed
+    if changed == nil {
+      // The walk starts after this event, so it includes every change up to it.
+      scanThrough = watcher?.active == true ? IndexEvent(id: FSEventsGetCurrentEventId(), date: Date()) : nil
+    } else if replay == nil, let indexEvent, let latest = watcher?.lastEventID, latest > indexEvent.id {
+      // These paths are every change delivered so far that the index does not include yet.
+      scanThrough = IndexEvent(id: latest, date: Date())
+    } else {
+      scanThrough = indexEvent
     }
     let previous = batches
     let initialQuery = query
@@ -1771,13 +2029,13 @@ final class QuickFileSearch {
             }
           }
           try Task.checkCancellation()
-          try? await SearchIndexCache.load(root, query: initialQuery) { [weak self] index in
+          let saved = try? await SearchIndexCache.load(root, query: initialQuery) { [weak self] index in
             if let addition = await unique.additions(index) {
               await self?.append(addition, id: id, fromCache: true)
             }
           }
           try Task.checkCancellation()
-          await self?.markCacheLoaded(id: id)
+          guard await self?.markCacheLoaded(id: id, event: saved ?? nil) == true else { return }
         }
         let loaded = await self?.residentBatches(id: id) ?? []
         let snapshot = try await SearchIndexReader.read(
@@ -1795,13 +2053,21 @@ final class QuickFileSearch {
     }
   }
   private func residentBatches(id: UUID) -> [SearchIndex] { scanID == id ? batches : [] }
-  private func markCacheLoaded(id: UUID) {
-    guard scanID == id else { return }
+  /// Returns false when the scan must stop because the loaded cache cannot be brought up to date.
+  private func markCacheLoaded(id: UUID, event: IndexEvent?) -> Bool {
+    guard scanID == id else { return false }
     cacheLoaded = true
     if !searching, response.total == 0, startFuzzyFallback() { didChange?() }
-    if !batches.isEmpty, !SearchIndexCache.hasPreparedCache(indexRoot) {
-      persist(SearchSnapshot(batches: batches, warning: warning))
+    // Saved history replays only onto the cache saved with it, not a damaged or replaced one.
+    if scanRequest != nil, let indexEvent, event?.id != indexEvent.id {
+      scanTask = nil
+      walkEverything(because: "cache changed")
+      return false
     }
+    if !batches.isEmpty, !SearchIndexCache.hasPreparedCache(indexRoot) {
+      persist(batches)
+    }
+    return true
   }
   private func finish(_ snapshot: SearchSnapshot, id: UUID, milliseconds: Double) {
     guard scanID == id else { return }
@@ -1812,10 +2078,15 @@ final class QuickFileSearch {
     indexedCount = batches.reduce(0) { $0 + $1.entries.count }
     warning = snapshot.warning
     indexMilliseconds = milliseconds
-    if snapshot.changed { persist(snapshot) }
+    indexEvent = scanThrough
+    // A walk always saves its fresh event. An unchanged incremental scan saves only when the
+    // file's event is over an hour behind, so the next start replays a short history.
+    let behind = indexEvent.map { $0.date.timeIntervalSince(savedEvent?.date ?? .distantPast) } ?? 0
+    if snapshot.changed || scanRequest == nil || behind > 3600 { persist(batches) }
     cacheDirty = false
-    state = .ready
+    state = replay == nil ? .ready : .indexing(indexedCount)
     scanTask = nil
+    scanRequest = nil
     // Reconciliation replaces cached paths, removing deleted entries and duplicate coverage.
     if presented && snapshot.changed {
       restartQuery()
@@ -1824,8 +2095,9 @@ final class QuickFileSearch {
     }
     scanPending()
   }
-  private func persist(_ snapshot: SearchSnapshot) {
-    pendingCache = snapshot
+  private func persist(_ batches: [SearchIndex]) {
+    pendingCache = SearchSnapshot(batches: batches, event: indexEvent)
+    savedEvent = indexEvent
     guard cacheTask == nil else { return }
     cacheTask = Task { [weak self] in
       while let self, let snapshot = self.pendingCache {
@@ -1847,6 +2119,7 @@ final class QuickFileSearch {
     guard scanID == id else { return }
     state = .failed(error)
     scanTask = nil
+    scanRequest = nil
     didChange?()
   }
   func recordOpen(_ hit: SearchHit) {
