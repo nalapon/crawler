@@ -136,7 +136,7 @@ pub struct State {
     mounted: Vec<Volume>,
     volume_events: mpsc::Receiver<()>,
     volume_sender: mpsc::Sender<()>,
-    volume_observer: Option<platform::VolumeObserver>,
+    volume_observer: Option<platform::WorkspaceObserver>,
     waker: Option<Waker>,
     focus_pending: bool,
     restore_scroll: bool,

@@ -34,11 +34,16 @@ pub struct State {
     rx: Receiver<OpenResult>,
     waker: Option<Waker>,
     scanned: bool,
+    editor_events: Receiver<()>,
+    editor_event_sender: Sender<()>,
+    editor_observer: Option<platform::WorkspaceObserver>,
+    last_scan: f64,
     ejection: Latest<Result<(), String>>,
 }
 impl Default for State {
     fn default() -> Self {
         let (tx, rx) = mpsc::channel();
+        let (editor_event_sender, editor_events) = mpsc::channel();
         Self {
             editors: Vec::new(),
             default_editor: None,
@@ -50,6 +55,10 @@ impl Default for State {
             rx,
             waker: None,
             scanned: false,
+            editor_events,
+            editor_event_sender,
+            editor_observer: None,
+            last_scan: f64::NEG_INFINITY,
             ejection: Latest::default(),
         }
     }
@@ -72,6 +81,10 @@ pub fn setup(app: &mut App, waker: &Waker) {
     app.opening.waker = Some(waker.clone());
     app.opening.discovery.set_waker(waker.clone());
     app.opening.ejection.set_waker(waker.clone());
+    app.opening.editor_observer = Some(platform::observe_activation(
+        app.opening.editor_event_sender.clone(),
+        waker.clone(),
+    ));
     refresh_editors(app);
 }
 pub fn refresh_editors(app: &mut App) {
@@ -79,6 +92,12 @@ pub fn refresh_editors(app: &mut App) {
 }
 pub fn poll(app: &mut App, tx: &mut Tx) -> bool {
     let mut changed = false;
+    if app.opening.editor_events.try_iter().next().is_some() {
+        for _ in app.opening.editor_events.try_iter() {}
+        if app.clock - app.opening.last_scan > 30.0 && !app.opening.discovery.is_pending() {
+            refresh_editors(app);
+        }
+    }
     if let Some(result) = app.opening.ejection.take() {
         if let Err(error) = result {
             app.toast(error);
@@ -89,6 +108,7 @@ pub fn poll(app: &mut App, tx: &mut Tx) -> bool {
         changed |= app.section == crate::app::Section::Settings && editors != app.opening.editors;
         app.opening.editors = editors;
         app.opening.scanned = true;
+        app.opening.last_scan = app.clock;
         let pending = std::mem::take(&mut app.opening.awaiting_editors);
         for p in pending {
             changed |= dispatch_visible(app, p.path, p.kind, tx);

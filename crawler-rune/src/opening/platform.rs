@@ -130,11 +130,11 @@ pub fn eject(path: &Path) -> Result<(), String> {
     })
 }
 
-pub struct VolumeObserver {
+pub struct WorkspaceObserver {
     center: objc2::rc::Retained<objc2_foundation::NSNotificationCenter>,
     tokens: Vec<objc2::rc::Retained<objc2_foundation::NSObject>>,
 }
-impl Drop for VolumeObserver {
+impl Drop for WorkspaceObserver {
     fn drop(&mut self) {
         unsafe {
             for token in &self.tokens {
@@ -143,7 +143,7 @@ impl Drop for VolumeObserver {
         }
     }
 }
-pub fn observe_volumes(tx: Sender<()>, waker: Waker) -> VolumeObserver {
+pub fn observe_volumes(tx: Sender<()>, waker: Waker) -> WorkspaceObserver {
     use objc2_app_kit::{
         NSWorkspaceDidMountNotification, NSWorkspaceDidRenameVolumeNotification,
         NSWorkspaceDidUnmountNotification,
@@ -171,7 +171,7 @@ pub fn observe_volumes(tx: Sender<()>, waker: Waker) -> VolumeObserver {
                 &block,
             ));
         }
-        VolumeObserver { center, tokens }
+        WorkspaceObserver { center, tokens }
     }
 }
 
@@ -216,4 +216,36 @@ pub fn is_hidden(path: &Path) -> bool {
             b
         })
     })
+}
+
+pub fn observe_activation(tx: Sender<()>, waker: Waker) -> WorkspaceObserver {
+    use objc2_app_kit::{NSWorkspaceApplicationKey, NSWorkspaceDidActivateApplicationNotification};
+    use objc2_foundation::NSNotification;
+    use std::ptr::NonNull;
+    unsafe {
+        let center = NSWorkspace::sharedWorkspace().notificationCenter();
+        let block = block2::RcBlock::new(move |notification: NonNull<NSNotification>| {
+            let Some(info) = notification.as_ref().userInfo() else {
+                return;
+            };
+            let Some(app) = info.objectForKey(NSWorkspaceApplicationKey) else {
+                return;
+            };
+            let pid: i32 = msg_send![&*app, processIdentifier];
+            if pid == std::process::id() as i32 {
+                let _ = tx.send(());
+                waker();
+            }
+        });
+        let token = center.addObserverForName_object_queue_usingBlock(
+            Some(NSWorkspaceDidActivateApplicationNotification),
+            None,
+            None,
+            &block,
+        );
+        WorkspaceObserver {
+            center,
+            tokens: vec![token],
+        }
+    }
 }
