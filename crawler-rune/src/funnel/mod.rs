@@ -47,6 +47,7 @@ struct Session {
     has_nonempty: bool,
     scope_children: Vec<PathBuf>,
     revision: u64,
+    g_at: Option<f64>,
 }
 impl Session {
     fn new(folder: PathBuf, query_focused: bool) -> Self {
@@ -75,6 +76,7 @@ impl Session {
             has_nonempty: false,
             scope_children: Vec::new(),
             revision: 0,
+            g_at: None,
         }
     }
     fn searching(&self) -> bool {
@@ -825,6 +827,10 @@ fn enter_selected_folder(app: &mut App, tx: &mut Tx) {
     });
     if let Some(item) = item.filter(|i| i.kind == DocumentKind::Folder) {
         open_folder(app, item.id.0.clone(), tx);
+    } else if !browsing(app)
+        && let Some(path) = focused_path(app).and_then(|p| p.parent().map(Path::to_owned))
+    {
+        open_folder(app, path, tx);
     }
 }
 fn parent(app: &mut App, tx: &mut Tx) {
@@ -846,7 +852,34 @@ fn parent(app: &mut App, tx: &mut Tx) {
         s.selected.insert(id);
     }
 }
+fn half_page_key(app: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
+    if ev.mods.ctrl
+        && !ev.mods.alt
+        && let Key::Text(t) = &ev.key
+    {
+        if t.eq_ignore_ascii_case("d") || t.eq_ignore_ascii_case("u") {
+            let count = session(app)
+                .chrome
+                .half_page(if browsing(app) { 32.0 } else { 44.0 });
+            move_selection(
+                app,
+                if t.eq_ignore_ascii_case("d") {
+                    count
+                } else {
+                    -count
+                },
+                false,
+                tx,
+            );
+            return true;
+        }
+    }
+    false
+}
 fn field_key(app: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
+    if half_page_key(app, ev, tx) {
+        return true;
+    }
     match &ev.key {
         Key::Escape => {
             session_mut(app).query_focused = false;
@@ -873,6 +906,9 @@ fn field_key(app: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
     }
 }
 pub fn on_key(app: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
+    if half_page_key(app, ev, tx) {
+        return true;
+    }
     match &ev.key {
         Key::Command('[') if app.section == Section::Folders => {
             travel(app, -1, tx);
@@ -983,6 +1019,25 @@ pub fn on_key(app: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
             } else {
                 s.query_focused = true;
                 tx.focus(query_key(app), false);
+            }
+            true
+        }
+        Key::Text(t) if t == "/" || t == "i" => {
+            session_mut(app).query_focused = true;
+            tx.focus(query_key(app), false);
+            true
+        }
+        Key::Text(t) if t == "G" => {
+            move_selection(app, isize::MAX, false, tx);
+            true
+        }
+        Key::Text(t) if t == "g" => {
+            let clock = app.clock;
+            if session(app).g_at.is_some_and(|at| clock - at <= 0.7) {
+                session_mut(app).g_at = None;
+                move_selection(app, isize::MIN, false, tx);
+            } else {
+                session_mut(app).g_at = Some(clock);
             }
             true
         }

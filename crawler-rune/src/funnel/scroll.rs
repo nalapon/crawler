@@ -22,6 +22,9 @@ impl Default for Chrome {
     }
 }
 impl Chrome {
+    pub fn half_page(&self, row_height: f32) -> isize {
+        ((self.position.get().viewport[1] / row_height / 2.0) as isize).max(1)
+    }
     pub fn hide_keyboard(&self) {
         self.mouse.set(false);
         self.opacity.snap(0.0);
