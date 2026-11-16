@@ -288,10 +288,13 @@ fn read_directory(path: &Path) -> Result<Vec<Item>, String> {
             modified: None,
             created: None,
             symlink: false,
+            hidden: false,
             highlights: Vec::new(),
             path_highlights: Vec::new(),
         });
-        rows.push(row);
+        if !row.hidden {
+            rows.push(row);
+        }
     }
     rows.sort_by(|a, b| {
         (b.kind == DocumentKind::Folder)
@@ -330,7 +333,9 @@ pub fn bounded_context(path: &Path) -> Result<Vec<Item>, String> {
             continue;
         }
         if let Ok(item) = Item::read(&entry.path()) {
-            result.push(item);
+            if !item.hidden {
+                result.push(item);
+            }
         }
         if result.len() == 80 {
             break;

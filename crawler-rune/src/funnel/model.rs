@@ -127,6 +127,7 @@ pub struct Item {
     pub modified: Option<SystemTime>,
     pub created: Option<SystemTime>,
     pub symlink: bool,
+    pub hidden: bool,
     pub highlights: Vec<std::ops::Range<usize>>,
     pub path_highlights: Vec<std::ops::Range<usize>>,
 }
@@ -153,6 +154,7 @@ impl Item {
             modified: meta.as_ref().and_then(|m| m.modified().ok()),
             created: meta.as_ref().and_then(|m| m.created().ok()),
             symlink,
+            hidden: crate::opening::platform::is_hidden(&path),
             highlights: Vec::new(),
             path_highlights: Vec::new(),
         })
@@ -166,6 +168,7 @@ impl Item {
             modified: None,
             created: None,
             symlink: false,
+            hidden: false,
             highlights: hit.name_highlights.clone(),
             path_highlights: hit.dir_highlights.clone(),
         }

@@ -200,3 +200,20 @@ pub fn is_package(path: &Path) -> bool {
         })
     })
 }
+
+pub fn is_hidden(path: &Path) -> bool {
+    autoreleasepool(|_| unsafe {
+        let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+        let mut value = None;
+        if url
+            .getResourceValue_forKey_error(&mut value, objc2_foundation::NSURLIsHiddenKey)
+            .is_err()
+        {
+            return false;
+        }
+        value.is_some_and(|v| {
+            let b: bool = msg_send![&*v, boolValue];
+            b
+        })
+    })
+}
