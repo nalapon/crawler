@@ -16,7 +16,7 @@ pub struct Editor {
     pub path: PathBuf,
 }
 pub(crate) struct OpenResult {
-    path: PathBuf,
+    path: Option<PathBuf>,
     outcome: Result<(), String>,
 }
 struct Pending {
@@ -132,9 +132,14 @@ pub fn poll(app: &mut App, tx: &mut Tx) -> bool {
     }
     while let Ok(result) = app.opening.rx.try_recv() {
         match result.outcome {
-            Ok(()) => record_recent(app, &result.path),
+            Ok(()) => {
+                if let Some(path) = result.path {
+                    record_recent(app, &path);
+                    changed = true;
+                }
+            }
             Err(e) => {
-                app.toast(format!("Could not open {}: {e}", result.path.display()));
+                app.toast(format!("Could not open: {e}"));
                 refresh_editors(app);
                 changed = true;
             }
@@ -433,4 +438,24 @@ fn read_editor(path: PathBuf) -> Option<Editor> {
 
 pub fn eject_volume(app: &mut App, path: PathBuf) {
     app.opening.ejection.request(path, |p| platform::eject(&p));
+}
+
+/// Explicit application choices still record only successful file opens.
+pub fn open_with_application(app: &mut App, path: &Path, application: &Path, record: bool) {
+    platform::open_application(
+        path,
+        application,
+        record,
+        app.opening.tx.clone(),
+        app.opening.waker.clone(),
+    );
+}
+pub fn open_terminal(app: &mut App, folder: &Path) {
+    match platform::terminal_application() {
+        Some(application) => open_with_application(app, folder, &application, false),
+        None => app.toast("Terminal is unavailable."),
+    }
+}
+pub fn reveal(paths: &[PathBuf]) {
+    platform::reveal(paths);
 }

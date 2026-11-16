@@ -57,6 +57,20 @@ pub fn section_bar(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) 
 /// A section or place button drawn in the current theme: a tinted block in modern themes, an
 /// inverted block in System 7 and raised or pressed bevels in Windows Retro and Linux Retro.
 pub fn shell_button(p: &Paint, key: &str, label: &str, active: bool) -> El {
+    shell_button_with_icon(p, key, label, active, None)
+}
+
+pub fn place_button(p: &Paint, key: &str, label: &str, active: bool, kind: PlaceKind) -> El {
+    shell_button_with_icon(p, key, label, active, Some(kind))
+}
+
+fn shell_button_with_icon(
+    p: &Paint,
+    key: &str,
+    label: &str,
+    active: bool,
+    place: Option<PlaceKind>,
+) -> El {
     let l = &p.look;
     let base = el()
         .key(key.to_string())
@@ -79,6 +93,9 @@ pub fn shell_button(p: &Paint, key: &str, label: &str, active: bool) -> El {
         Era::Classic | Era::Terminal => base,
     };
     let mut content = row().gap(5.0).items_center();
+    if let Some(kind) = place {
+        content = content.child(place_icon(kind, ink));
+    }
     if let Some(section) = Section::ALL.into_iter().find(|s| s.key() == key) {
         content = content.child(section_icon(section, ink));
     }
@@ -263,8 +280,7 @@ pub enum PlaceKind {
 }
 
 /// Theme-coloured vector icons for the funnel's places bar.
-pub fn place_icon(kind: PlaceKind, p: &Paint) -> El {
-    let c = p.look.text;
+pub fn place_icon(kind: PlaceKind, c: rune::Color) -> El {
     let shape = match kind {
         PlaceKind::Home => rune::Shape::new()
             .stroke(vec![[1.0, 7.0], [7.0, 2.0], [13.0, 7.0]], 1.2, c)

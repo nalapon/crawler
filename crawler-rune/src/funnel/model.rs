@@ -104,18 +104,6 @@ impl DocumentKind {
             Self::Package => "Application or package",
         }
     }
-    pub fn icon(self) -> &'static str {
-        match self {
-            Self::Folder => "folder",
-            Self::Pdf | Self::Word => "document",
-            Self::Markdown | Self::Text => "code",
-            Self::Image => "image",
-            Self::Video => "play",
-            Self::Audio => "audio",
-            Self::Package => "package",
-            Self::Other => "file",
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

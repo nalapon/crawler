@@ -7,6 +7,7 @@ use crate::app::{App, Paint, Section};
 use crate::args::Launch;
 use crate::index::{Query, Response, Scope};
 use crate::opening::platform::{self, Volume};
+use crate::shell::PlaceKind;
 use library::{Library, Listing};
 use model::{DocumentKind, FolderID, Item, ItemID, Sort, SortField, name, standardized};
 use rune::prefs::Prefs;
@@ -413,9 +414,14 @@ pub fn current_folder(app: &App) -> Option<PathBuf> {
     Some(session(app).folder.0.clone())
 }
 pub fn pin_current(app: &mut App) {
-    let folder = session(app).folder.clone();
+    pin_folder(app, session(app).folder.0.clone());
+}
+pub fn pin_folder(app: &mut App, path: PathBuf) {
+    let folder = FolderID::new(&path);
     app.funnel.pinned = Some(folder.clone());
-    let _ = app.prefs.set("pinnedFolder", &folder.0);
+    if let Err(error) = app.prefs.set("pinnedFolder", &folder.0) {
+        app.toast(error.to_string());
+    }
 }
 pub fn pinned_folder(app: &App) -> Option<PathBuf> {
     app.funnel.pinned.as_ref().map(|f| f.0.clone())
@@ -443,9 +449,10 @@ fn consume_local(app: &mut App) {
 fn query_changed(app: &mut App, _tx: &mut Tx) {
     session_mut(app).query_focused = true;
     let was_local = session(app).local;
+    let entered_prefix = session(app).query.text.starts_with('$');
     consume_local(app);
     if session(app).query.text.trim().is_empty() {
-        if was_local {
+        if was_local && !entered_prefix {
             session_mut(app).local = false;
         }
         let s = session_mut(app);
@@ -1738,10 +1745,10 @@ fn context_pane(app: &App, p: &Paint) -> El {
         file_list(app, p, List::Context)
     })
 }
-fn place(app: &App, p: &Paint, key: &str, label: &str, path: PathBuf) -> El {
+fn place(app: &App, p: &Paint, key: &str, label: &str, path: PathBuf, kind: PlaceKind) -> El {
     let dest = path.clone();
     let active = session(app).folder.0 == path;
-    crate::shell::shell_button(p, key, label, active)
+    crate::shell::place_button(p, key, label, active, kind)
         .on_press_tx(move |a: &mut App, tx| open_folder(a, path.clone(), tx))
         .on_drop_files(move |a: &mut App, files, tx| {
             crate::transfers::start_copy(a, files.to_vec(), dest.clone(), tx)
@@ -1808,13 +1815,21 @@ fn places(app: &App, p: &Paint) -> El {
         );
     let home = crate::app::home();
     bar = bar
-        .child(place(app, p, "place-home", "Home", home.clone()))
+        .child(place(
+            app,
+            p,
+            "place-home",
+            "Home",
+            home.clone(),
+            PlaceKind::Home,
+        ))
         .child(place(
             app,
             p,
             "place-downloads",
             "Downloads",
             home.join("Downloads"),
+            PlaceKind::Downloads,
         ))
         .child(place(
             app,
@@ -1822,9 +1837,17 @@ fn places(app: &App, p: &Paint) -> El {
             "place-desktop",
             "Desktop",
             home.join("Desktop"),
+            PlaceKind::Desktop,
         ));
     if let Some(pin) = &app.funnel.pinned {
-        bar = bar.child(place(app, p, "place-pinned", &name(&pin.0), pin.0.clone()));
+        bar = bar.child(place(
+            app,
+            p,
+            "place-pinned",
+            &name(&pin.0),
+            pin.0.clone(),
+            PlaceKind::Folder,
+        ));
     }
     for volume in &app.funnel.mounted {
         bar = bar.child(place(
@@ -1833,6 +1856,7 @@ fn places(app: &App, p: &Paint) -> El {
             &format!("volume-{}", volume.path.display()),
             &volume.name,
             volume.path.clone(),
+            PlaceKind::Drive,
         ));
         if volume.ejectable {
             let path = volume.path.clone();
@@ -1855,7 +1879,7 @@ fn places(app: &App, p: &Paint) -> El {
                 }),
         )
         .child(
-            crate::shell::shell_button(p, "folder-pin", "Pin", false)
+            crate::shell::place_button(p, "folder-pin", "Pin", false, PlaceKind::Pin)
                 .help("Pin current folder")
                 .on_press(pin_current),
         )
@@ -1873,9 +1897,7 @@ pub fn choose_pinned_folder(app: &mut App, tx: &mut Tx) {
     };
     tx.open_folder(options, |a: &mut App, result, _| match result {
         Ok(Some(path)) => {
-            let folder = FolderID::new(&path);
-            a.funnel.pinned = Some(folder.clone());
-            let _ = a.prefs.set("pinnedFolder", &folder.0);
+            pin_folder(a, path);
         }
         Ok(None) => {}
         Err(error) => a.toast(error.to_string()),

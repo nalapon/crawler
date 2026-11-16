@@ -10,10 +10,7 @@ use rune::{
     Cx, El, FileDialogOptions, Key, KeyEvent, Latest, TextEdit, Tx, Waker, col, el, row, text,
 };
 use rune_kit::{Dialog, Select, SelectAppearance, TextInput};
-use std::{
-    path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver, Sender},
-};
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Page {
@@ -37,8 +34,9 @@ enum Action {
     Theme(Theme),
     Editor(PathBuf),
     Terminal,
-    ChooseFolder(bool),
+    ChooseFolder,
     Pin,
+    ChoosePin,
     Refresh,
     Help,
 }
@@ -59,14 +57,11 @@ pub struct State {
     folder: Option<PathBuf>,
     context: platform::Context,
     request: Latest<platform::Context>,
-    send: Sender<Result<(), String>>,
-    receive: Receiver<Result<(), String>>,
     font_theme: Option<Theme>,
     editor_open: bool,
 }
 impl Default for State {
     fn default() -> Self {
-        let (send, receive) = mpsc::channel();
         Self {
             open: false,
             page: Page::Commands,
@@ -76,8 +71,6 @@ impl Default for State {
             folder: None,
             context: platform::Context::default(),
             request: Latest::default(),
-            send,
-            receive,
             font_theme: None,
             editor_open: false,
         }
@@ -104,12 +97,6 @@ pub fn poll(app: &mut App, tx: &mut Tx) -> bool {
     if let Some(context) = app.settings.request.take() {
         app.settings.context = context;
         changed = app.settings.open;
-    }
-    while let Ok(result) = app.settings.receive.try_recv() {
-        if let Err(e) = result {
-            app.toast(format!("Could not open: {e}"));
-            changed = true;
-        }
     }
     changed
 }
@@ -155,10 +142,10 @@ fn commands(app: &App) -> Vec<Command> {
             }
         }
         Page::Drives => {
-            for path in &s.context.drives {
+            for (path, name, _) in funnel::connected_volumes(app) {
                 add(
                     path.display().to_string(),
-                    basename(path),
+                    name,
                     path.display().to_string(),
                     "volume disk",
                     Action::Folder(path.clone()),
@@ -220,7 +207,7 @@ fn commands(app: &App) -> Vec<Command> {
                     Action::Folder(path),
                 );
             }
-            if let Some(pin) = app.prefs.get::<PathBuf>("pinnedFolder") {
+            if let Some(pin) = funnel::pinned_folder(app) {
                 add(
                     "pinned".into(),
                     format!("Go to pinned folder: {}", basename(&pin)),
@@ -241,7 +228,7 @@ fn commands(app: &App) -> Vec<Command> {
                 "Go to folder…".into(),
                 "⌘L".into(),
                 "go location path",
-                Action::ChooseFolder(false),
+                Action::ChooseFolder,
             );
             if let Some(file) = s.files.first() {
                 let name = basename(file);
@@ -349,7 +336,7 @@ fn commands(app: &App) -> Vec<Command> {
                 "Change pinned folder…".into(),
                 String::new(),
                 "favorite",
-                Action::ChooseFolder(true),
+                Action::ChoosePin,
             );
             add(
                 "theme".into(),
@@ -461,7 +448,7 @@ fn activate(app: &mut App, tx: &mut Tx) {
                 app.toast("Path copied.");
             }
         }
-        Action::Reveal => platform::reveal(&files),
+        Action::Reveal => opening::reveal(&files),
         Action::AirDrop => transfers::airdrop(app, files, tx),
         Action::Theme(theme) => {
             tx.color_motion(rune::tok::motion::CALM);
@@ -473,54 +460,30 @@ fn activate(app: &mut App, tx: &mut Tx) {
             } else {
                 files.first().cloned()
             } {
-                platform::open(
-                    &path,
-                    Some(&editor),
-                    false,
-                    app.settings.send.clone(),
-                    app.waker.clone(),
-                );
+                opening::open_with_application(app, &path, &editor, !folder_editor);
             }
         }
         Action::Terminal => {
             if let Some(folder) = folder {
-                platform::open(
-                    &folder,
-                    None,
-                    true,
-                    app.settings.send.clone(),
-                    app.waker.clone(),
-                );
+                opening::open_terminal(app, &folder);
             }
         }
-        Action::ChooseFolder(pin) => tx.open_folder(
+        Action::ChooseFolder => tx.open_folder(
             FileDialogOptions {
-                title: if pin {
-                    "Choose pinned folder".into()
-                } else {
-                    "Go to folder".into()
-                },
+                title: "Go to folder".into(),
                 directory: folder,
                 ..Default::default()
             },
-            move |a: &mut App, result, tx| match result {
-                Ok(Some(path)) => {
-                    if pin {
-                        if let Err(e) = a.prefs.set("pinnedFolder", &path) {
-                            a.toast(format!("Could not save pinned folder: {e}"));
-                        }
-                    }
-                    funnel::open_folder(a, path, tx);
-                }
+            |a: &mut App, result, tx| match result {
+                Ok(Some(path)) => funnel::open_folder(a, path, tx),
                 Ok(None) => {}
-                Err(e) => a.toast(e.to_string()),
+                Err(error) => a.toast(error.to_string()),
             },
         ),
+        Action::ChoosePin => funnel::choose_pinned_folder(app, tx),
         Action::Pin => {
             if let Some(folder) = folder {
-                if let Err(e) = app.prefs.set("pinnedFolder", &folder) {
-                    app.toast(format!("Could not save pinned folder: {e}"));
-                }
+                funnel::pin_folder(app, folder);
             }
         }
         Action::Refresh => {
@@ -702,12 +665,7 @@ pub fn overlays(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) {
         }
         if choices.is_empty() {
             let empty = match app.settings.page {
-                Page::Drives if app.settings.context.drives.is_empty() => app
-                    .settings
-                    .context
-                    .error
-                    .as_deref()
-                    .unwrap_or("No connected drives"),
+                Page::Drives if funnel::connected_volumes(app).is_empty() => "No connected drives",
                 Page::FolderEditors if app.opening.editors.is_empty() => {
                     "No installed editors support opening this folder."
                 }
@@ -1016,4 +974,8 @@ pub fn view(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) -> El {
                 })
                 .child(content),
         )
+}
+
+pub fn palette_visible(app: &App) -> bool {
+    app.settings.open
 }

@@ -33,6 +33,24 @@ pub fn open(
     result: Sender<OpenResult>,
     waker: Option<Waker>,
 ) {
+    open_url(path, editor.map(|e| e.path.as_path()), true, result, waker);
+}
+pub fn open_application(
+    path: &Path,
+    application: &Path,
+    record: bool,
+    result: Sender<OpenResult>,
+    waker: Option<Waker>,
+) {
+    open_url(path, Some(application), record, result, waker);
+}
+fn open_url(
+    path: &Path,
+    application: Option<&Path>,
+    record: bool,
+    result: Sender<OpenResult>,
+    waker: Option<Waker>,
+) {
     unsafe {
         let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
         let path = path.to_owned();
@@ -44,7 +62,7 @@ pub fn open(
                     Ok(())
                 };
                 let _ = result.send(OpenResult {
-                    path: path.clone(),
+                    path: record.then(|| path.clone()),
                     outcome,
                 });
                 if let Some(w) = &waker {
@@ -54,9 +72,9 @@ pub fn open(
         );
         let workspace = NSWorkspace::sharedWorkspace();
         let config = NSWorkspaceOpenConfiguration::new();
-        if let Some(editor) = editor {
+        if let Some(application) = application {
             let application =
-                NSURL::fileURLWithPath(&NSString::from_str(&editor.path.to_string_lossy()));
+                NSURL::fileURLWithPath(&NSString::from_str(&application.to_string_lossy()));
             workspace.openURLs_withApplicationAtURL_configuration_completionHandler(
                 &NSArray::from_slice(&[&*url]),
                 &application,
@@ -132,7 +150,9 @@ pub fn eject(path: &Path) -> Result<(), String> {
 
 pub struct WorkspaceObserver {
     center: objc2::rc::Retained<objc2_foundation::NSNotificationCenter>,
-    tokens: Vec<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_foundation::NSObjectProtocol>>>,
+    tokens: Vec<
+        objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_foundation::NSObjectProtocol>>,
+    >,
 }
 impl Drop for WorkspaceObserver {
     fn drop(&mut self) {
@@ -248,4 +268,19 @@ pub fn observe_activation(tx: Sender<()>, waker: Waker) -> WorkspaceObserver {
             tokens: vec![token],
         }
     }
+}
+
+pub fn terminal_application() -> Option<PathBuf> {
+    NSWorkspace::sharedWorkspace()
+        .URLForApplicationWithBundleIdentifier(&NSString::from_str("com.apple.Terminal"))
+        .and_then(|url| url.path())
+        .map(|p| PathBuf::from(p.to_string()))
+}
+pub fn reveal(paths: &[PathBuf]) {
+    let urls: Vec<_> = paths
+        .iter()
+        .map(|p| NSURL::fileURLWithPath(&NSString::from_str(&p.to_string_lossy())))
+        .collect();
+    NSWorkspace::sharedWorkspace()
+        .activateFileViewerSelectingURLs(&NSArray::from_retained_slice(&urls));
 }
