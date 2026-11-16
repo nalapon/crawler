@@ -1,0 +1,74 @@
+[package]
+name = "fff-search"
+version = "0.11.0"
+edition = "2024"
+license = "MIT"
+authors = ["Dmitriy Kovalenko <dmtr.kovalenko@outlook.com>"]
+description = "Faboulous & Fast File Finder - a fast and extremely correct file finder SDK with typo resistance, SIMD, prefiltering, and more"
+
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[features]
+# `ripgrep` is the pure-Rust walker/glob backend and is on by default so
+# consumers build without a Zig toolchain. CI/release opt into zlob via
+# `--no-default-features --features zlob`.
+default = ["ripgrep"]
+# Enable C FFI exports
+ffi = []
+# Count full rescans and their causes. Always on in debug builds; enable this
+# to keep the accounting in a release build (used by the rescan_probe binary).
+rescan-stats = []
+# Enables POC definition classification for grep result matched lines
+definitions = []
+# Pure-Rust filesystem walker + glob matcher (ignore + globset crates).
+ripgrep = ["dep:ignore", "dep:globset", "fff-query-parser/ripgrep"]
+# Call mi_collect(true) after large allocator churn (bigram build).
+# Requires mimalloc to be the global allocator (linked by fff-nvim).
+mimalloc-collect = ["dep:libmimalloc-sys"]
+# Use zlob (Zig-compiled C globbing library) for glob matching.
+# Requires Zig to be installed. When disabled, falls back to globset (pure Rust).
+zlob = ["dep:zlob", "fff-query-parser/zlob"]
+
+[dependencies]
+ahash = "0.8"
+rayon = "1.8.0"
+smallvec = { version = "1.13", features = ["const_generics", "union"] }
+thiserror = "2.0.10"
+tracing = "0.1"
+fff-query-parser = { git = "https://github.com/dmtrKovalenko/fff", rev = "c188e7a8f90e4ee4aabe18f93d5869dfb4289f12" }
+blake3 = "1.8.2"
+dirs = "5.0"
+libc = "0.2"
+git2 = { version = "0.21.0", default-features = false, features = ["vendored-libgit2"] }
+glidesort = "0.1"
+globset = { version = "0.4", optional = true }
+fff-grep = { git = "https://github.com/dmtrKovalenko/fff", rev = "c188e7a8f90e4ee4aabe18f93d5869dfb4289f12" }
+aho-corasick = "1"
+memchr = "2"
+heed = "0.22.0"
+ignore = { version = "0.4.22", optional = true }
+memmap2 = "0.9"
+neo_frizbee = { version = "0.13.3", features = ["match_end_col"] }
+notify = { version = "=9.0.0-rc.4" }
+notify-debouncer-full = { package = "fff-notify-debouncer-full", version = "0.9.4" }
+parking_lot = "0.12"
+pathdiff = "0.2.1"
+regex = "1.11"
+regex-syntax = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zlob = { version = "=1.6.5" , optional = true }
+libmimalloc-sys = { version = "0.1", optional = true, features = ["extended", "local_dynamic_tls"] }
+mimalloc = { version = "0.1", optional = true, features = ["local_dynamic_tls"] }
+# Platform-specific: dunce for Windows to avoid \\?\ extended path prefix
+[target.'cfg(windows)'.dependencies]
+dunce = "1.0"
+
+# signal-hook only compiles on unix; we wrap the SIGSEGV handler behind cfg(unix)
+[target.'cfg(unix)'.dependencies]
+signal-hook-registry = "1.4"
+

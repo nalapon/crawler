@@ -9,12 +9,27 @@ rune = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c9f77b1a0051d8e
 rune-kit = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+fff-search = { git = "https://github.com/dmtrKovalenko/fff", rev = "c188e7a8f90e4ee4aabe18f93d5869dfb4289f12" }
+fff-query-parser = { git = "https://github.com/dmtrKovalenko/fff", rev = "c188e7a8f90e4ee4aabe18f93d5869dfb4289f12" }
+memmap2 = "0.9"
+unicode-normalization = "0.1"
+unicode-segmentation = "1"
+rayon = "1"
+libc = "0.2"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSURL", "NSString"] }
+objc2-core-services = { version = "0.3", features = ["FSEvents"] }
+objc2-core-foundation = { version = "0.3", features = ["CFArray", "CFString", "CFRunLoop"] }
 
 # Rune patches these crates; an app that builds Rune must patch them too.
 [patch.crates-io]
 wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90" }
 winit = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90" }
 parley_engine = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90" }
+
+# Pinned source copy exposes the snapshot API hidden by upstream's public SDK.
+[patch."https://github.com/dmtrKovalenko/fff"]
+fff-search = { path = "src/index/fff-core" }
 
 [profile.release]
 lto = "thin"
