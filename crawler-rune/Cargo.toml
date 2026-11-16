@@ -3,6 +3,7 @@ name = "crawler"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+build = "src/index/build.rs"
 
 [dependencies]
 rune = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90", features = ["tooling", "native-file-dialog"] }
@@ -15,11 +16,16 @@ roxmltree = "0.21"
 pulldown-cmark = { version = "0.13", default-features = false }
 mach2 = "0.6"
 unicode-normalization = "0.1"
+unicode-segmentation = "1"
 plist = "1"
 tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
 security-framework = "3.7"
 core-foundation = "0.10"
+fff-search = { git = "https://github.com/dmtrKovalenko/fff", rev = "c188e7a8f90e4ee4aabe18f93d5869dfb4289f12" }
+fff-query-parser = { git = "https://github.com/dmtrKovalenko/fff", rev = "c188e7a8f90e4ee4aabe18f93d5869dfb4289f12" }
+memmap2 = "0.9"
+rayon = "1"
 objc2 = "0.6.3"
 block2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSArray", "NSURL", "NSString", "NSError", "NSGeometry"] }
@@ -28,14 +34,22 @@ objc2-pdf-kit = "0.3.2"
 objc2-uniform-type-identifiers = "0.3"
 objc2-quick-look-thumbnailing = "0.3"
 objc2-core-graphics = "0.3"
-objc2-core-foundation = "0.3"
+objc2-core-foundation = { version = "0.3", features = ["CFArray", "CFString", "CFRunLoop"] }
+objc2-core-services = { version = "0.3", features = ["FSEvents"] }
 objc2-image-io = "0.3"
+
+[build-dependencies]
+cc = "1"
 
 # Rune patches these crates; an app that builds Rune must patch them too.
 [patch.crates-io]
 wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90" }
 winit = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90" }
 parley_engine = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90" }
+
+# Pinned source copy exposes the snapshot API hidden by upstream's public SDK.
+[patch."https://github.com/dmtrKovalenko/fff"]
+fff-search = { path = "src/index/fff-core" }
 
 [profile.release]
 lto = "thin"

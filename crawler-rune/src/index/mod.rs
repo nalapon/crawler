@@ -62,50 +62,179 @@ pub struct Response {
 pub enum Status {
     #[default]
     Idle,
-    Loading { indexed: usize },
-    Ready { indexed: usize },
+    Loading {
+        indexed: usize,
+    },
+    Ready {
+        indexed: usize,
+    },
     Failed(String),
 }
 
+mod cache;
+mod discovery;
+mod matching;
+mod performance;
+mod snapshot;
+mod watcher;
+mod worker;
+
+use std::{
+    path::Path,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
+    time::Instant,
+};
+
+struct Shared {
+    response: Option<Response>,
+    status: Status,
+    report: serde_json::Value,
+    waker: Option<Waker>,
+}
 pub struct Engine {
     next_id: u64,
+    interval: performance::Interval,
     waker: Option<Waker>,
-    #[allow(dead_code)]
-    workers: Option<usize>,
+    commands: mpsc::Sender<worker::Message>,
+    shared: Arc<Mutex<Shared>>,
+    generation: Arc<AtomicU64>,
 }
-
 impl Engine {
     pub fn new(workers: Option<usize>) -> Engine {
-        Engine { next_id: 0, waker: None, workers }
+        Self::with_root(workers, PathBuf::from("/"), cache::support_dir())
     }
 
+    /// Isolated roots and caches for headless diagnostics. The app uses `new`, rooted at `/`.
+    pub fn with_root(workers: Option<usize>, root: PathBuf, support: PathBuf) -> Engine {
+        let workers = workers
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map_or(1, |n| n.get())
+                    .min(12)
+            })
+            .max(1);
+        let shared = Arc::new(Mutex::new(Shared {
+            response: None,
+            status: Status::Idle,
+            report: serde_json::json!({"workers": workers}),
+            waker: None,
+        }));
+        let generation = Arc::new(AtomicU64::new(0));
+        let (commands, receive) = mpsc::channel();
+        let state = Arc::clone(&shared);
+        let token = Arc::clone(&generation);
+        let sender = commands.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("crawler-index".into())
+            .spawn(move || worker::run(workers, root, support, sender, receive, state, token))
+        {
+            if let Ok(mut state) = shared.lock() {
+                state.status = Status::Failed(error.to_string());
+            }
+        }
+        Engine {
+            next_id: 0,
+            interval: performance::Interval::default(),
+            waker: None,
+            commands,
+            shared,
+            generation,
+        }
+    }
     pub fn set_waker(&mut self, waker: Waker) {
-        self.waker = Some(waker);
+        self.waker = Some(waker.clone());
+        if let Ok(mut state) = self.shared.lock() {
+            state.waker = Some(waker);
+        }
     }
-
-    pub fn search(&mut self, _query: Query) -> u64 {
+    pub fn search(&mut self, mut query: Query) -> u64 {
+        let started = Instant::now();
         self.next_id += 1;
+        self.generation.store(self.next_id, Ordering::Release);
+        query.text = query.text.trim().to_owned();
+        let signpost = if query.text.is_empty() {
+            self.interval.cancel();
+            0
+        } else {
+            self.interval.begin(self.next_id)
+        };
+        let _ = self.commands.send(worker::Message::Search {
+            id: self.next_id,
+            signpost,
+            query,
+            started,
+        });
         self.next_id
     }
-
-    /// The newest response since the last call, if any.
+    /// Moves at most 100 owned hits out of a mailbox. It never waits for a worker lock.
     pub fn take(&mut self) -> Option<Response> {
-        None
+        let response = match self.shared.try_lock() {
+            Ok(mut state) => state.response.take()?,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                // A response may already be waiting behind a diagnostic/status update.
+                if let Some(waker) = &self.waker {
+                    waker();
+                }
+                return None;
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => return None,
+        };
+        (response.id == self.next_id && self.generation.load(Ordering::Acquire) == self.next_id)
+            .then_some(response)
     }
-
-    /// Records a successful open, for access-history scoring.
-    pub fn record_access(&mut self, _path: &std::path::Path) {}
-
-    pub fn idle(&mut self) {}
-
-    pub fn suspend(&mut self) {}
-
+    pub fn record_access(&mut self, path: &Path) {
+        let _ = self.commands.send(worker::Message::Access(path.to_owned()));
+    }
+    pub fn idle(&mut self) {
+        self.interval.cancel();
+        self.generation.store(0, Ordering::Release);
+        let _ = self.commands.send(worker::Message::Idle);
+    }
+    pub fn suspend(&mut self) {
+        self.interval.cancel();
+        self.generation.store(0, Ordering::Release);
+        let _ = self.commands.send(worker::Message::Suspend);
+    }
     pub fn status(&self) -> Status {
-        Status::Idle
+        self.shared
+            .lock()
+            .map(|s| s.status.clone())
+            .unwrap_or(Status::Idle)
+    }
+    pub fn report(&self) -> serde_json::Value {
+        self.shared
+            .lock()
+            .map(|s| s.report.clone())
+            .unwrap_or_default()
     }
 
-    /// Fields for the `--state-report` JSON.
-    pub fn report(&self) -> serde_json::Value {
-        serde_json::json!({})
+    /// Measures a stage against the query's dispatch time. Call the title stage from paint.
+    pub fn mark_stage(&mut self, id: u64, stage: &'static str) {
+        if let Some(elapsed) = self.interval.elapsed(id) {
+            self.trace_stage(id, stage, elapsed);
+        }
+    }
+
+    /// The funnel can attach row preparation and actual title-paint timings to the numeric trace.
+    /// A window-update notification is not a draw measurement.
+    pub fn trace_stage(&mut self, id: u64, stage: &'static str, milliseconds: f64) {
+        if stage == "first_title_draw_ms" {
+            self.interval.drawn(id);
+        }
+        let _ = self.commands.send(worker::Message::Trace {
+            id,
+            stage,
+            milliseconds,
+        });
+    }
+}
+impl Drop for Engine {
+    fn drop(&mut self) {
+        self.generation.store(0, Ordering::Release);
+        let _ = self.commands.send(worker::Message::Shutdown);
     }
 }
