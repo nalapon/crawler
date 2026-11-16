@@ -271,6 +271,7 @@ pub fn open_menu(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
         .items_center()
         .child(
             crate::shell::shell_button(p, "open-selected", "Open", false)
+                .disabled(crate::funnel::selection(app).is_empty())
                 .opacity(if crate::funnel::selection(app).is_empty() {
                     0.5
                 } else {

@@ -38,6 +38,8 @@ struct Slot {
     playing_requested: Cell<bool>,
     muted: bool,
     displayed_second: u64,
+    requested_at: Option<std::time::Instant>,
+    load_ms: Option<f64>,
 }
 impl Slot {
     fn request(&mut self, path: &Path, budget: Budget, cache: &Option<Arc<ImageCache>>) {
@@ -45,6 +47,8 @@ impl Slot {
             return;
         }
         self.cancel();
+        self.requested_at = Some(std::time::Instant::now());
+        self.load_ms = None;
         self.path = Some(path.to_owned());
         self.document = None;
         self.error = None;
@@ -78,6 +82,9 @@ impl Slot {
         let Some(result) = self.task.take() else {
             return false;
         };
+        self.load_ms = self
+            .requested_at
+            .map(|at| at.elapsed().as_secs_f64() * 1000.0);
         match result {
             Ok(document) => {
                 if document.format == Format::Video {
@@ -1067,7 +1074,11 @@ pub fn with_space_window(mut host: rune::App<App>) -> rune::App<App> {
         on_key: Some(space_key),
         ..AppSpec::new("Preview", (780.0, 660.0), App::preview_window, space_view)
     };
-    let space_host = rune::App::new(spec).on_close(space_closed);
+    let space_host = rune::App::new(spec).on_close(space_closed).menu_item(
+        rune::MenuItem::new("Quit Crawler", space_quit)
+            .id("crawler-quit")
+            .key_equivalent("cmd+q".parse().expect("valid quit shortcut")),
+    );
     let (space_app, space_window) = host.window(
         WindowSpec::from_app("space-preview", space_host).options(WindowOptions {
             visible: false,
@@ -1082,7 +1093,9 @@ pub fn with_space_window(mut host: rune::App<App>) -> rune::App<App> {
         a.preview.space_open = shared;
         a.preview.space_parent = Some(parent);
     });
+    let host_handle = main_handle.clone();
     main_handle.update(move |a, _| {
+        a.host = Some(host_handle);
         a.preview.space = Some((space_app, space_window));
         a.preview.space_open = open;
     });
@@ -1152,7 +1165,17 @@ fn space_view(app: &App, cx: &mut Cx<App>) -> El {
         message("Select a file to preview", &p)
     }
 }
+fn space_quit(app: &mut App, _tx: &mut Tx) {
+    if let Some(parent) = &app.preview.space_parent {
+        parent.open();
+        parent.update(crate::app::request_quit);
+    }
+}
 fn space_key(app: &mut App, event: &KeyEvent, tx: &mut Tx) -> bool {
+    if event.key == Key::Command('q') {
+        space_quit(app, tx);
+        return true;
+    }
     if matches!(event.key, Key::Escape | Key::Command('w'))
         || matches!(&event.key, Key::Text(t) if t == " ")
     {
@@ -1219,4 +1242,52 @@ pub fn main_closed(app: &mut App, tx: &mut Tx) {
         window.close();
     }
     crate::app::on_close(app, tx);
+}
+
+/// Readiness reflects completed background reads, not compositor presentation.
+pub fn report(app: &App) -> serde_json::Value {
+    fn state(slot: &Slot) -> &'static str {
+        if slot.error.is_some() {
+            "failed"
+        } else if slot.document.is_some() {
+            "ready"
+        } else if slot.task.is_pending() {
+            "loading"
+        } else {
+            "closed"
+        }
+    }
+    let pane = app.preview.pane.borrow();
+    let reader = &app.preview.reader;
+    let path = if app.preview.space_window {
+        app.preview.space_path.clone()
+    } else if app.reader == Reader::None
+        && matches!(app.section, Section::Search | Section::Folders)
+    {
+        crate::funnel::focused_path(app)
+    } else {
+        None
+    };
+    let preview_state = if let Some(path) = path.as_deref().filter(|p| Format::of(p) == Format::Pdf)
+    {
+        if crate::pdf::is_ready(app, path) {
+            "ready"
+        } else {
+            "loading"
+        }
+    } else if path.as_deref() == pane.path.as_deref() {
+        state(&pane)
+    } else {
+        "closed"
+    };
+    serde_json::json!({
+        "file_search_preview_state":preview_state, "file_search_preview_path":path,
+        "preview_load_ms":pane.load_ms, "preview_error":pane.error,
+        "video_seconds":pane.player.as_ref().map(|p| p.time()),
+        "markdown_reader_visible":app.reader == Reader::Markdown,
+        "markdown_reader_path":reader.path, "markdown_reader_state":state(reader),
+        "markdown_reader_load_ms":reader.load_ms, "markdown_reader_error":reader.error,
+        "markdown_reader_scale":app.preview.scale, "markdown_reader_history":app.preview.history,
+        "space_open":app.preview.space_open.load(Ordering::Relaxed)
+    })
 }

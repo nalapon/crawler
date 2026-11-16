@@ -41,12 +41,14 @@ struct Session {
     chrome: Rc<scroll::Chrome>,
     query_focused: bool,
     request: Option<u64>,
+    published_query: Option<u64>,
     usable: bool,
     complete: bool,
     pending: Option<Response>,
     last_publication: f64,
     has_nonempty: bool,
-    scope_children: Vec<PathBuf>,
+    drawn_query: Option<u64>,
+    scope_counts: Vec<(PathBuf, usize)>,
     revision: u64,
     g_at: Option<f64>,
 }
@@ -70,12 +72,14 @@ impl Session {
             chrome: Rc::new(scroll::Chrome::default()),
             query_focused,
             request: None,
+            published_query: None,
             usable: true,
             complete: false,
             pending: None,
             last_publication: 0.0,
             has_nonempty: false,
-            scope_children: Vec::new(),
+            drawn_query: None,
+            scope_counts: Vec::new(),
             revision: 0,
             g_at: None,
         }
@@ -400,6 +404,9 @@ pub fn selection(app: &App) -> Vec<PathBuf> {
         .collect()
 }
 pub fn focused_path(app: &App) -> Option<PathBuf> {
+    if !active(app) {
+        return None;
+    }
     let s = session(app);
     s.usable
         .then(|| {
@@ -411,7 +418,7 @@ pub fn focused_path(app: &App) -> Option<PathBuf> {
         .flatten()
 }
 pub fn current_folder(app: &App) -> Option<PathBuf> {
-    Some(session(app).folder.0.clone())
+    active(app).then(|| session(app).folder.0.clone())
 }
 pub fn pin_current(app: &mut App) {
     pin_folder(app, session(app).folder.0.clone());
@@ -460,7 +467,7 @@ fn query_changed(app: &mut App, _tx: &mut Tx) {
         s.pending = None;
         s.usable = true;
         s.scope = None;
-        s.scope_children.clear();
+        s.scope_counts.clear();
         s.revision += 1;
         app.index.idle();
         prepare_browsing(app);
@@ -497,6 +504,7 @@ fn submit_query(app: &mut App) {
         folder_mode: s.local,
     };
     let id = app.index.search(query);
+    app.index.mark_stage(id, "input_dispatch_ms");
     let s = session_mut(app);
     s.request = Some(id);
     s.usable = false;
@@ -505,22 +513,31 @@ fn submit_query(app: &mut App) {
     s.has_nonempty = false;
 }
 fn publish(app: &mut App, response: Response) -> bool {
+    let id = response.id;
+    let started = std::time::Instant::now();
+    app.index.mark_stage(id, "publication_ms");
     let clock = app.clock;
     let s = session_mut(app);
     let rows: Vec<_> = response.hits.iter().map(Item::from_hit).collect();
     let changed = s.rows.as_ref() != &rows || !s.usable || s.complete != response.complete;
-    let scopes = response.scope_counts.into_iter().map(|(p, _)| p).collect();
-    let changed = changed || s.scope_children != scopes;
-    s.scope_children = scopes;
+    let changed = changed || s.scope_counts != response.scope_counts;
+    s.scope_counts = response.scope_counts;
     if s.rows.as_ref() != &rows {
         s.rows = Arc::new(rows);
         s.revision += 1;
     }
     s.usable = true;
+    s.published_query = Some(id);
     s.complete = response.complete;
     s.has_nonempty |= !s.rows.is_empty();
     s.last_publication = clock;
     s.reconcile_selection();
+    app.index.mark_stage(id, "first_rows_ms");
+    app.index.trace_stage(
+        id,
+        "row_update_work_ms",
+        started.elapsed().as_secs_f64() * 1000.0,
+    );
     changed
 }
 fn prepare_browsing(app: &mut App) {
@@ -1372,7 +1389,11 @@ fn file_list(app: &App, p: &Paint, list: List) -> El {
                 )
             },
         )
-        .virtual_rows_version(version);
+        .virtual_rows_version((
+            version,
+            (list == List::Main && session(app).searching())
+                .then_some(session(app).published_query),
+        ));
     let mut viewport = col()
         .key(key)
         .w_full()
@@ -1409,6 +1430,7 @@ fn file_list(app: &App, p: &Paint, list: List) -> El {
             .role("listbox")
             .label("Files")
             .focusable(true)
+            .on_key(crate::app::on_key)
             .w_full()
             .grow(1.0)
             .min_h(0.0)
@@ -1433,7 +1455,7 @@ fn file_row(app: &App, p: &Paint, list: List, item: &Item) -> El {
     };
     let single = list == List::Main && selected && session(app).selected.len() == 1;
     let path_detail = list == List::Main && !browsing(app);
-    let title = text(&item.name)
+    let mut title = text(&item.name)
         .font(rune::tok::type_::BODY)
         .color(ink)
         .spans(
@@ -1444,6 +1466,28 @@ fn file_row(app: &App, p: &Paint, list: List, item: &Item) -> El {
         )
         .truncate()
         .w_full();
+    if list == List::Main && session(app).searching() {
+        // Rune reports drawn layout only when a node's geometry or identity changes. A new
+        // published query gets a new title identity even when its file hits are identical.
+        title = title
+            .key(format!(
+                "result-title-{}",
+                session(app).published_query.unwrap_or(0)
+            ))
+            .on_drawn_layout_tx(|a: &mut App, rect, tx| {
+                let s = session_mut(a);
+                if let Some(id) = s.request
+                    && s.drawn_query != Some(id)
+                    && s.usable
+                    && rect[2] > 0.0
+                    && rect[3] > 0.0
+                {
+                    s.drawn_query = Some(id);
+                    a.index.mark_stage(id, "first_title_draw_ms");
+                }
+                tx.live_only();
+            });
+    }
     let mut label = col().gap(1.0).min_w(0.0).grow(1.0).child(title);
     if path_detail {
         label = label.child(
@@ -1639,11 +1683,11 @@ fn scope_rail(app: &App, p: &Paint) -> El {
         .w_full()
         .growth(GrowthSpec::default())
         .virtual_rows(
-            s.scope_children.len(),
+            s.scope_counts.len(),
             30.0,
-            |a: &App, i| session(a).scope_children[i].to_string_lossy(),
+            |a: &App, i| session(a).scope_counts[i].0.to_string_lossy(),
             move |a: &App, i| {
-                let path = session(a).scope_children[i].clone();
+                let path = session(a).scope_counts[i].0.clone();
                 let p = Paint {
                     look,
                     kit: look.kit(),
@@ -1906,8 +1950,23 @@ pub fn choose_pinned_folder(app: &mut App, tx: &mut Tx) {
 
 /// Numeric and path diagnostics for the shell's optional state report.
 pub fn report(app: &App) -> serde_json::Value {
-    let s = session(app);
-    serde_json::json!({"folder":s.folder.0,"query":s.query.text,"folder_mode":s.local,"scope":s.scope.as_ref().map(|f|&f.0),"selection":selection(app),"focused":focused_path(app),"usable":s.usable,"complete":s.complete,"rows":s.rows.iter().map(|i|&i.id.0).collect::<Vec<_>>(),"history":app.funnel.history.iter().map(|f|&f.0).collect::<Vec<_>>(),"history_at":app.funnel.history_at})
+    fn session_report(s: &Session) -> serde_json::Value {
+        serde_json::json!({"folder":s.folder.0,"query":s.query.text,"folder_mode":s.local,
+            "scope":s.scope.as_ref().map(|f|&f.0), "focused":s.neighbor.as_ref().map(|i|&i.id.0).or_else(||s.focused.as_ref().map(|i|&i.0)),
+            "scope_counts":s.scope_counts,
+            "selection":s.selected.iter().map(|i|&i.0).collect::<Vec<_>>(),
+            "usable":s.usable,"complete":s.complete,"query_id":s.request,"scroll":s.scroll.get(),
+            "rows":s.rows.iter().map(|i|&i.id.0).collect::<Vec<_>>()})
+    }
+    let mut report = session_report(session(app));
+    report["search"] = session_report(&app.funnel.search);
+    report["folders"] = session_report(&app.funnel.folders);
+    report["history"] =
+        serde_json::json!(app.funnel.history.iter().map(|f| &f.0).collect::<Vec<_>>());
+    report["history_at"] = serde_json::json!(app.funnel.history_at);
+    report["pinned"] = serde_json::json!(pinned_folder(app));
+    report["path_editing"] = serde_json::json!(app.funnel.path_editing);
+    report
 }
 
 fn sort_header(app: &App, p: &Paint) -> El {

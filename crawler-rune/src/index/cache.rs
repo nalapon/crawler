@@ -138,6 +138,15 @@ fn corrupt() -> io::Error {
 }
 
 pub fn support_dir() -> PathBuf {
+    if let Some(root) = std::env::var_os("RUNE_PREFS_DIR") {
+        return PathBuf::from(root).join("studio.crawler.rune/index");
+    }
+    if let Some(root) = std::env::var_os("RUNE_DIRS_ROOT") {
+        return PathBuf::from(root).join("cache/studio.crawler.rune/index");
+    }
+    if rune::tooling::headless_run().is_some() {
+        return std::env::temp_dir().join(format!("crawler-index-{}", std::process::id()));
+    }
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)

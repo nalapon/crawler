@@ -222,7 +222,6 @@ pub fn poll(app: &mut App, tx: &mut Tx) -> bool {
         .as_ref()
         .map(|w| w.receive.try_iter().collect())
         .unwrap_or_default();
-    let had_events = !events.is_empty();
     for event in events {
         let visible = |path: &Path| {
             if app.reader == Reader::Pdf {
@@ -380,14 +379,6 @@ pub fn poll(app: &mut App, tx: &mut Tx) -> bool {
     } else if app.pdf.deferred {
         app.pdf.deferred = false;
         changed = true;
-    }
-    if let Some(destination) = &app.launch.state_report {
-        if changed || had_events {
-            app.pdf.send(Command::Report {
-                destination: destination.clone(),
-                value: report(app),
-            });
-        }
     }
     changed
 }
@@ -566,6 +557,10 @@ pub fn on_close(app: &mut App, tx: &mut Tx) {
     } else {
         app.pdf.epoch.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+pub fn request_quit(app: &mut App, tx: &mut Tx) {
+    request_close(app, CloseIntent::Quit, tx);
 }
 
 pub fn can_close(app: &mut App, tx: &mut Tx) -> bool {

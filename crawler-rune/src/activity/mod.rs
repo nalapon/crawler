@@ -1066,3 +1066,14 @@ fn activity_dialogs(app: &App, p: &Paint, layer: &mut Vec<El>) {
         Dialog::new("quit-process",format!("Quit {} (PID {})?",proc.name,proc.id.pid)).open(true).fit().description("Quit requests that the process exit. Force Quit stops it immediately and may lose unsaved work.").on_close(|a: &mut App| a.activity.quit=None).child(actions).build(&p.kit,layer);
     }
 }
+
+pub fn report(app: &App) -> serde_json::Value {
+    let s = &app.activity;
+    serde_json::json!({"active":s.active,"paused":s.paused,"filter":s.filter.text,
+        "sample_ms":s.sample.milliseconds,"unavailable":s.sample.unavailable,"error":s.sample.error,
+        "process_count":s.sample.processes.len(),"processes":s.sample.processes.iter().map(|p| {
+            serde_json::json!({"pid":p.id.pid,"started":p.id.started,"name":p.name,
+                "memory_bytes":p.memory,"cpu_percent":p.cpu,"read_bytes_per_second":p.read,
+                "written_bytes_per_second":p.written,"threads":p.threads})
+        }).collect::<Vec<_>>()})
+}

@@ -23,6 +23,8 @@ pub struct Launch {
     pub theme: Option<String>,
     /// `--state-report <path>`: write a JSON state report while running.
     pub state_report: Option<PathBuf>,
+    pub event_log: Option<PathBuf>,
+    pub launch_report: Option<PathBuf>,
     /// Positional paths, as `scripts/crawler [path]` and Finder hand them over.
     pub paths: Vec<PathBuf>,
 }
@@ -48,6 +50,8 @@ impl Launch {
                 "--search-workers" => out.search_workers = value().and_then(|v| v.parse().ok()),
                 "--crawler-theme" => out.theme = value(),
                 "--state-report" => out.state_report = value().map(PathBuf::from),
+                "--event-log" => out.event_log = value().map(PathBuf::from),
+                "--launch-report" => out.launch_report = value().map(PathBuf::from),
                 other if !other.starts_with('-') => out.paths.push(PathBuf::from(other)),
                 _ => {}
             }

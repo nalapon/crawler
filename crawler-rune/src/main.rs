@@ -4,7 +4,6 @@
 //! Crawler's own launch flags, for example:
 //! `crawler --section folders --folder /tmp --snap out.png --size 1200x760`.
 
-
 mod activity;
 mod app;
 mod args;
@@ -30,8 +29,22 @@ fn main() {
         scenes: app::SCENES,
         ..AppSpec::new("Crawler", (1180.0, 760.0), app::App::launch, app::view)
     };
-    preview::with_space_window(rune::App::new(spec)
-        .chrome(Chrome { traffic_lights: Some((14.0, 14.0)), drag_regions: true, ..Chrome::DEFAULT })
-        .on_close(preview::main_closed))
-        .run();
+    preview::with_space_window(
+        rune::App::new(spec)
+            .chrome(Chrome {
+                traffic_lights: Some((14.0, 14.0)),
+                drag_regions: true,
+                ..Chrome::DEFAULT
+            })
+            .keep_running()
+            .menu_item(
+                rune::MenuItem::new("Quit Crawler", app::request_quit)
+                    .id("crawler-quit")
+                    .key_equivalent("cmd+q".parse().expect("valid quit shortcut")),
+            )
+            .on_window(|_| app::install_quit_menu())
+            .on_quit(preview::main_closed)
+            .on_close(app::window_closed),
+    )
+    .run();
 }

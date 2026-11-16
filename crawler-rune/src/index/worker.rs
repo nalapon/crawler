@@ -437,6 +437,7 @@ impl Worker {
                 if matches!(
                     stage,
                     "first_rows_ms"
+                        | "publication_ms"
                         | "row_update_work_ms"
                         | "first_title_draw_ms"
                         | "title_draw_work_ms"
@@ -447,7 +448,16 @@ impl Worker {
                         .iter_mut()
                         .find(|s| s["sequence"].as_u64() == Some(id))
                 {
-                    sample[stage] = json!(milliseconds.max(0.0));
+                    if matches!(
+                        stage,
+                        "first_rows_ms" | "publication_ms" | "first_title_draw_ms"
+                    ) {
+                        if sample.get(stage).is_none() {
+                            sample[stage] = json!(milliseconds.max(0.0));
+                        }
+                    } else {
+                        sample[stage] = json!(milliseconds.max(0.0));
+                    }
                     self.notify(None, None);
                 }
             }

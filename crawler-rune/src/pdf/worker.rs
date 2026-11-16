@@ -57,10 +57,6 @@ pub enum Edit {
 
 pub enum Command {
     Load(PathBuf, Instant),
-    Report {
-        destination: PathBuf,
-        value: serde_json::Value,
-    },
     Retain {
         path: PathBuf,
         pages: std::ops::Range<usize>,
@@ -154,12 +150,6 @@ impl Worker {
 }
 
 fn handle(command: Command, documents: &mut HashMap<PathBuf, Document>) -> Vec<Event> {
-    if let Command::Report { destination, value } = &command {
-        if let Ok(bytes) = serde_json::to_vec_pretty(value) {
-            let _ = fs::write(destination, bytes);
-        }
-        return Vec::new();
-    }
     if let Command::Render { key, path, .. } = &command {
         let incoming = key.width as usize * key.height as usize * 4;
         let hit = documents
@@ -191,7 +181,6 @@ fn handle(command: Command, documents: &mut HashMap<PathBuf, Document>) -> Vec<E
         Command::Load(path, _) | Command::Release(path) => (path.clone(), false),
         Command::Render { path, .. } => (path.clone(), false),
         Command::Copy { path, .. } | Command::Retain { path, .. } => (path.clone(), false),
-        Command::Report { .. } => return Vec::new(),
         Command::Edit { path, .. } | Command::Save { path, .. } => (path.clone(), true),
     };
     let error_path = path.clone();
@@ -297,7 +286,7 @@ fn handle(command: Command, documents: &mut HashMap<PathBuf, Document>) -> Vec<E
                 doc.loaded.retain(|i, _| pages.contains(i));
                 Ok(Vec::new())
             }
-            Command::Report { .. } | Command::Release(_) => Ok(Vec::new()),
+            Command::Release(_) => Ok(Vec::new()),
         }
     })();
     result.unwrap_or_else(|message| {
