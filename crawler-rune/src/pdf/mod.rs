@@ -683,6 +683,11 @@ fn commit_note(app: &mut App) {
 }
 
 /// Opening policy can record a recent file once a real bitmap has arrived.
+/// The document the reader shows.
+pub fn active_path(app: &App) -> Option<PathBuf> {
+    app.pdf.active.clone()
+}
+
 pub fn is_ready(app: &App, path: &Path) -> bool {
     app.pdf.sources.borrow().iter().any(|(key, source)| {
         (key == path || source.saved_path.as_deref() == Some(path))

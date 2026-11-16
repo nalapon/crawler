@@ -4,8 +4,6 @@
 //! Crawler's own launch flags, for example:
 //! `crawler --section folders --folder /tmp --snap out.png --size 1200x760`.
 
-// Stubs fill in module by module during the port.
-#![allow(dead_code)]
 
 mod activity;
 mod app;

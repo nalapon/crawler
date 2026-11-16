@@ -90,6 +90,8 @@ pub struct App {
     pub reader: Reader,
     /// A file to open on the first poll (`--open` or a path handed to the app).
     pub pending_open: Option<PathBuf>,
+    /// The PDF whose successful display was last added to recent files.
+    pub recorded_pdf: Option<PathBuf>,
     /// The last Escape's time in a reader, for the two-press close (700 ms).
     pub reader_escape_at: Option<f64>,
     pub clock: f64,
@@ -143,6 +145,7 @@ impl App {
             theme_preview: None,
             reader: Reader::None,
             pending_open: None,
+            recorded_pdf: None,
             reader_escape_at: None,
             clock: 0.0,
             toasts: Vec::new(),
@@ -196,6 +199,8 @@ pub fn setup(app: &mut App, waker: Waker) {
     transfers::setup(app, &waker);
     opening::setup(app, &waker);
     settings::setup(app, &waker);
+    preview::set_editor_opener(app, opening::open_in_editor);
+    preview::set_reader_display_observer(app, opening::record_recent);
     if let Some(path) = app.launch.open.clone().or_else(|| app.launch.paths.first().cloned()) {
         app.pending_open = Some(path);
     }
@@ -205,13 +210,10 @@ pub fn poll(app: &mut App, clock: f64, tx: &mut Tx) -> bool {
     app.clock = clock;
     let mut changed = false;
     if let Some(path) = app.pending_open.take() {
-        if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("pdf")) {
-            if let Err(error) = pdf::open_reader(app, &path, tx) { app.toast(error); }
-        } else {
-            opening::open_path(app, &path, tx);
-        }
+        opening::open_path(app, &path, tx);
         changed = true;
     }
+    record_displayed_pdf(app);
     let before = app.toasts.len();
     app.toasts.retain(|t| t.until > clock);
     changed |= app.toasts.len() != before;
@@ -226,6 +228,23 @@ pub fn poll(app: &mut App, clock: f64, tx: &mut Tx) -> bool {
     changed |= activity::poll(app, tx);
     changed |= transfers::poll(app, tx);
     changed
+}
+
+/// Recent-file history counts a PDF once its first page has drawn, as the Swift reader does.
+fn record_displayed_pdf(app: &mut App) {
+    let shown = match app.reader {
+        Reader::Pdf => pdf::active_path(app).filter(|p| pdf::is_ready(app, p)),
+        _ => None,
+    };
+    match shown {
+        Some(path) if app.recorded_pdf.as_ref() != Some(&path) => {
+            opening::record_recent(app, &path);
+            app.recorded_pdf = Some(path);
+        }
+        Some(_) => {}
+        None if app.reader != Reader::Pdf => app.recorded_pdf = None,
+        None => {}
+    }
 }
 
 pub fn on_close(app: &mut App, tx: &mut Tx) {
