@@ -60,6 +60,17 @@ struct Running {
     progress: Arc<Progress>,
     snapshot: Snapshot,
     done: mpsc::Receiver<copy::Finished>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.progress.cancel();
+        // The worker owns the staging directory. Let its cancellation cleanup finish before
+        // the app exits, so closing during a copy cannot strand partial files.
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 struct Record {
     id: String,
@@ -318,7 +329,7 @@ fn begin_next(s: &mut State) {
     let sources = job.sources.clone();
     let destination = job.destination.clone();
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
+    let worker = std::thread::spawn(move || {
         let result = copy::run(sources, destination, &worker_progress);
         let _ = tx.send(result);
         waker();
@@ -328,6 +339,7 @@ fn begin_next(s: &mut State) {
         progress,
         snapshot: Snapshot::default(),
         done: rx,
+        worker: Some(worker),
     });
 }
 /// Copies into `dest` without replacing names. Jobs queue behind the running copy.
