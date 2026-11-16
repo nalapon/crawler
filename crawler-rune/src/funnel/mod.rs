@@ -293,6 +293,7 @@ pub fn focus_section(app: &mut App, tx: &mut Tx) {
         } else {
             prepare_browsing(app);
         }
+        tx.scroll_to_instant(list_key(app), 0.0, session(app).saved_scroll);
     }
     if session(app).query_focused {
         tx.focus(query_key(app), false);
