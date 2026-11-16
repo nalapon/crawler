@@ -25,6 +25,7 @@ use rune::{AppSpec, Chrome};
 fn main() {
     let spec = AppSpec::<app::App> {
         min_size: Some((760.0, 480.0)),
+        fonts: theme::FONTS,
         setup: Some(app::setup),
         poll: Some(app::poll),
         on_key: Some(app::on_key),

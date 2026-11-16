@@ -195,6 +195,7 @@ pub fn setup(app: &mut App, waker: Waker) {
     activity::setup(app, &waker);
     transfers::setup(app, &waker);
     opening::setup(app, &waker);
+    settings::setup(app, &waker);
     if let Some(path) = app.launch.open.clone().or_else(|| app.launch.paths.first().cloned()) {
         app.pending_open = Some(path);
     }
@@ -215,6 +216,7 @@ pub fn poll(app: &mut App, clock: f64, tx: &mut Tx) -> bool {
     }
     changed |= funnel::poll(app, tx);
     changed |= opening::poll(app, tx);
+    changed |= settings::poll(app, tx);
     changed |= preview::poll(app, tx);
     changed |= pdf::poll(app, tx);
     changed |= activity::poll(app, tx);
@@ -232,6 +234,9 @@ pub fn on_key(app: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
     if app.reader != Reader::None {
         return reader_key(app, ev, tx);
     }
+    if settings::on_key(app, ev, tx) {
+        return true;
+    }
     if let Key::Command(c) = ev.key {
         if !ev.mods.shift {
             if let Some(section) = Section::ALL.into_iter().find(|s| s.shortcut() == c) {
@@ -244,9 +249,6 @@ pub fn on_key(app: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
             funnel::show_search(app, None, tx);
             return true;
         }
-    }
-    if settings::on_key(app, ev, tx) {
-        return true;
     }
     match app.section {
         Section::Search | Section::Folders => funnel::on_key(app, ev, tx),
