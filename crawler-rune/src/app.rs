@@ -110,13 +110,23 @@ pub const PREFS_ID: &str = "studio.crawler.rune";
 
 impl App {
     pub fn launch() -> App {
-        let launch = Launch::parse();
+        let mut app = Self::new(Launch::parse());
+        funnel::launched(&mut app);
+        app
+    }
+
+    /// A secondary preview needs the shared document services, without launching a funnel.
+    pub fn preview_window() -> App {
+        Self::new(Launch::default())
+    }
+
+    fn new(launch: Launch) -> App {
         // Headless runs keep their preferences apart from the real ones.
         let prefs = if rune::tooling::headless_run().is_some() { Prefs::memory() } else { Prefs::open(PREFS_ID) };
         let saved: Theme = prefs.get("theme").unwrap_or_default();
         let theme = launch.theme.as_deref().and_then(Theme::parse).unwrap_or(saved);
         let section = launch.section.unwrap_or(if launch.folder.is_some() { Section::Folders } else { Section::Search });
-        let mut app = App {
+        App {
             index: index::Engine::new(launch.search_workers),
             funnel: funnel::State::new(&launch, &prefs),
             opening: opening::State::new(&prefs),
@@ -137,9 +147,7 @@ impl App {
             clock: 0.0,
             toasts: Vec::new(),
             show_help: false,
-        };
-        funnel::launched(&mut app);
-        app
+        }
     }
 
     pub fn look(&self) -> Look {

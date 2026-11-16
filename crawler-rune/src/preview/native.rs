@@ -125,12 +125,13 @@ fn rgba(image: &CGImage) -> Result<Bitmap, String> {
         Some(image),
     );
     drop(context);
-    for pixel in data.chunks_exact_mut(4) {
+    for pixel in data.as_chunks_mut::<4>().0 {
         let alpha = u32::from(pixel[3]);
-        if alpha > 0 {
-            for c in &mut pixel[..3] {
-                *c = ((u32::from(*c) * 255 + alpha / 2) / alpha).min(255) as u8;
-            }
+        for c in &mut pixel[..3] {
+            *c = (u32::from(*c) * 255 + alpha / 2)
+                .checked_div(alpha)
+                .unwrap_or(0)
+                .min(255) as u8;
         }
     }
     Ok(Bitmap {

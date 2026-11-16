@@ -31,8 +31,8 @@ fn main() {
         scenes: app::SCENES,
         ..AppSpec::new("Crawler", (1180.0, 760.0), app::App::launch, app::view)
     };
-    rune::App::new(spec)
+    preview::with_space_window(rune::App::new(spec)
         .chrome(Chrome { traffic_lights: Some((14.0, 14.0)), drag_regions: true, ..Chrome::DEFAULT })
-        .on_close(app::on_close)
+        .on_close(preview::main_closed))
         .run();
 }

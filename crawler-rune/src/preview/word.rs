@@ -359,5 +359,11 @@ fn escape_block(value: &str) -> String {
 }
 
 fn parse_xml(source: &str) -> Result<Document<'_>, roxmltree::Error> {
-    Document::parse_with_options(source, roxmltree::ParsingOptions { nodes_limit: 400_000, ..Default::default() })
+    Document::parse_with_options(
+        source,
+        roxmltree::ParsingOptions {
+            nodes_limit: 400_000,
+            ..Default::default()
+        },
+    )
 }

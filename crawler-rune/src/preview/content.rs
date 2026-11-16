@@ -108,7 +108,7 @@ pub struct Block {
 pub struct Document {
     pub path: PathBuf,
     pub format: Format,
-    pub bytes: u64,
+    pub bytes: Option<u64>,
     pub modified: Option<SystemTime>,
     pub blocks: Vec<Block>,
     pub truncated: bool,
@@ -150,14 +150,14 @@ pub fn load(request: Request) -> Result<Arc<Document>, String> {
         .open(&request.path)
         .map_err(|e| e.to_string())?;
     let metadata = file.metadata().map_err(|e| e.to_string())?;
-    if !metadata.is_file() {
+    let format = Format::of(&request.path);
+    if !(metadata.is_file() || metadata.is_dir() && format == Format::Thumbnail) {
         return Err("This item is not a regular file.".into());
     }
-    let format = Format::of(&request.path);
     let mut document = Document {
         path: request.path.clone(),
         format,
-        bytes: metadata.len(),
+        bytes: metadata.is_file().then_some(metadata.len()),
         modified: metadata.modified().ok(),
         blocks: Vec::new(),
         truncated: false,
@@ -234,7 +234,9 @@ fn read_text(
     let source = if data.starts_with(&[0xff, 0xfe]) || data.starts_with(&[0xfe, 0xff]) {
         let little = data.starts_with(&[0xff, 0xfe]);
         let mut words: Vec<u16> = data[2..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| {
                 if little {
                     u16::from_le_bytes([c[0], c[1]])
@@ -299,10 +301,7 @@ fn prepare_text(
     source: &str,
     cancelled: &impl Fn() -> bool,
 ) -> Result<(), String> {
-    let highlights = syntax::highlight(
-        syntax::lang_for_path(&doc.path.to_string_lossy()).as_deref(),
-        source,
-    );
+    let highlights = syntax::highlight(syntax::lang_for_path(&doc.path.to_string_lossy()), source);
     let mut offset = 0;
     let mut token_start = 0;
     for line in source.split('\n') {
@@ -418,9 +417,20 @@ fn prepare_markdown(doc: &mut Document, source: &str, request: &Request) -> Resu
                 if *tag == TagEnd::CodeBlock
                     && let Some(language) = code_language.take()
                 {
+                    let code = code_text.trim_end_matches(['\n', '\r']);
+                    // Rune gives a custom highlighter only its line-aligned 128 KB prefix.
+                    let end = if code.len() > 128 * 1024 {
+                        code.as_bytes()[..128 * 1024]
+                            .iter()
+                            .rposition(|b| *b == b'\n')
+                            .unwrap_or(0)
+                    } else {
+                        code.len()
+                    };
+                    let code = code[..end].trim_end_matches(['\n', '\r']);
                     fenced.insert(
-                        code_text.trim_end_matches(['\n', '\r']).to_owned(),
-                        syntax::highlight(Some(&language), code_text.trim_end_matches(['\n', '\r'])).to_vec(),
+                        code.to_owned(),
+                        syntax::highlight(Some(&language), code).to_vec(),
                     );
                 }
                 depth = depth.saturating_sub(1);
@@ -497,9 +507,13 @@ pub fn local_path(base: &Path, destination: &str) -> Option<PathBuf> {
         return None;
     }
     let destination = if let Some(file) = destination.strip_prefix("file://") {
-        if !file.starts_with('/') { return None; }
+        if !file.starts_with('/') {
+            return None;
+        }
         file
-    } else { destination };
+    } else {
+        destination
+    };
     if destination.contains(':') {
         return None;
     }
