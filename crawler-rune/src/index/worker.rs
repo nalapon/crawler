@@ -3,6 +3,7 @@ use super::{
     cache::{self, Event, History, Reader, Visit},
     discovery::{self, Paths, Progress},
     matching::{self, Matches},
+    performance,
     snapshot::{self, Snapshot},
     watcher::{self, Events, Watcher},
 };
@@ -23,6 +24,7 @@ use std::{
 pub(super) enum Message {
     Search {
         id: u64,
+        signpost: u64,
         query: Query,
         started: Instant,
     },
@@ -82,6 +84,7 @@ struct Key {
 }
 struct Active {
     id: u64,
+    signpost: u64,
     key: Key,
     started: Instant,
     first_result: bool,
@@ -93,6 +96,9 @@ struct Supplement {
     cancel: Arc<AtomicBool>,
     job: u64,
     _watch: Watcher,
+    pending: HashSet<String>,
+    pending_full: bool,
+    failure: Option<String>,
 }
 struct ScanJob {
     id: u64,
@@ -120,6 +126,7 @@ struct Worker {
     batches: Vec<Arc<Snapshot>>,
     unique: Option<Paths>,
     complete: bool,
+    failure: Option<String>,
     cache_loaded: bool,
     loading: bool,
     cache_cancel: Arc<AtomicBool>,
@@ -187,6 +194,7 @@ pub(super) fn run(
         batches: Vec::new(),
         unique: None,
         complete: false,
+        failure: None,
         cache_loaded: false,
         loading: false,
         cache_cancel: Arc::new(AtomicBool::new(false)),
@@ -244,8 +252,19 @@ impl Worker {
     }
     fn notify(&mut self, status: Option<Status>, response: Option<Response>) {
         self.report["indexed_paths"] = json!(self.batches.iter().map(|b| b.len()).sum::<usize>());
+        let supplement_bytes = self
+            .supplement
+            .as_ref()
+            .map_or(0, |s| s.batches.iter().map(|b| b.bytes()).sum::<usize>());
         self.report["resident_bytes"] =
-            json!(self.batches.iter().map(|b| b.bytes()).sum::<usize>());
+            json!(self.batches.iter().map(|b| b.bytes()).sum::<usize>() + supplement_bytes);
+        self.report["supplemental_paths"] = json!(
+            self.supplement.as_ref().map_or(0, |s| s
+                .batches
+                .iter()
+                .map(|b| b.len())
+                .sum::<usize>())
+        );
         self.report["query_cache_entries"] = json!(self.queries.len());
         self.report["physical_footprint_bytes"] = json!(physical_footprint());
         self.report["cache_loaded"] = json!(self.cache_loaded);
@@ -283,6 +302,12 @@ impl Worker {
                 .map_or(0, |s| s.batches.iter().map(|b| b.len()).sum());
         let status = if self.active.is_none() {
             Status::Idle
+        } else if let Some(error) = self
+            .failure
+            .as_ref()
+            .or_else(|| self.supplement.as_ref().and_then(|s| s.failure.as_ref()))
+        {
+            Status::Failed(error.clone())
         } else if self.ready() {
             Status::Ready { indexed }
         } else {
@@ -305,6 +330,7 @@ impl Worker {
         match message {
             Message::Search {
                 id,
+                signpost,
                 mut query,
                 started,
             } => {
@@ -318,6 +344,7 @@ impl Worker {
                 }
                 let was_idle = self.active.is_none();
                 self.idle_at = None;
+                self.report["idle_released"] = json!(false);
                 self.epoch.fetch_add(1, Ordering::AcqRel);
                 self.scoring = false;
                 let key = Key {
@@ -330,6 +357,7 @@ impl Worker {
                 }
                 self.active = Some(Active {
                     id,
+                    signpost,
                     key,
                     started,
                     first_result: false,
@@ -502,7 +530,8 @@ impl Worker {
                         }
                         Err(error) => {
                             self.report["scan_error"] = json!(error);
-                            self.notify(Some(Status::Failed(error)), None);
+                            self.failure = Some(error);
+                            self.status();
                         }
                     }
                 }
@@ -511,7 +540,12 @@ impl Worker {
                 job,
                 supplement: true,
                 progress,
-            } if self.supplement.as_ref().is_some_and(|s| s.job == job) => {
+            } if self.active.is_some()
+                && self
+                    .supplement
+                    .as_ref()
+                    .is_some_and(|s| s.job == job && !s.cancel.load(Ordering::Acquire)) =>
+            {
                 let Some(supplement) = &mut self.supplement else {
                     return;
                 };
@@ -567,6 +601,7 @@ impl Worker {
                             }
                             Err(error) => {
                                 supplement.complete = false;
+                                supplement.failure = Some(error.clone());
                                 self.report["supplement_error"] = json!(error);
                                 self.notify(Some(Status::Failed(error)), None);
                                 return;
@@ -582,7 +617,31 @@ impl Worker {
             Message::SupplementEvents { job, events }
                 if self.supplement.as_ref().is_some_and(|s| s.job == job) =>
             {
-                if events.full_scan || !events.paths.is_empty() {
+                let Some(supplement) = &mut self.supplement else {
+                    return;
+                };
+                supplement.pending_full |= events.full_scan;
+                for path in events.paths {
+                    if path.starts_with(&self.support) {
+                        continue;
+                    }
+                    let Ok(relative) = path.strip_prefix(&events.root) else {
+                        continue;
+                    };
+                    let Some(relative) = relative.to_str() else {
+                        continue;
+                    };
+                    if relative.is_empty() {
+                        supplement.pending_full = true;
+                    } else if !relative.split('/').any(|p| p.starts_with('.')) {
+                        supplement.pending.insert(relative.to_owned());
+                    }
+                }
+                if supplement.pending.len() > 50_000 {
+                    supplement.pending_full = true;
+                    supplement.pending.clear();
+                }
+                if supplement.pending_full || !supplement.pending.is_empty() {
                     self.supplement_refresh_at = Some(Instant::now() + Duration::from_millis(220));
                 }
             }
@@ -628,6 +687,7 @@ impl Worker {
     }
     fn published(&mut self, response: Response, cache_hit: bool) {
         if let Some(active) = &mut self.active {
+            performance::published(active.signpost, response.complete, cache_hit);
             let ms = active.started.elapsed().as_secs_f64() * 1000.0;
             if let Some(sample) = self.samples.back_mut() {
                 if sample.get("first_publish_ms").is_none() {
@@ -665,6 +725,20 @@ impl Worker {
         }
     }
     fn load(&mut self) {
+        let failure = match fs::metadata(&self.root) {
+            Ok(metadata) if metadata.is_dir() => None,
+            Ok(_) => Some("The search root is not a folder".to_owned()),
+            Err(error) => Some(error.to_string()),
+        };
+        if let Some(error) = failure {
+            self.failure = Some(error.clone());
+            self.report["root_error"] = json!(error);
+            self.status();
+            return;
+        }
+        self.failure = None;
+        self.report["root_error"] = Value::Null;
+        self.physical_root = fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
         self.loading = true;
         self.cache_cancel = Arc::new(AtomicBool::new(false));
         self.cache_job = self.next();
@@ -885,6 +959,7 @@ impl Worker {
             incremental,
         });
         self.complete = false;
+        self.failure = None;
         let root = self.root.clone();
         let previous = self.batches.clone();
         let tx = self.sender.clone();
@@ -916,19 +991,42 @@ impl Worker {
                     _ => None,
                 })
         });
-        if self.supplement.as_ref().map(|s| &s.path) == desired.as_ref() {
+        if self.supplement.as_ref().map(|s| &s.path) == desired.as_ref()
+            && self.supplement.as_ref().is_none_or(|s| {
+                s.failure.is_none() && (s.complete || !s.cancel.load(Ordering::Acquire))
+            })
+        {
+            if self
+                .supplement
+                .as_ref()
+                .is_some_and(|s| s.pending_full || !s.pending.is_empty())
+            {
+                self.supplement_refresh_at = Some(Instant::now());
+            }
             return;
         }
-        if let Some(old) = self.supplement.take() {
+        let previous = if let Some(old) = self.supplement.take() {
             old.cancel.store(true, Ordering::Release);
-        }
+            if Some(&old.path) == desired.as_ref() {
+                old.batches
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
         self.invalidate();
         let Some(path) = desired.filter(|p| p.starts_with(&self.root) && p != &self.root) else {
             return;
         };
-        self.start_supplement(path, Vec::new());
+        self.start_supplement(path, previous, None);
     }
-    fn start_supplement(&mut self, path: PathBuf, previous: Vec<Arc<Snapshot>>) {
+    fn start_supplement(
+        &mut self,
+        path: PathBuf,
+        previous: Vec<Arc<Snapshot>>,
+        changes: Option<HashSet<String>>,
+    ) {
         let job = self.next();
         let cancel = Arc::new(AtomicBool::new(false));
         let event_tx = self.sender.clone();
@@ -942,6 +1040,9 @@ impl Worker {
             cancel: Arc::clone(&cancel),
             job,
             _watch: watch,
+            pending: HashSet::new(),
+            pending_full: false,
+            failure: None,
         });
         let tx = self.sender.clone();
         let prefix = path
@@ -970,7 +1071,7 @@ impl Worker {
                         ))
                     })
                     .collect();
-                discovery::run(path, previous, None, cancel, move |progress| {
+                discovery::run(path, previous, changes, cancel, move |progress| {
                     let _ = tx.send(Message::Scan {
                         job,
                         supplement: true,
@@ -1146,7 +1247,7 @@ impl Worker {
             self.complete = false;
             self.pending_full = true;
         }
-        if let Some(supplement) = self.supplement.take() {
+        if let Some(supplement) = &self.supplement {
             supplement.cancel.store(true, Ordering::Release);
         }
         self.save_cancel.store(true, Ordering::Release);
@@ -1162,8 +1263,10 @@ impl Worker {
         self.watch_job = self.next();
         self.replay = None;
         self.batches.clear();
+        self.supplement = None;
         self.unique = None;
         self.complete = false;
+        self.failure = None;
         self.cache_loaded = false;
         self.pending.clear();
         self.excluded.clear();
@@ -1182,8 +1285,12 @@ impl Worker {
             self.supplement_refresh_at = None;
             if let Some(old) = self.supplement.take() {
                 old.cancel.store(true, Ordering::Release);
-                self.start_supplement(old.path, old.batches);
-                self.invalidate();
+                let changes = if old.pending_full {
+                    None
+                } else {
+                    Some(old.pending)
+                };
+                self.start_supplement(old.path, old.batches, changes);
             }
         }
         if self

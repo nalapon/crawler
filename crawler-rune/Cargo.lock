@@ -690,6 +690,7 @@ dependencies = [
 name = "crawler"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "fff-query-parser",
  "fff-search",
  "libc",

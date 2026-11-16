@@ -32,8 +32,14 @@ pub fn equal(a: &str, b: &str) -> bool {
 }
 
 struct Entry {
-    range: Range<usize>,
+    start: usize,
+    length: u16,
     directory: bool,
+}
+impl Entry {
+    fn range(&self) -> Range<usize> {
+        self.start..self.start + usize::from(self.length)
+    }
 }
 enum Originals {
     Owned(Vec<u8>),
@@ -48,6 +54,7 @@ enum Prepared {
     },
 }
 pub struct Snapshot {
+    original_bytes: usize,
     originals: Originals,
     entries: Vec<Entry>,
     pub paths: Vec<ChunkedString>,
@@ -70,7 +77,8 @@ impl Snapshot {
             let start = originals.len();
             originals.extend_from_slice(path.as_bytes());
             entries.push(Entry {
-                range: start..originals.len(),
+                start,
+                length: path.len() as u16,
                 directory: *directory,
             });
             paths.push(builder.add_file_immediate(
@@ -79,6 +87,7 @@ impl Snapshot {
             ));
         }
         Self {
+            original_bytes: originals.len(),
             originals: Originals::Owned(originals),
             entries,
             paths,
@@ -94,8 +103,7 @@ impl Snapshot {
             Originals::Mapped(v) => v,
         };
         // Both construction paths validate UTF-8 and range boundaries.
-        std::str::from_utf8(&bytes[self.entries[row].range.clone()])
-            .expect("validated snapshot UTF-8")
+        std::str::from_utf8(&bytes[self.entries[row].range()]).expect("validated snapshot UTF-8")
     }
     pub fn directory(&self, row: usize) -> bool {
         self.entries[row].directory
@@ -115,14 +123,9 @@ impl Snapshot {
     }
     pub fn bytes(&self) -> usize {
         self.entries.len() * (std::mem::size_of::<Entry>() + std::mem::size_of::<ChunkedString>())
+            + self.original_bytes
             + match &self.prepared {
-                Prepared::Owned(s) => {
-                    s.heap_bytes()
-                        + match &self.originals {
-                            Originals::Owned(v) => v.len(),
-                            _ => 0,
-                        }
-                }
+                Prepared::Owned(store) => store.heap_bytes(),
                 Prepared::Mapped {
                     chunks, indices, ..
                 } => chunks.len() + indices.len(),
@@ -210,7 +213,8 @@ impl Snapshot {
                 return None;
             }
             entries.push(Entry {
-                range: range.start + at..range.start + at + size,
+                start: range.start + at,
+                length: size as u16,
                 directory: directory == 1,
             });
             at += size;
@@ -264,7 +268,7 @@ impl Snapshot {
                 prepared.extend_from_slice(bytes.get(chunk..chunk + take)?);
             }
             let text = std::str::from_utf8(&prepared).ok()?;
-            let original = std::str::from_utf8(map.get(entry.range.clone())?).ok()?;
+            let original = std::str::from_utf8(map.get(entry.range())?).ok()?;
             if folded(original) != text
                 || text.rfind('/').map_or(0, |n| n + 1) != usize::from(filename)
             {
@@ -282,6 +286,7 @@ impl Snapshot {
             indices: range.start + indices..range.end,
         };
         Some(Self {
+            original_bytes: entries.iter().map(|entry| usize::from(entry.length)).sum(),
             originals: Originals::Mapped(map),
             entries,
             paths,

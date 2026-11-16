@@ -30,6 +30,7 @@ struct Directory {
     delayed: Vec<String>,
     excluded: Vec<String>,
     warning: Option<String>,
+    keep_contents: bool,
 }
 pub struct Paths {
     batches: Vec<Arc<Snapshot>>,
@@ -152,6 +153,7 @@ fn read(
         delayed: Vec::new(),
         excluded: Vec::new(),
         warning: None,
+        keep_contents: false,
     };
     if unentered(root, relative) {
         out.excluded.push(relative.into());
@@ -165,6 +167,10 @@ fn read(
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
+                if relative.is_empty() {
+                    return Err(e.to_string());
+                }
+                out.keep_contents |= e.kind() == std::io::ErrorKind::TimedOut;
                 out.warning = Some(e.to_string());
                 continue;
             }
@@ -404,6 +410,9 @@ fn scan(
                 if let Some((path, _, _)) = running.remove(&id) {
                     match result {
                         Ok(result) => {
+                            if result.keep_contents {
+                                keep.insert(path);
+                            }
                             rows = result.rows;
                             pending.extend(result.children);
                             deferred.extend(result.delayed);

@@ -74,6 +74,7 @@ pub enum Status {
 mod cache;
 mod discovery;
 mod matching;
+mod performance;
 mod snapshot;
 mod watcher;
 mod worker;
@@ -96,6 +97,7 @@ struct Shared {
 }
 pub struct Engine {
     next_id: u64,
+    interval: performance::Interval,
     waker: Option<Waker>,
     commands: mpsc::Sender<worker::Message>,
     shared: Arc<Mutex<Shared>>,
@@ -136,6 +138,7 @@ impl Engine {
         }
         Engine {
             next_id: 0,
+            interval: performance::Interval::default(),
             waker: None,
             commands,
             shared,
@@ -149,13 +152,21 @@ impl Engine {
         }
     }
     pub fn search(&mut self, mut query: Query) -> u64 {
+        let started = Instant::now();
         self.next_id += 1;
         self.generation.store(self.next_id, Ordering::Release);
         query.text = query.text.trim().to_owned();
+        let signpost = if query.text.is_empty() {
+            self.interval.cancel();
+            0
+        } else {
+            self.interval.begin(self.next_id)
+        };
         let _ = self.commands.send(worker::Message::Search {
             id: self.next_id,
+            signpost,
             query,
-            started: Instant::now(),
+            started,
         });
         self.next_id
     }
@@ -179,10 +190,12 @@ impl Engine {
         let _ = self.commands.send(worker::Message::Access(path.to_owned()));
     }
     pub fn idle(&mut self) {
+        self.interval.cancel();
         self.generation.store(0, Ordering::Release);
         let _ = self.commands.send(worker::Message::Idle);
     }
     pub fn suspend(&mut self) {
+        self.interval.cancel();
         self.generation.store(0, Ordering::Release);
         let _ = self.commands.send(worker::Message::Suspend);
     }
@@ -199,9 +212,19 @@ impl Engine {
             .unwrap_or_default()
     }
 
+    /// Measures a stage against the query's dispatch time. Call the title stage from paint.
+    pub fn mark_stage(&mut self, id: u64, stage: &'static str) {
+        if let Some(elapsed) = self.interval.elapsed(id) {
+            self.trace_stage(id, stage, elapsed);
+        }
+    }
+
     /// The funnel can attach row preparation and actual title-paint timings to the numeric trace.
     /// A window-update notification is not a draw measurement.
     pub fn trace_stage(&mut self, id: u64, stage: &'static str, milliseconds: f64) {
+        if stage == "first_title_draw_ms" {
+            self.interval.drawn(id);
+        }
         let _ = self.commands.send(worker::Message::Trace {
             id,
             stage,

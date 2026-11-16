@@ -15,6 +15,7 @@ use std::{
 
 #[derive(Debug)]
 pub struct Events {
+    pub root: PathBuf,
     pub paths: Vec<PathBuf>,
     pub full_scan: bool,
     pub history_done: bool,
@@ -35,7 +36,13 @@ impl Watcher {
         let _ = thread::Builder::new()
             .name("crawler-fsevents".into())
             .spawn(move || {
-                let mut callback: Box<Box<dyn Fn(Events) + Send>> = Box::new(Box::new(deliver));
+                let root = std::fs::canonicalize(&root).unwrap_or(root);
+                let event_root = root.clone();
+                let mut callback: Box<Box<dyn Fn(Events) + Send>> =
+                    Box::new(Box::new(move |mut event: Events| {
+                        event.root = event_root.clone();
+                        deliver(event);
+                    }));
                 let mut context = FSEventStreamContext {
                     version: 0,
                     info: ptr::from_mut(callback.as_mut()).cast(),
@@ -43,7 +50,6 @@ impl Watcher {
                     release: None,
                     copyDescription: None,
                 };
-                let root = std::fs::canonicalize(&root).unwrap_or(root);
                 let path = CFString::from_str(root.to_str().unwrap_or("/"));
                 let paths = CFArray::from_objects(&[&*path]);
                 // All CF objects and callback storage stay alive until Stop/Invalidate/Release below.
@@ -124,6 +130,7 @@ unsafe extern "C-unwind" fn receive(
     let flags = unsafe { std::slice::from_raw_parts(flags.as_ptr(), count) };
     let ids = unsafe { std::slice::from_raw_parts(ids.as_ptr(), count) };
     let mut events = Events {
+        root: PathBuf::new(),
         paths: Vec::new(),
         full_scan: false,
         history_done: false,

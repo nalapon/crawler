@@ -67,6 +67,9 @@ impl Reader {
             return Err(corrupt());
         }
         let mut at = (12 + size).next_multiple_of(8);
+        if header.batches > map.len().saturating_sub(at) / 56 {
+            return Err(corrupt());
+        }
         let mut blocks = std::collections::VecDeque::with_capacity(header.batches);
         for _ in 0..header.batches {
             let size = u64::from_le_bytes(
