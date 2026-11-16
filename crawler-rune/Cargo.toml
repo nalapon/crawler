@@ -20,10 +20,11 @@ tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
 security-framework = "3.7"
 core-foundation = "0.10"
-objc2 = "0.6"
+objc2 = "0.6.3"
 block2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSArray", "NSURL", "NSString", "NSError", "NSGeometry"] }
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSWorkspace", "NSRunningApplication", "NSSharingService", "block2"] }
+objc2-app-kit = "0.3.2"
+objc2-pdf-kit = "0.3.2"
 objc2-uniform-type-identifiers = "0.3"
 objc2-quick-look-thumbnailing = "0.3"
 objc2-core-graphics = "0.3"

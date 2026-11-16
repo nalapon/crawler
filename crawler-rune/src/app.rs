@@ -205,7 +205,11 @@ pub fn poll(app: &mut App, clock: f64, tx: &mut Tx) -> bool {
     app.clock = clock;
     let mut changed = false;
     if let Some(path) = app.pending_open.take() {
-        opening::open_path(app, &path, tx);
+        if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("pdf")) {
+            if let Err(error) = pdf::open_reader(app, &path, tx) { app.toast(error); }
+        } else {
+            opening::open_path(app, &path, tx);
+        }
         changed = true;
     }
     let before = app.toasts.len();
