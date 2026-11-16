@@ -50,6 +50,7 @@ impl Matches {
         self.hits.sort_unstable_by(|a, b| {
             b.score
                 .cmp(&a.score)
+                .then_with(|| a.batch.path(a.row).len().cmp(&b.batch.path(b.row).len()))
                 .then_with(|| a.batch.path(a.row).cmp(b.batch.path(b.row)))
         });
         self.hits.truncate(100);
