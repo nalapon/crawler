@@ -48,6 +48,7 @@ struct Session {
     last_publication: f64,
     has_nonempty: bool,
     drawn_query: Option<u64>,
+    list_viewport: [f32; 4],
     scope_counts: Vec<(PathBuf, usize)>,
     revision: u64,
     g_at: Option<f64>,
@@ -79,6 +80,7 @@ impl Session {
             last_publication: 0.0,
             has_nonempty: false,
             drawn_query: None,
+            list_viewport: [0.0; 4],
             scope_counts: Vec::new(),
             revision: 0,
             g_at: None,
@@ -1405,7 +1407,12 @@ fn file_list(app: &App, p: &Paint, list: List) -> El {
         .child(stack);
     if list == List::Main {
         let scroll = session(app).scroll.clone();
-        viewport = viewport.on_scroll_offset(move |pos| scroll.set(pos.offset[1]));
+        viewport = viewport
+            .on_scroll_offset(move |pos| scroll.set(pos.offset[1]))
+            .on_drawn_layout_tx(|a: &mut App, rect, tx| {
+                session_mut(a).list_viewport = rect;
+                tx.live_only();
+            });
         viewport = viewport.key(list_key(app));
     }
     let chrome = match list {
@@ -1481,6 +1488,8 @@ fn file_row(app: &App, p: &Paint, list: List, item: &Item) -> El {
                     && s.usable
                     && rect[2] > 0.0
                     && rect[3] > 0.0
+                    && rect[1] + rect[3] > s.list_viewport[1]
+                    && rect[1] < s.list_viewport[1] + s.list_viewport[3]
                 {
                     s.drawn_query = Some(id);
                     a.index.mark_stage(id, "first_title_draw_ms");
