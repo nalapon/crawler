@@ -226,6 +226,7 @@ pub fn poll(app: &mut App, clock: f64, tx: &mut Tx) -> bool {
 
 pub fn on_close(app: &mut App, tx: &mut Tx) {
     pdf::on_close(app, tx);
+    transfers::on_close(app);
     app.index.suspend();
 }
 
