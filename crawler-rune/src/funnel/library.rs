@@ -289,6 +289,7 @@ fn read_directory(path: &Path) -> Result<Vec<Item>, String> {
             created: None,
             symlink: false,
             highlights: Vec::new(),
+            path_highlights: Vec::new(),
         });
         rows.push(row);
     }

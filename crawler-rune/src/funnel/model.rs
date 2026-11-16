@@ -128,6 +128,7 @@ pub struct Item {
     pub created: Option<SystemTime>,
     pub symlink: bool,
     pub highlights: Vec<std::ops::Range<usize>>,
+    pub path_highlights: Vec<std::ops::Range<usize>>,
 }
 impl Item {
     pub fn read(path: &Path) -> Result<Self, String> {
@@ -153,6 +154,7 @@ impl Item {
             created: meta.as_ref().and_then(|m| m.created().ok()),
             symlink,
             highlights: Vec::new(),
+            path_highlights: Vec::new(),
         })
     }
     pub fn from_hit(hit: &crate::index::Hit) -> Self {
@@ -165,6 +167,7 @@ impl Item {
             created: None,
             symlink: false,
             highlights: hit.name_highlights.clone(),
+            path_highlights: hit.dir_highlights.clone(),
         }
     }
 }

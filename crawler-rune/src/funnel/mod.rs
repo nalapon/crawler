@@ -1292,7 +1292,11 @@ fn file_list(app: &App, p: &Paint, list: List) -> El {
         .growth(GrowthSpec::default())
         .virtual_rows(
             count,
-            32.0,
+            if list == List::Main && !browsing(app) {
+                44.0
+            } else {
+                32.0
+            },
             move |a: &App, i| rows(a, list)[i].id.key().into(),
             move |a: &App, i| {
                 file_row(
@@ -1366,12 +1370,46 @@ fn file_row(app: &App, p: &Paint, list: List, item: &Item) -> El {
         p.look.text
     };
     let single = list == List::Main && selected && session(app).selected.len() == 1;
+    let path_detail = list == List::Main && !browsing(app);
+    let title = text(&item.name)
+        .font(rune::tok::type_::BODY)
+        .color(ink)
+        .spans(
+            item.highlights
+                .iter()
+                .map(|r| rune::Span::new(r.start, r.end).bold())
+                .collect::<Vec<_>>(),
+        )
+        .truncate()
+        .w_full();
+    let mut label = col().gap(1.0).min_w(0.0).grow(1.0).child(title);
+    if path_detail {
+        label = label.child(
+            text(
+                item.id
+                    .0
+                    .parent()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            )
+            .font(rune::tok::type_::LABEL)
+            .color(if selected { ink } else { p.look.muted })
+            .truncate()
+            .w_full()
+            .spans(
+                item.path_highlights
+                    .iter()
+                    .map(|r| rune::Span::new(r.start, r.end).bold())
+                    .collect::<Vec<_>>(),
+            ),
+        );
+    }
     let mut r = row()
         .role("option")
         .focus_selected(selected)
         .label(item.name.clone())
         .w_full()
-        .h(32.0)
+        .h(if path_detail { 44.0 } else { 32.0 })
         .px(10.0)
         .gap(8.0)
         .items_center()
@@ -1395,20 +1433,7 @@ fn file_row(app: &App, p: &Paint, list: List, item: &Item) -> El {
             Vec::new()
         })
         .child(file_icon(p, item.kind, selected))
-        .child(
-            text(&item.name)
-                .font(rune::tok::type_::BODY)
-                .color(ink)
-                .spans(
-                    item.highlights
-                        .iter()
-                        .map(|r| rune::Span::new(r.start, r.end).bold())
-                        .collect::<Vec<_>>(),
-                )
-                .truncate()
-                .grow(1.0)
-                .min_w(0.0),
-        );
+        .child(label);
     if item.symlink {
         r = r.child(text("↗").font(rune::tok::type_::LABEL).color(p.look.muted));
     }
