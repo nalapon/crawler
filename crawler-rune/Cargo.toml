@@ -6,9 +6,20 @@ license = "MIT"
 
 [dependencies]
 rune = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90", features = ["tooling", "native-file-dialog"] }
-rune-kit = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90" }
+rune-kit = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90", features = ["markdown"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+libc = "0.2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+roxmltree = "0.21"
+pulldown-cmark = { version = "0.13", default-features = false }
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSURL", "NSString", "NSError", "NSGeometry"] }
+objc2-quick-look-thumbnailing = "0.3"
+objc2-core-graphics = "0.3"
+objc2-core-foundation = "0.3"
+objc2-image-io = "0.3"
+block2 = "0.6"
 
 # Rune patches these crates; an app that builds Rune must patch them too.
 [patch.crates-io]
