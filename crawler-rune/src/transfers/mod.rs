@@ -11,7 +11,7 @@ use crate::{
     shell,
 };
 use copy::{Outcome, Progress, Snapshot};
-use rune::tok::{motion, type_};
+use rune::tok::motion;
 use rune::{
     Cx, El, Icon, Key, KeyEvent, ScrollSpec, Transition, Tx, Waker, col, el, icon, row, text,
 };
@@ -30,7 +30,7 @@ use std::{
 static AIRDROP: Icon = Icon {
     name: "crawler-airdrop",
     view: 32.0,
-    body: r#"<g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M7 23a12 12 0 1 1 18 0M11 19a7 7 0 1 1 10 0"/><path d="m16 17-6 11h12Z"/></g>"#,
+    body: r#"<g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M7 23a12 12 0 1 1 18 0M11 19a7 7 0 1 1 10 0"/><path d="m16 17-6 11h12Z" fill="currentColor" stroke="none"/></g>"#,
 };
 static PHONE: Icon = Icon {
     name: "crawler-phone",
@@ -555,7 +555,7 @@ pub fn status(app: &App, p: &Paint) -> Option<El> {
                     .on_press(|a: &mut App| a.show(Section::Transfers))
                     .child(
                         text(message)
-                            .font(type_::LABEL)
+                            .font(p.look.font(12.0, 400.0))
                             .color(p.look.text)
                             .truncate(),
                     )
@@ -576,14 +576,15 @@ pub fn status(app: &App, p: &Paint) -> Option<El> {
 fn copies(app: &App, p: &Paint) -> El {
     let s = &app.transfers;
     let title = if s.queue.is_empty() {
-        "One copy runs at a time".into()
+        "Drop files on a Folders place to copy them".into()
     } else {
         format!("{} queued", s.queue.len())
     };
     let mut pane = col()
         .key("copies")
-        .w_frac(0.36)
-        .min_w(280.0)
+        .w_frac(0.30)
+        .min_w(300.0)
+        .max_w(380.0)
         .h_full()
         .border_sides([0.0, 0.0, 0.0, 1.0], p.look.line)
         .child(shell::pane_title(
@@ -607,7 +608,7 @@ fn copies(app: &App, p: &Paint) -> El {
                     } else {
                         format!("Copying {} to {}", snap.name, running.job.place())
                     })
-                    .font(type_::LABEL)
+                    .font(p.look.font(12.0, 400.0))
                     .color(p.look.text)
                     .truncate(),
                 )
@@ -617,7 +618,7 @@ fn copies(app: &App, p: &Paint) -> El {
                         bytes(snap.copied.min(snap.total)),
                         bytes(snap.total)
                     ))
-                    .font(type_::LABEL)
+                    .font(p.look.font(12.0, 400.0))
                     .color(p.look.muted),
                 )
                 .child(progress(p, "copy-progress", snap.copied, snap.total))
@@ -627,7 +628,7 @@ fn copies(app: &App, p: &Paint) -> El {
                         .items_center()
                         .child(
                             text("Existing names are skipped.")
-                                .font(type_::LABEL)
+                                .font(p.look.font(12.0, 400.0))
                                 .color(p.look.muted),
                         )
                         .child(
@@ -637,7 +638,7 @@ fn copies(app: &App, p: &Paint) -> El {
         );
     }
     if s.running.is_none() && s.records.is_empty() {
-        pane = pane.child(col().padding(18.0).gap(8.0).child(text("No copies yet").font(type_::LABEL).color(p.look.text)).child(text("Drag files from Search or Folders onto a place in Folders to copy them there.").font(type_::BODY).color(p.look.muted).wrap()));
+        pane = pane.child(text("No copies yet. Drag files from Search or Folders onto a place in Folders to copy them there.").padding(18.0).font(p.look.font(12.0, 400.0)).color(p.look.muted).wrap());
     } else {
         let look = p.look;
         pane = pane.child(
@@ -674,7 +675,7 @@ fn copies(app: &App, p: &Paint) -> El {
                                     .motion(motion::SNAPPY)
                                     .child(
                                         text(record.title.as_str())
-                                            .font(type_::LABEL)
+                                            .font(look.font(12.0, 400.0))
                                             .color(if record.outcome == Outcome::Failed {
                                                 crate::theme::rgb(0xc53c3c)
                                             } else {
@@ -684,7 +685,7 @@ fn copies(app: &App, p: &Paint) -> El {
                                     )
                                     .child(
                                         text(format!("{} · {}", record.time, record.detail))
-                                            .font(type_::LABEL)
+                                            .font(look.font(12.0, 400.0))
                                             .color(look.muted)
                                             .max_lines(2)
                                             .help(record.detail.clone()),
@@ -696,13 +697,14 @@ fn copies(app: &App, p: &Paint) -> El {
     }
     pane
 }
-fn beacon(s: &State, p: &Paint) -> El {
-    let active = s.sending.is_some() || s.devices.is_empty() && s.discovery_error.is_none();
-    let mut body = el().key("airdrop-beacon-waves").size(100.0, 100.0).center();
-    for (index, diameter) in [96.0, 74.0, 52.0].into_iter().enumerate() {
+fn beacon(s: &State, p: &Paint, reduced_motion: bool) -> El {
+    let active = !reduced_motion
+        && (s.sending.is_some() || s.devices.is_empty() && s.discovery_error.is_none());
+    let mut body = el().key("airdrop-beacon-waves").size(130.0, 130.0).center();
+    for (index, diameter) in [106.0, 66.0, 26.0].into_iter().enumerate() {
         let wave = el()
             .key(format!("wave-{index}"))
-            .absolute((100.0 - diameter) / 2.0, (100.0 - diameter) / 2.0)
+            .absolute((130.0 - diameter) / 2.0, (130.0 - diameter) / 2.0)
             .size(diameter, diameter)
             .radius(diameter / 2.0)
             .border(1.0, p.look.accent.alpha(0.35))
@@ -715,7 +717,7 @@ fn beacon(s: &State, p: &Paint) -> El {
     }
     col()
         .key("airdrop-beacon")
-        .h(112.0)
+        .h(130.0)
         .w_full()
         .center()
         .child(
@@ -726,13 +728,13 @@ fn beacon(s: &State, p: &Paint) -> El {
                     } else {
                         &AIRDROP
                     },
-                    32.0,
+                    43.0,
                 )
                 .color(p.look.accent),
             ),
         )
 }
-fn air_view(app: &App, p: &Paint) -> El {
+fn air_view(app: &App, p: &Paint, reduced_motion: bool, tile_height: f32) -> El {
     let s = &app.transfers;
     let busy = busy(s);
     let status = s
@@ -789,13 +791,13 @@ fn air_view(app: &App, p: &Paint) -> El {
             )
             .child(
                 text(device.name.clone())
-                    .font(type_::LABEL)
+                    .font(p.look.font(12.0, 400.0))
                     .color(p.look.text)
                     .truncate(),
             )
             .child(
                 text(device.detail.clone())
-                    .font(type_::LABEL)
+                    .font(p.look.font(12.0, 400.0))
                     .color(p.look.muted)
                     .max_lines(2),
             );
@@ -828,58 +830,71 @@ fn air_view(app: &App, p: &Paint) -> El {
     };
     let mut actions = row()
         .key("airdrop-actions")
-        .gap(8.0)
+        .w_full()
+        .h(32.0)
+        .items_center()
         .justify_center()
-        .wrap();
+        .gap(12.0);
     if busy {
-        if s.sending.is_some() {
-            actions = actions.child(
-                shell::shell_button(p, "airdrop-cancel", "Cancel transfer", false).on_press(
-                    |a: &mut App| {
-                        if let Some(sending) = &a.transfers.sending {
-                            sending.cancel.store(true, Ordering::Relaxed);
-                            a.transfers.message = Some("Cancelling…".into());
-                        }
-                    },
-                ),
-            );
-        }
-    } else {
         actions = actions.child(
-            shell::shell_button(p, "airdrop-choose", "Choose files…", false)
-                .on_press(|a: &mut App| a.transfers.picker.show(false)),
+            shell::shell_button(p, "airdrop-cancel", "Cancel transfer", false).on_press(
+                |a: &mut App| {
+                    if let Some(sending) = &a.transfers.sending {
+                        sending.cancel.store(true, Ordering::Relaxed);
+                        a.transfers.message = Some("Cancelling…".into());
+                    }
+                },
+            ),
         );
-        if !s.files.is_empty() {
-            if s.devices
+    } else {
+        let can_send = !s.files.is_empty()
+            && s.devices
                 .iter()
-                .any(|d| d.ready && Some(&d.id) == s.selected.as_ref())
-            {
-                actions = actions
-                    .child(shell::shell_button(p, "airdrop-send", "Send", true).on_press(send));
-            }
-            actions = actions.child(
-                shell::shell_button(p, "airdrop-clear", "Clear files", false).on_press(
-                    |a: &mut App| {
+                .any(|d| d.ready && Some(&d.id) == s.selected.as_ref());
+        actions = actions
+            .child(
+                shell::shell_button(p, "airdrop-choose", "Choose files…", false)
+                    .w(142.0)
+                    .on_press(|a: &mut App| a.transfers.picker.show(false)),
+            )
+            .child(
+                shell::shell_button(p, "airdrop-send", "Send", false)
+                    .w(192.0)
+                    .disabled(!can_send)
+                    .opacity(if can_send { 1.0 } else { 0.45 })
+                    .on_press(send),
+            )
+            .child(
+                shell::shell_button(p, "airdrop-clear", "Clear files", false)
+                    .w(132.0)
+                    .disabled(s.files.is_empty())
+                    .opacity(if s.files.is_empty() { 0.45 } else { 1.0 })
+                    .on_press(|a: &mut App| {
                         a.transfers.files.clear();
                         a.transfers.error = false;
                         a.transfers.message = None;
                         a.transfers.upload = None;
                         a.transfers.delivered = false;
-                    },
-                ),
+                    }),
             );
-        }
     }
     let mut content = col()
         .key("airdrop-content")
-        .padding(30.0)
-        .gap(18.0)
         .w_full()
+        .min_h(686.0)
+        .pt(28.0)
+        .px(36.0)
         .child(
             row()
-                .justify_between()
+                .w_full()
+                .h(36.0)
                 .items_center()
-                .child(text("AirDrop").font(type_::TITLE).color(p.look.text))
+                .justify_between()
+                .child(
+                    text("AirDrop")
+                        .font(p.look.font(25.0, 600.0))
+                        .color(p.look.text),
+                )
                 .child(
                     shell::shell_button(p, "airdrop-refresh", "Refresh devices", false)
                         .on_press(refresh),
@@ -887,47 +902,64 @@ fn air_view(app: &App, p: &Paint) -> El {
         )
         .child(
             text("Drop files onto a device, or click it to choose what to send.")
-                .font(type_::BODY)
+                .font(p.look.font(12.0, 400.0))
+                .color(p.look.muted)
+                .h(22.0)
+                .mt(8.0),
+        )
+        .child(beacon(s, p, reduced_motion).mt(8.0))
+        .child(
+            el().w_full().h(40.0).center().child(
+                text(status)
+                    .key("airdrop-status")
+                    .font(p.look.font(18.0, 600.0))
+                    .color(if s.error {
+                        crate::theme::rgb(0xc53c3c)
+                    } else {
+                        p.look.text
+                    })
+                    .wrap(),
+            ),
+        )
+        .child(
+            el().w_full().h(36.0).center().child(
+                text(if s.discovery_error.is_some() {
+                    "Network discovery is unavailable. You can still use the macOS AirDrop window."
+                } else if s.devices.is_empty() {
+                    "Your iPad, iPhone or Mac will appear here when discovered."
+                } else {
+                    "Click a device to select files, or drop files directly onto it."
+                })
+                .font(p.look.font(12.0, 400.0))
                 .color(p.look.muted)
                 .wrap(),
+            ),
         )
-        .child(beacon(s, p))
         .child(
-            text(status)
-                .key("airdrop-status")
-                .font(type_::TITLE)
-                .color(if s.error {
-                    crate::theme::rgb(0xc53c3c)
-                } else {
-                    p.look.text
+            col()
+                .key("airdrop-device-scroll")
+                .w_full()
+                .h(tile_height)
+                .mt(10.0)
+                .scroll(ScrollSpec {
+                    stick_bottom: false,
                 })
-                .wrap(),
+                .child(devices),
         )
         .child(
-            text(if s.discovery_error.is_some() {
-                "Network discovery is unavailable. You can still use the macOS AirDrop window."
-            } else if s.devices.is_empty() {
-                "Your iPad, iPhone or Mac will appear here when discovered."
-            } else {
-                "Click a device to select files, or drop files directly onto it."
-            })
-            .font(type_::BODY)
-            .color(p.look.muted)
-            .wrap(),
-        )
-        .child(devices)
-        .child(
-            text(files_label)
-                .key("airdrop-files")
-                .font(type_::LABEL)
-                .color(p.look.text)
-                .help(
-                    s.files
-                        .iter()
-                        .map(|p| p.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                ),
+            el().w_full().h(26.0).mt(8.0).center().child(
+                text(files_label)
+                    .key("airdrop-files")
+                    .font(p.look.font(12.0, 400.0))
+                    .color(p.look.muted)
+                    .help(
+                        s.files
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    ),
+            ),
         );
     if let Some((sent, total)) = s.upload {
         content = content.child(
@@ -937,41 +969,29 @@ fn air_view(app: &App, p: &Paint) -> El {
                 .child(progress(p, "airdrop-progress", sent, total).grow(1.0))
                 .child(
                     text(format!("{}%", sent.saturating_mul(100) / total.max(1)))
-                        .font(type_::LABEL)
+                        .font(p.look.font(12.0, 400.0))
                         .color(p.look.muted),
                 ),
         );
     }
-    content = content.child(actions)
-        .child(text("Keep the receiving device unlocked, with Wi-Fi and Bluetooth on. Use AirDrop's Everyone for 10 Minutes setting. Custom sending requires macOS 15 or later.").font(type_::LABEL).color(p.look.muted).wrap());
+    content = content.child(actions.mt(18.0))
+        .child(el().w_full().mt(14.0).center().child(text("Keep the receiving device unlocked, with Wi-Fi and Bluetooth on. For testing, use AirDrop's Everyone for 10 Minutes setting.").font(p.look.font(12.0, 400.0)).color(p.look.muted).w_full().max_w(620.0).align(rune::Align::Center).wrap()));
     if !busy && !s.files.is_empty() {
         content = content.child(
             shell::shell_button(p, "airdrop-system", "Use macOS AirDrop…", false)
                 .on_press(system_share),
         );
     }
-    let pane = col()
-        .key("airdrop")
-        .grow(1.0)
-        .min_w(0.0)
-        .h_full()
-        .child(shell::pane_title(
-            p,
-            "airdrop-pane-title",
-            "AirDrop",
-            None,
-            true,
-        ))
-        .child(
-            col()
-                .key("airdrop-scroll")
-                .scroll(ScrollSpec {
-                    stick_bottom: false,
-                })
-                .grow(1.0)
-                .min_h(0.0)
-                .child(content),
-        );
+    let pane = col().key("airdrop").grow(1.0).min_w(0.0).h_full().child(
+        col()
+            .key("airdrop-scroll")
+            .scroll(ScrollSpec {
+                stick_bottom: false,
+            })
+            .grow(1.0)
+            .min_h(0.0)
+            .child(content),
+    );
     if busy {
         pane
     } else {
@@ -985,6 +1005,12 @@ pub fn view(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) -> El {
         .w_full()
         .h_full()
         .fill(p.look.background)
-        .child(air_view(app, p))
+        .child(air_view(
+            app,
+            p,
+            cx.system_reduced_motion(),
+            cx.layout_size("airdrop")
+                .map_or(220.0, |s| (s[1] - 482.0).clamp(124.0, 220.0)),
+        ))
         .child(copies(app, p))
 }

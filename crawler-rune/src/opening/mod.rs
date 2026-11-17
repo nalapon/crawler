@@ -266,11 +266,48 @@ pub fn open_in_editor(app: &mut App, path: &Path, _tx: &mut Tx) {
 }
 pub fn open_menu(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
     let _ = layer;
+    let text_file = crate::funnel::focused_path(app).is_some_and(|path| {
+        matches!(
+            DocumentKind::for_path(&path, false),
+            DocumentKind::Text | DocumentKind::Markdown
+        )
+    });
     row()
         .key("open-controls")
+        .h(28.0)
+        .w(100.0)
+        .radius(p.kit.radius.sm)
+        .fill(p.look.raised)
+        .border(1.0, p.look.line)
         .items_center()
         .child(
-            crate::shell::shell_button(p, "open-selected", "Open", false)
+            p.kit
+                .interactive(
+                    row()
+                        .key("open-selected")
+                        .role("button")
+                        .label("Open selected item")
+                        .h(26.0)
+                        .w(73.0)
+                        .gap(5.0)
+                        .items_center()
+                        .justify_center()
+                        .child(if text_file {
+                            crate::settings::editor_icon(app, p, 14.0)
+                        } else {
+                            crate::shell::control_icon(
+                                crate::shell::ControlIcon::Document,
+                                p.look.text,
+                                14.0,
+                            )
+                        })
+                        .child(
+                            rune::text("Open")
+                                .font(p.look.font(11.0, 400.0))
+                                .color(p.look.text),
+                        ),
+                )
+                .press_scale(0.98)
                 .disabled(crate::funnel::selection(app).is_empty())
                 .opacity(if crate::funnel::selection(app).is_empty() {
                     0.5
@@ -284,8 +321,10 @@ pub fn open_menu(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
                 }),
         )
         .child(
-            crate::shell::shell_button(p, "open-editor-menu", "⌄", false).on_press_tx(
-                |a: &mut App, tx| {
+            crate::shell::shell_button(p, "open-editor-menu", "Choose default text editor", false)
+                .w(26.0)
+                .border_sides([0.0, 0.0, 0.0, 1.0], p.look.line)
+                .on_press_tx(|a: &mut App, tx| {
                     refresh_editors(a);
                     let mut menu = PopupMenu::new()
                         .item(PopupItem::new("heading", "Default text editor").enabled(false));
@@ -305,8 +344,7 @@ pub fn open_menu(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
                             set_default_editor(a, Some(id.to_owned()));
                         }
                     });
-                },
-            ),
+                }),
         )
 }
 fn discover() -> Vec<Editor> {

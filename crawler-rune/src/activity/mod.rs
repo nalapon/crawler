@@ -675,9 +675,11 @@ pub fn view(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) -> El {
     });
     let filter = TextInput::new(&s.filter)
         .placeholder("Filter processes · /")
+        .leading_icon(p.kit.glyph.search)
+        .leading_icon_size(13.0)
         .label("Filter processes by name or PID")
         .height(28.0)
-        .width(Some(240.0))
+        .width(Some(260.0))
         .on_edit(|a: &mut App| &mut a.activity.filter)
         .on_change(|a: &mut App, _| {
             a.activity.scope.clear();
@@ -694,9 +696,9 @@ pub fn view(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) -> El {
         })
         .build(&p.kit)
         .key("process-filter");
-    let toolbar = row().key("activity-toolbar").w_full().h(44.0).px(12.0).gap(12.0).items_center().border_sides([0.0,0.0,1.0,0.0],p.look.line)
+    let toolbar = row().key("activity-toolbar").w_full().h(44.0).px(16.0).gap(12.0).items_center().border_sides([0.0,0.0,1.0,0.0],p.look.line)
         .child(text(summary).font(p.look.font(12.0,400.0)).color(p.look.muted).truncate().grow(1.0).min_w(0.0).help(format!("{:.1} ms to sample. CPU uses 100% per core. Memory includes compressed memory.",s.sample.milliseconds)))
-        .child(filter).child(shell::shell_button(p,"activity-pause",if s.paused { "Resume" } else { "Pause" },s.paused).on_press(toggle_pause));
+        .child(filter).child(shell::shell_button(p,"activity-pause",if s.paused { "Resume" } else { "Pause" },s.paused).w(92.0).on_press(toggle_pause));
     let mut style = TableStyle::from_kit(&p.kit);
     style.row_height = 42.0;
     style.header_height = 28.0;
@@ -790,7 +792,11 @@ pub fn view(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) -> El {
             } else {
                 Metric::Memory
             };
-            let formatted = m.format(r.value(m));
+            let formatted = if m == Metric::Disk && r.value(m) == Some(0.0) {
+                String::new()
+            } else {
+                m.format(r.value(m))
+            };
             Cell::el(cell_context(
                 rune::memo(
                     format!("{}-{column}-cell", r.id),
@@ -832,26 +838,89 @@ pub fn view(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) -> El {
         .child(table);
     let mut metrics = row()
         .key("map-controls")
-        .h(40.0)
-        .px(10.0)
-        .gap(4.0)
-        .items_center();
+        .w(182.0)
+        .h(24.0)
+        .radius(if p.look.era() == crate::theme::Era::Modern {
+            5.0
+        } else {
+            0.0
+        })
+        .fill(p.look.raised);
     for m in Metric::ALL {
+        let active = s.metric == m;
+        let mut segment = el()
+            .key(m.column())
+            .role("radio")
+            .label(m.title())
+            .grow(1.0)
+            .h(24.0)
+            .center()
+            .radius(if p.look.era() == crate::theme::Era::Modern {
+                4.0
+            } else {
+                0.0
+            });
+        if active {
+            let mut indicator = el()
+                .key("metric-indicator")
+                .matched("metric-indicator")
+                .pin(Some(0.), Some(0.), Some(0.), Some(0.))
+                .radius(if p.look.era() == crate::theme::Era::Modern {
+                    4.0
+                } else {
+                    0.0
+                })
+                .fill(p.look.background)
+                .border(1.0, p.look.line)
+                .motion(rune::tok::motion::SNAPPY)
+                .inert();
+            if matches!(
+                p.look.era(),
+                crate::theme::Era::WindowsBevel | crate::theme::Era::UnixBevel
+            ) {
+                indicator = shell::bevel(indicator, p, true).fill(p.look.raised);
+            }
+            segment = segment.child(indicator);
+        }
         metrics = metrics.child(
-            shell::shell_button(p, m.column(), m.title(), s.metric == m).on_press(
-                move |a: &mut App| {
+            p.kit
+                .interactive(segment)
+                .press_scale(0.98)
+                .child(
+                    text(m.title())
+                        .font(p.look.font(11.0, 500.0))
+                        .color(p.look.text),
+                )
+                .on_press(move |a: &mut App| {
                     a.activity.metric = m;
                     rebuild(&mut a.activity);
-                },
-            ),
+                }),
         );
     }
-    if !s.scope.is_empty() {
-        metrics = metrics.child(
-            shell::shell_button(p, "map-back", "Back", false)
+    let back_label = if s.scope.is_empty() {
+        "All applications".to_string()
+    } else {
+        format!(
+            "Back to {}",
+            if s.scope.len() == 1 {
+                "all applications"
+            } else {
+                "parent"
+            }
+        )
+    };
+    let back_link = row()
+        .key("map-back-row")
+        .w_full()
+        .h(32.0)
+        .px(6.0)
+        .items_center()
+        .child(
+            shell::shell_button(p, "map-back", &back_label, false)
+                .disabled(s.scope.is_empty())
+                .opacity(if s.scope.is_empty() { 0.55 } else { 1.0 })
                 .on_press(|a: &mut App| back(&mut a.activity)),
         );
-    }
     let detail = selected(s);
     let mut details = col()
         .key("process-details")
@@ -928,17 +997,22 @@ pub fn view(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) -> El {
         .grow(1.0)
         .min_w(0.0)
         .min_h(0.0)
-        .child(shell::pane_title(
-            p,
-            "map-title",
-            &format!("{} by application", s.metric.title()),
-            None,
-            s.map_focused,
-        ))
-        .child(metrics)
+        .child(
+            el().w_full()
+                .h(30.0)
+                .child(shell::pane_title(
+                    p,
+                    "map-title",
+                    &format!("{} by application", s.metric.title()),
+                    None,
+                    s.map_focused,
+                ))
+                .child(metrics.pin(None, Some(3.0), Some(8.0), None)),
+        )
+        .child(back_link)
         .child(
             text(if s.metric == Metric::Memory {
-                "Area = physical footprint · Double-click to explore"
+                "Area = physical footprint · Includes compressed memory"
             } else {
                 "Area = measured usage · Double-click to explore"
             })
@@ -952,13 +1026,13 @@ pub fn view(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) -> El {
                 .key("treemap")
                 .grow(1.0)
                 .min_h(0.0)
-                .padding(10.0)
+                .padding(8.0)
                 .child(tiles(
                     &visible(s),
                     s,
                     p,
-                    map_size[0] as f64 - 20.0,
-                    map_size[1] as f64 - 20.0,
+                    map_size[0] as f64 - 16.0,
+                    map_size[1] as f64 - 16.0,
                     0,
                     None,
                 )),

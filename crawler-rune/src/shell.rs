@@ -7,10 +7,10 @@ use crate::app::{App, Paint, Section};
 use crate::theme::Era;
 use crate::{funnel, settings, transfers};
 
-pub const SECTION_BAR_H: f32 = 40.0;
-pub const STATUS_BAR_H: f32 = 24.0;
+pub const SECTION_BAR_H: f32 = 46.0;
+pub const STATUS_BAR_H: f32 = 26.0;
 /// Room for the traffic lights at the bar's leading edge.
-const LIGHTS_INSET: f32 = 80.0;
+const LIGHTS_INSET: f32 = 86.0;
 
 pub struct Toast {
     pub text: String,
@@ -21,7 +21,16 @@ pub struct Toast {
 /// then the Open menu, the command palette and keyboard help.
 pub fn section_bar(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) -> El {
     let inset = cx.titlebar_inset().max(LIGHTS_INSET);
-    let mut buttons = row().key("sections").gap(4.0).items_center();
+    let mut buttons = row()
+        .key("sections")
+        .gap(
+            if matches!(p.look.era(), Era::WindowsBevel | Era::UnixBevel) {
+                4.0
+            } else {
+                2.0
+            },
+        )
+        .items_center();
     for section in Section::ALL {
         buttons = buttons.child(
             shell_button(p, section.key(), section.title(), app.section == section)
@@ -40,8 +49,8 @@ pub fn section_bar(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) 
         .pr(10.0)
         .items_center()
         .justify_between()
-        .fill(p.look.sidebar)
-        .border_sides([0.0, 0.0, 1.0, 0.0], p.look.line)
+        .fill(p.look.chrome())
+        .border_sides([0.0, 0.0, 1.0, 0.0], p.look.separator())
         .window_drag()
         .child(buttons)
         .child(
@@ -49,7 +58,13 @@ pub fn section_bar(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) 
                 .key("section-bar-trailing")
                 .gap(6.0)
                 .items_center()
-                .child(crate::opening::open_menu(app, p, layer))
+                .child(
+                    if matches!(app.section, Section::Search | Section::Folders) {
+                        crate::opening::open_menu(app, p, layer)
+                    } else {
+                        el()
+                    },
+                )
                 .child(settings::bar_buttons(app, p, layer)),
         )
 }
@@ -72,39 +87,226 @@ fn shell_button_with_icon(
     place: Option<PlaceKind>,
 ) -> El {
     let l = &p.look;
-    let base = el()
+    let section = Section::ALL.into_iter().find(|s| s.key() == key);
+    let is_shell = section.is_some() || place.is_some();
+    let ink = if active {
+        l.selection_text
+    } else if !is_shell || l.era() == Era::Modern {
+        l.muted
+    } else {
+        l.text
+    };
+    let fill = if active {
+        l.selection
+    } else if is_shell && matches!(l.era(), Era::WindowsBevel | Era::UnixBevel) {
+        l.raised
+    } else {
+        rune::Color::TRANSPARENT
+    };
+    let mut base = el()
         .key(key.to_string())
         .role("button")
         .label(label.to_string())
         .focusable(false)
-        .h(26.0)
-        .px(8.0)
+        .h(28.0)
+        .px(if place.is_some() || section.is_some() {
+            11.0
+        } else {
+            8.0
+        })
         .center();
-    let (fill, ink) = match (l.era(), active) {
-        (Era::Modern, true) => (l.selection, l.selection_text),
-        (Era::Classic | Era::Terminal, true) => (l.accent, l.accent_text),
-        (Era::WindowsBevel | Era::UnixBevel, true) => (l.raised, l.text),
-        (Era::WindowsBevel | Era::UnixBevel, false) => (l.raised, l.text),
-        (_, false) => (rune::Color::TRANSPARENT, l.muted),
-    };
-    let base = match l.era() {
+    base = match l.era() {
         Era::Modern => base.radius(6.0),
-        Era::WindowsBevel | Era::UnixBevel => bevel(base, p, active),
+        Era::WindowsBevel | Era::UnixBevel if is_shell => bevel(base, p, active),
+        Era::WindowsBevel | Era::UnixBevel => base,
         Era::Classic | Era::Terminal => base,
     };
-    let mut content = row().gap(5.0).items_center();
+    // A matched background preserves the sliding section indicator across reparenting.
+    if active && section.is_some() {
+        let inset = if matches!(l.era(), Era::WindowsBevel | Era::UnixBevel) {
+            2.0
+        } else {
+            0.0
+        };
+        base = base.child(
+            el().key("section-indicator")
+                .matched("section-indicator")
+                .pin(Some(inset), Some(inset), Some(inset), Some(inset))
+                .radius(if l.era() == Era::Modern { 6.0 } else { 0.0 })
+                .fill(fill)
+                .motion(rune::tok::motion::SNAPPY)
+                .inert(),
+        );
+    } else {
+        base = base.fill(fill);
+    }
+    let mut content = row().gap(4.0).items_center();
     if let Some(kind) = place {
-        content = content.child(place_icon(kind, ink));
+        content = content.child(shell_icon(p, kind.into(), active, 18.0));
     }
-    if let Some(section) = Section::ALL.into_iter().find(|s| s.key() == key) {
-        content = content.child(section_icon(section, ink));
+    if let Some(section) = section {
+        content = content.child(shell_icon(p, section.into(), active, 18.0));
     }
-    content = content.child(text(label).font(p.look.font(11.0, 500.0)).color(ink));
+    let action = match key {
+        "folder-back" | "map-back" => Some(ControlIcon::Back),
+        "folder-forward" => Some(ControlIcon::Forward),
+        "folder-refresh" | "airdrop-refresh" | "refresh-editors" => Some(ControlIcon::Refresh),
+        "activity-pause" => Some(if active {
+            ControlIcon::Play
+        } else {
+            ControlIcon::Pause
+        }),
+        "airdrop-choose" => Some(ControlIcon::Add),
+        "airdrop-send" => Some(ControlIcon::Send),
+        "airdrop-clear" => Some(ControlIcon::Close),
+        "commands-button" => Some(ControlIcon::Command),
+        "help-button" => Some(ControlIcon::Help),
+        "open-editor-menu" => Some(ControlIcon::Down),
+        _ => None,
+    };
+    if key.starts_with("eject-") {
+        content = content.child(shell_icon(p, ShellIcon::Eject, false, 18.0));
+    } else if let Some(icon) = action {
+        content = content.child(control_icon(icon, ink, 14.0));
+    }
+    let icon_only = key.starts_with("eject-")
+        || matches!(
+            key,
+            "folder-back"
+                | "folder-forward"
+                | "folder-refresh"
+                | "commands-button"
+                | "help-button"
+                | "open-editor-menu"
+        );
+    if !icon_only {
+        content = content.child(
+            text(label)
+                .font(l.font(
+                    if section.is_some() || place.is_some() {
+                        12.0
+                    } else {
+                        11.0
+                    },
+                    if active { 600.0 } else { 500.0 },
+                ))
+                .color(ink),
+        );
+    }
     p.kit
-        .interactive(base.fill(fill))
+        .interactive(base)
         .motion(rune::tok::motion::SNAPPY)
         .press_scale(0.98)
         .child(content)
+}
+
+/// Small action symbols share a fourteen-point coordinate system.
+#[derive(Clone, Copy)]
+pub enum ControlIcon {
+    Back,
+    Forward,
+    Down,
+    Refresh,
+    Pause,
+    Play,
+    Add,
+    Send,
+    Close,
+    Command,
+    Help,
+    Document,
+}
+pub fn control_icon(kind: ControlIcon, ink: rune::Color, size: f32) -> El {
+    use ControlIcon::*;
+    let lines: Vec<Vec<[f32; 2]>> = match kind {
+        Back => vec![vec![[9., 2.], [4., 7.], [9., 12.]]],
+        Forward => vec![vec![[5., 2.], [10., 7.], [5., 12.]]],
+        Down => vec![vec![[3., 5.], [7., 9.], [11., 5.]]],
+        Pause => vec![vec![[5., 3.], [5., 11.]], vec![[9., 3.], [9., 11.]]],
+        Play => vec![vec![[4., 2.], [11., 7.], [4., 12.], [4., 2.]]],
+        Add => vec![vec![[7., 2.], [7., 12.]], vec![[2., 7.], [12., 7.]]],
+        Send => vec![
+            vec![[7., 12.], [7., 2.], [3., 6.]],
+            vec![[7., 2.], [11., 6.]],
+        ],
+        Close => vec![vec![[3., 3.], [11., 11.]], vec![[3., 11.], [11., 3.]]],
+        Refresh => vec![
+            vec![
+                [11., 5.],
+                [9., 2.],
+                [5., 2.],
+                [2., 5.],
+                [2., 9.],
+                [5., 12.],
+                [9., 12.],
+                [12., 9.],
+            ],
+            vec![[11., 1.], [11., 5.], [7., 5.]],
+        ],
+        Help => vec![
+            circle_points(7., 7., 5.5),
+            vec![[5., 5.], [6., 4.], [8., 4.], [9., 5.], [9., 6.], [7., 8.]],
+            vec![[7., 10.], [7., 10.5]],
+        ],
+        Command => vec![vec![
+            [5., 5.],
+            [3., 5.],
+            [2., 4.],
+            [2., 3.],
+            [3., 2.],
+            [4., 2.],
+            [5., 3.],
+            [5., 11.],
+            [4., 12.],
+            [3., 12.],
+            [2., 11.],
+            [2., 10.],
+            [3., 9.],
+            [11., 9.],
+            [12., 10.],
+            [12., 11.],
+            [11., 12.],
+            [10., 12.],
+            [9., 11.],
+            [9., 3.],
+            [10., 2.],
+            [11., 2.],
+            [12., 3.],
+            [12., 4.],
+            [11., 5.],
+            [5., 5.],
+        ]],
+        Document => vec![
+            vec![
+                [3., 1.],
+                [8., 1.],
+                [11., 4.],
+                [11., 13.],
+                [3., 13.],
+                [3., 1.],
+            ],
+            vec![[8., 1.], [8., 4.], [11., 4.]],
+        ],
+    };
+    let mut shape = rune::Shape::new();
+    for line in lines {
+        shape = shape.stroke(
+            line.into_iter()
+                .map(|[x, y]| [x * size / 14., y * size / 14.])
+                .collect::<Vec<_>>(),
+            1.1,
+            ink,
+        );
+    }
+    el().size(size, size).shape(shape).inert()
+}
+fn circle_points(x: f32, y: f32, radius: f32) -> Vec<[f32; 2]> {
+    (0..=32)
+        .map(|i| {
+            let a = i as f32 * std::f32::consts::TAU / 32.;
+            [x + radius * a.cos(), y + radius * a.sin()]
+        })
+        .collect()
 }
 
 /// A raised bevel, or a pressed one when `down`.
@@ -141,76 +343,95 @@ pub fn bevel(e: El, p: &Paint, down: bool) -> El {
 /// the way its theme marks an active window. No focus rings around panes.
 pub fn pane_title(p: &Paint, key: &str, title: &str, detail: Option<&str>, active: bool) -> El {
     let l = &p.look;
+    let ink = pane_title_ink(p, active);
+    let mut strip = pane_strip(p, key, active);
+    if l.era() == Era::Modern {
+        strip = strip.child(
+            el().size(6.0, 6.0)
+                .radius(3.0)
+                .fill(if active { l.accent } else { l.line })
+                .inert(),
+        );
+    }
+    let mut content = row()
+        .gap(8.0)
+        .items_center()
+        .min_w(0.0)
+        .child(text(title).font(l.font(12.0, 600.0)).color(ink).truncate());
+    if let Some(detail) = detail {
+        content = content.child(
+            text(detail)
+                .font(l.font(11.0, 400.0))
+                .color(ink.alpha(0.72))
+                .truncate()
+                .min_w(0.0),
+        );
+    }
+    if active && l.era() == Era::Classic {
+        content = content.fill(l.background).px(6.0);
+    }
+    strip.child(content)
+}
+
+/// Shared strip decoration for pane owners that compose their own title content.
+pub fn pane_strip(p: &Paint, key: &str, active: bool) -> El {
+    let l = &p.look;
     let mut strip = row()
         .key(key.to_string())
         .w_full()
-        .h(26.0)
-        .px(10.0)
+        .h(30.0)
+        .px(12.0)
         .gap(8.0)
         .items_center()
-        .border_sides([0.0, 0.0, 1.0, 0.0], l.line);
-    let mut ink = l.text;
+        .border_sides([0.0, 0.0, 1.0, 0.0], l.separator());
     strip = match (l.era(), active) {
         (Era::Classic, true) => {
-            for y in [5.0, 8.0, 11.0, 14.0, 17.0, 20.0] {
-                strip = strip.child(el().absolute(0.0, y).w_full().h(1.0).fill(l.text).inert());
+            for y in (8..23).step_by(2) {
+                strip = strip.child(
+                    el().pin(Some(4.0), Some(y as f32), Some(4.0), None)
+                        .h(1.0)
+                        .fill(l.text)
+                        .inert(),
+                );
             }
-            strip.fill(l.raised)
+            strip.fill(l.background)
         }
-        (Era::WindowsBevel, true) => {
-            ink = rune::Color::WHITE;
-            strip.linear_gradient(
-                std::f32::consts::FRAC_PI_2,
-                &[(0.0, l.accent), (1.0, crate::theme::rgb(0x1084d0))],
-            )
-        }
-        (Era::UnixBevel, true) => {
-            ink = l.accent_text;
-            strip.fill(l.accent)
-        }
-        (Era::Terminal, true) => {
-            ink = l.accent_text;
-            strip.fill(l.accent)
-        }
+        (Era::WindowsBevel, true) => strip.linear_gradient(
+            std::f32::consts::FRAC_PI_2,
+            &[(0.0, l.accent), (1.0, crate::theme::rgb(0x1084d0))],
+        ),
+        (Era::WindowsBevel, false) => strip.fill(crate::theme::rgb(0x808080)),
+        (Era::UnixBevel | Era::Terminal, true) => strip.fill(l.accent),
+        (Era::Terminal, false) => strip.fill(l.sidebar),
         _ => strip.fill(l.raised),
     };
-    if active && l.era() == Era::Modern {
-        strip = strip.child(
-            el().key("active-dot")
-                .size(6.0, 6.0)
-                .radius(3.0)
-                .fill(l.accent)
-                .transition(Transition::opacity()),
-        );
-    }
-    let title = text(title).font(l.font(12.0, 600.0)).color(ink).truncate();
-    strip = strip.child(if active && l.era() == Era::Classic {
-        title.fill(l.raised).px(6.0)
-    } else {
-        title
-    });
-    if let Some(detail) = detail {
-        let detail = text(detail)
-            .font(l.font(11.0, 500.0))
-            .color(if active && l.era() != Era::Modern {
-                ink
-            } else {
-                l.muted
-            })
-            .truncate();
-        strip = strip.child(if active && l.era() == Era::Classic {
-            detail.fill(l.raised).px(6.0)
-        } else {
-            detail
-        });
-    }
     strip
+}
+pub fn pane_title_ink(p: &Paint, active: bool) -> rune::Color {
+    match (p.look.era(), active) {
+        (Era::WindowsBevel, true) => rune::Color::WHITE,
+        (Era::Classic, false) => crate::theme::rgb(0x808080),
+        (Era::WindowsBevel, false) => crate::theme::rgb(0xd4d0c8),
+        (Era::Terminal | Era::UnixBevel, true) => p.look.accent_text,
+        (_, true) => p.look.text,
+        (_, false) => p.look.muted,
+    }
 }
 
 /// The funnel's status and key hints (or Activity's) on the left, the running copy on the right.
 pub fn status_bar(app: &App, p: &Paint) -> El {
     let left = match app.section {
-        Section::Search | Section::Folders => funnel::status_line(app),
+        Section::Search | Section::Folders => {
+            let line = funnel::status_line(app);
+            let hints = "NAVIGATE    j/k Files    h/l Scope    / Search    Space Preview    ↵ Open";
+            if let Some((status, _)) = line.split_once(" · ↑↓") {
+                format!("{status}    {hints}")
+            } else if line.starts_with("Recent files ·") {
+                hints.to_string()
+            } else {
+                line
+            }
+        }
         Section::Activity => crate::activity::hints(app),
         Section::Transfers | Section::Settings => String::new(),
     };
@@ -223,7 +444,7 @@ pub fn status_bar(app: &App, p: &Paint) -> El {
         .items_center()
         .justify_between()
         .fill(p.look.sidebar)
-        .border_sides([1.0, 0.0, 0.0, 0.0], p.look.line)
+        .border_sides([1.0, 0.0, 0.0, 0.0], p.look.separator())
         .child(
             text(left)
                 .key("status-left")
@@ -252,16 +473,22 @@ pub fn toasts(app: &App, p: &Paint, layer: &mut Vec<El>) {
     for (i, t) in app.toasts.iter().enumerate() {
         stack = stack.child(
             el().key(format!("toast-{i}"))
+                .w(450.0)
+                .min_h(43.0)
                 .px(14.0)
-                .py(8.0)
-                .radius(8.0)
+                .py(12.0)
+                .radius(if p.look.era() == Era::Modern {
+                    8.0
+                } else {
+                    0.0
+                })
                 .fill(p.look.raised)
                 .border(1.0, p.look.line)
                 .shadow(6.0, 18.0, rune::Color::BLACK.alpha(0.18))
                 .transition(Transition::opacity().combined(Transition::offset(0.0, 8.0)))
                 .child(
                     text(t.text.as_str())
-                        .font(p.look.font(13.0, 400.0))
+                        .font(p.look.font(12.0, 400.0))
                         .color(p.look.text),
                 ),
         );
@@ -279,157 +506,101 @@ pub enum PlaceKind {
     Drive,
 }
 
-/// Theme-coloured vector icons for the funnel's places bar.
-pub fn place_icon(kind: PlaceKind, c: rune::Color) -> El {
-    let shape = match kind {
-        PlaceKind::Home => rune::Shape::new()
-            .stroke(vec![[1.0, 7.0], [7.0, 2.0], [13.0, 7.0]], 1.2, c)
-            .stroke(
-                vec![[3.0, 6.0], [3.0, 13.0], [11.0, 13.0], [11.0, 6.0]],
-                1.2,
-                c,
-            ),
-        PlaceKind::Downloads => rune::Shape::new()
-            .stroke(
-                vec![[7.0, 1.0], [7.0, 9.0], [4.0, 6.0], [7.0, 9.0], [10.0, 6.0]],
-                1.2,
-                c,
-            )
-            .stroke(
-                vec![[2.0, 10.0], [2.0, 13.0], [12.0, 13.0], [12.0, 10.0]],
-                1.2,
-                c,
-            ),
-        PlaceKind::Desktop => rune::Shape::new()
-            .stroke(
-                vec![
-                    [1.0, 2.0],
-                    [13.0, 2.0],
-                    [13.0, 10.0],
-                    [1.0, 10.0],
-                    [1.0, 2.0],
-                ],
-                1.2,
-                c,
-            )
-            .stroke(
-                vec![[7.0, 10.0], [7.0, 13.0], [4.0, 13.0], [10.0, 13.0]],
-                1.2,
-                c,
-            ),
-        PlaceKind::Pin => rune::Shape::new()
-            .stroke(
-                vec![
-                    [4.0, 2.0],
-                    [11.0, 2.0],
-                    [10.0, 7.0],
-                    [12.0, 9.0],
-                    [3.0, 9.0],
-                    [5.0, 7.0],
-                    [4.0, 2.0],
-                ],
-                1.2,
-                c,
-            )
-            .stroke(vec![[7.0, 9.0], [7.0, 14.0]], 1.2, c),
-        PlaceKind::Drive => rune::Shape::new()
-            .stroke(
-                vec![
-                    [2.0, 2.0],
-                    [12.0, 2.0],
-                    [13.0, 12.0],
-                    [1.0, 12.0],
-                    [2.0, 2.0],
-                ],
-                1.2,
-                c,
-            )
-            .stroke(vec![[3.0, 9.0], [11.0, 9.0]], 1.2, c),
-        PlaceKind::Folder => rune::Shape::new().stroke(
-            vec![
-                [1.0, 3.0],
-                [6.0, 3.0],
-                [8.0, 5.0],
-                [13.0, 5.0],
-                [13.0, 12.0],
-                [1.0, 12.0],
-                [1.0, 3.0],
-            ],
-            1.2,
-            c,
-        ),
-    };
-    el().size(14.0, 14.0).shape(shape).inert()
+/// The Swift ShellIcons artwork at 2x, laid out as twelve roles by eleven themes and two states.
+/// Keeping its native symbols and pixel artwork avoids substituting a different icon family.
+#[derive(Clone, Copy)]
+pub enum ShellIcon {
+    Home,
+    Folder,
+    Downloads,
+    Desktop,
+    Pin,
+    Drive,
+    AirDrop,
+    Activity,
+    Preferences,
+    Search = 10,
+    Eject,
 }
-fn section_icon(section: Section, c: rune::Color) -> El {
-    let shape = match section {
-        Section::Search => rune::Shape::new()
-            .stroke(vec![[9.0, 9.0], [13.0, 13.0]], 1.3, c)
-            .stroke(
-                vec![
-                    [6.0, 1.0],
-                    [9.5, 2.5],
-                    [11.0, 6.0],
-                    [9.5, 9.5],
-                    [6.0, 11.0],
-                    [2.5, 9.5],
-                    [1.0, 6.0],
-                    [2.5, 2.5],
-                    [6.0, 1.0],
-                ],
-                1.3,
-                c,
-            ),
-        Section::Folders => rune::Shape::new().stroke(
-            vec![
-                [1.0, 3.0],
-                [6.0, 3.0],
-                [8.0, 5.0],
-                [13.0, 5.0],
-                [13.0, 12.0],
-                [1.0, 12.0],
-                [1.0, 3.0],
-            ],
-            1.2,
-            c,
-        ),
-        Section::Activity => rune::Shape::new().stroke(
-            vec![
-                [0.0, 8.0],
-                [3.0, 8.0],
-                [5.0, 2.0],
-                [8.0, 13.0],
-                [10.0, 6.0],
-                [12.0, 8.0],
-                [14.0, 8.0],
-            ],
-            1.2,
-            c,
-        ),
-        Section::Transfers => rune::Shape::new()
-            .stroke(
-                vec![[1.0, 5.0], [12.0, 5.0], [9.0, 2.0], [12.0, 5.0], [9.0, 8.0]],
-                1.2,
-                c,
-            )
-            .stroke(
-                vec![
-                    [13.0, 10.0],
-                    [2.0, 10.0],
-                    [5.0, 7.0],
-                    [2.0, 10.0],
-                    [5.0, 13.0],
-                ],
-                1.2,
-                c,
-            ),
-        Section::Settings => rune::Shape::new()
-            .stroke(vec![[1.0, 3.0], [13.0, 3.0]], 1.2, c)
-            .stroke(vec![[1.0, 7.0], [13.0, 7.0]], 1.2, c)
-            .stroke(vec![[1.0, 11.0], [13.0, 11.0]], 1.2, c)
-            .stroke(vec![[4.0, 1.0], [4.0, 5.0]], 2.5, c)
-            .stroke(vec![[10.0, 5.0], [10.0, 9.0]], 2.5, c)
-            .stroke(vec![[6.0, 9.0], [6.0, 13.0]], 2.5, c),
-    };
-    el().size(14.0, 14.0).shape(shape).inert()
+impl From<PlaceKind> for ShellIcon {
+    fn from(kind: PlaceKind) -> Self {
+        match kind {
+            PlaceKind::Home => Self::Home,
+            PlaceKind::Downloads => Self::Downloads,
+            PlaceKind::Desktop => Self::Desktop,
+            PlaceKind::Folder => Self::Folder,
+            PlaceKind::Pin => Self::Pin,
+            PlaceKind::Drive => Self::Drive,
+        }
+    }
+}
+impl From<Section> for ShellIcon {
+    fn from(section: Section) -> Self {
+        match section {
+            Section::Search => Self::Search,
+            Section::Folders => PlaceKind::Folder.into(),
+            Section::Activity => Self::Activity,
+            Section::Transfers => Self::AirDrop,
+            Section::Settings => Self::Preferences,
+        }
+    }
+}
+pub fn shell_icon(p: &Paint, kind: ShellIcon, selected: bool, size: f32) -> El {
+    let theme = crate::theme::Theme::ALL
+        .iter()
+        .position(|t| *t == p.look.theme)
+        .unwrap_or(0);
+    let index = (theme * 2 + usize::from(selected)) * 12 + kind as usize;
+    match shell_artwork().get(index) {
+        Some(pixels) => el().size(size, size).pixels(pixels).inert(),
+        None => el().size(size, size).inert(),
+    }
+}
+fn shell_artwork() -> &'static [rune::Pixels] {
+    static ARTWORK: std::sync::OnceLock<Vec<rune::Pixels>> = std::sync::OnceLock::new();
+    ARTWORK.get_or_init(|| {
+        use objc2_app_kit::{NSBitmapFormat, NSBitmapImageRep};
+        use objc2_foundation::NSData;
+        let data = NSData::with_bytes(include_bytes!("shell-icons.png"));
+        let Some(bitmap) = NSBitmapImageRep::imageRepWithData(&data) else {
+            return Vec::new();
+        };
+        let stride = bitmap.bytesPerRow() as usize;
+        if bitmap.pixelsWide() != 480
+            || bitmap.pixelsHigh() != 880
+            || bitmap.samplesPerPixel() != 4
+            || bitmap.bitsPerSample() != 8
+            || bitmap.bitmapData().is_null()
+        {
+            return Vec::new();
+        }
+        // SAFETY: the decoded bitmap owns all 880 rows for this scope; stride comes from AppKit.
+        let bytes = unsafe { std::slice::from_raw_parts(bitmap.bitmapData(), stride * 880) };
+        let straight = bitmap
+            .bitmapFormat()
+            .contains(NSBitmapFormat::AlphaNonpremultiplied);
+        (0..264)
+            .map(|index| {
+                let mut rgba = Vec::with_capacity(40 * 40 * 4);
+                for y in 0..40 {
+                    let start = (index / 12 * 40 + y) * stride + (index % 12 * 40) * 4;
+                    rgba.extend_from_slice(&bytes[start..start + 160]);
+                }
+                if !straight {
+                    for px in rgba.chunks_exact_mut(4) {
+                        let alpha = u32::from(px[3]);
+                        for channel in &mut px[..3] {
+                            *channel = (u32::from(*channel) * 255 + alpha / 2)
+                                .checked_div(alpha)
+                                .unwrap_or(0)
+                                .min(255) as u8;
+                        }
+                    }
+                }
+                let pixels = rune::Pixels::new();
+                pixels.set(40, 40, rgba);
+                pixels
+            })
+            .collect()
+    })
 }

@@ -39,17 +39,18 @@ impl Metric {
         if self == Self::Cpu {
             return format!("{value:.1}%");
         }
-        let suffix = if self == Self::Disk { "/s" } else { "" };
-        let (div, unit) = if value >= 1073741824.0 {
-            (1073741824.0, "GB")
-        } else if value >= 1048576.0 {
-            (1048576.0, "MB")
-        } else if value >= 1024.0 {
-            (1024.0, "KB")
+        use objc2_foundation::{NSByteCountFormatter, NSByteCountFormatterCountStyle};
+        let count = value.clamp(0.0, (i64::MAX - 1024) as f64) as i64;
+        let bytes = NSByteCountFormatter::stringFromByteCount_countStyle(
+            count,
+            NSByteCountFormatterCountStyle::Memory,
+        )
+        .to_string();
+        if self == Self::Disk {
+            format!("{bytes}/s")
         } else {
-            (1.0, "B")
-        };
-        format!("{:.1} {unit}{suffix}", value / div)
+            bytes
+        }
     }
 }
 
