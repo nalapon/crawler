@@ -1,6 +1,5 @@
 prototype/.impeccable/review/
 .DS_Store
-.build/
 build/
 dist/
 artifacts/
