@@ -1108,40 +1108,37 @@ pub fn on_key(app: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
         _ => false,
     }
 }
+/// Status text for the status bar: the funnel state, then Swift's spaced key-hint groups.
 pub fn status_line(app: &App) -> String {
+    const GAP: &str = "    ";
+    const NAVIGATE: &str =
+        "NAVIGATE    j/k Files    h/l Scope    / Search    Space Preview    ↵ Open";
+    const SEARCH: &str = "SEARCH    Esc Navigate    Ctrl D/U Half page    ↵ Open";
     let s = session(app);
     if browsing(app) {
-        let state = app.funnel.library.listing(&s.folder);
-        return match state {
+        return match app.funnel.library.listing(&s.folder) {
             None | Some(Listing::Loading) => "Loading folder…".into(),
             Some(Listing::Failed(e)) => e.clone(),
-            Some(Listing::Ready(_)) => format!(
-                "NAVIGATE{} · j/k Files · h/l Scope · / Search · Space Preview · ↵ Open",
-                if s.selected.len() > 1 {
-                    format!(" · {} selected", s.selected.len())
-                } else {
-                    String::new()
-                }
-            ),
+            Some(Listing::Ready(_)) if s.selected.len() > 1 => {
+                format!("{} selected{GAP}{NAVIGATE}", s.selected.len())
+            }
+            Some(Listing::Ready(_)) => NAVIGATE.into(),
         };
     }
-    if s.searching() {
-        if let crate::index::Status::Failed(error) = app.index.status() {
-            return error;
-        }
-        if !s.usable || s.rows.is_empty() && !s.complete {
-            "Searching… · Esc Navigate · Ctrl D/U Half page · ↵ Open".into()
-        } else if s.rows.len() >= 100 {
-            "Showing the best 100 results · Narrow your search".into()
-        } else {
-            format!(
-                "{} results · Esc Navigate · Ctrl D/U Half page · ↵ Open",
-                s.rows.len()
-            )
-        }
-    } else {
-        "SEARCH · Esc Navigate · Ctrl D/U Half page · ↵ Open".into()
+    if !s.searching() {
+        return SEARCH.into();
     }
+    if let crate::index::Status::Failed(error) = app.index.status() {
+        return error;
+    }
+    let state = if !s.usable || s.rows.is_empty() && !s.complete {
+        "Searching…".to_string()
+    } else if s.rows.len() >= 100 {
+        "Showing the best 100 results · Narrow your search".to_string()
+    } else {
+        format!("{} results", s.rows.len())
+    };
+    format!("{state}{GAP}{SEARCH}")
 }
 
 pub fn view(app: &App, cx: &mut Cx<App>, p: &Paint, _layer: &mut Vec<El>) -> El {
@@ -2035,14 +2032,8 @@ fn context_pane(app: &App, p: &Paint) -> El {
 
 fn place(app: &App, p: &Paint, key: &str, label: &str, path: PathBuf, kind: PlaceKind) -> El {
     let dest = path.clone();
-    let home = crate::app::home();
-    let active = [home.clone(), home.join("Downloads"), home.join("Desktop")]
-        .into_iter()
-        .chain(app.funnel.pinned.iter().map(|f| f.0.clone()))
-        .chain(app.funnel.mounted.iter().map(|v| v.path.clone()))
-        .filter(|candidate| session(app).folder.0.starts_with(candidate))
-        .max_by_key(|candidate| candidate.components().count())
-        .is_some_and(|selected| selected == path);
+    // Swift lights a place only when it is exactly the current folder.
+    let active = session(app).folder.0 == path;
     crate::shell::place_button(p, key, label, active, kind)
         .on_press_tx(move |a: &mut App, tx| open_folder(a, path.clone(), tx))
         .on_drop_files(move |a: &mut App, files, tx| {

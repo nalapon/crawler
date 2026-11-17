@@ -356,15 +356,22 @@ pub fn pane_title(p: &Paint, key: &str, title: &str, detail: Option<&str>, activ
     let mut content = row()
         .gap(8.0)
         .items_center()
-        .min_w(0.0)
-        .child(text(title).font(l.font(12.0, 600.0)).color(ink).truncate());
+        .shrink()
+        // The detail elides first; the title keeps up to ~220 pt, like Swift's strip.
+        .child(
+            text(title)
+                .font(l.font(12.0, 600.0))
+                .color(ink)
+                .truncate()
+                .min_w((title.chars().count() as f32 * 7.5).min(220.0)),
+        );
     if let Some(detail) = detail {
         content = content.child(
             text(detail)
                 .font(l.font(11.0, 400.0))
                 .color(ink.alpha(0.72))
                 .truncate()
-                .min_w(0.0),
+                .shrink(),
         );
     }
     if active && l.era() == Era::Classic {
@@ -421,17 +428,7 @@ pub fn pane_title_ink(p: &Paint, active: bool) -> rune::Color {
 /// The funnel's status and key hints (or Activity's) on the left, the running copy on the right.
 pub fn status_bar(app: &App, p: &Paint) -> El {
     let left = match app.section {
-        Section::Search | Section::Folders => {
-            let line = funnel::status_line(app);
-            let hints = "NAVIGATE    j/k Files    h/l Scope    / Search    Space Preview    ↵ Open";
-            if let Some((status, _)) = line.split_once(" · ↑↓") {
-                format!("{status}    {hints}")
-            } else if line.starts_with("Recent files ·") {
-                hints.to_string()
-            } else {
-                line
-            }
-        }
+        Section::Search | Section::Folders => funnel::status_line(app),
         Section::Activity => crate::activity::hints(app),
         Section::Transfers | Section::Settings => String::new(),
     };
