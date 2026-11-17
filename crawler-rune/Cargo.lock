@@ -715,11 +715,13 @@ dependencies = [
 name = "crawler"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "block2 0.6.2",
  "cc",
  "core-foundation 0.10.1",
  "fff-query-parser",
  "fff-search",
+ "foldhash 0.2.0",
  "libc",
  "mach2",
  "memmap2",

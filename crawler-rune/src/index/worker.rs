@@ -7,9 +7,10 @@ use super::{
     snapshot::{self, Snapshot},
     watcher::{self, Events, Watcher},
 };
+use foldhash::{HashSet, HashSetExt};
 use serde_json::{Value, json};
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::VecDeque,
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -43,6 +44,7 @@ pub(super) enum Message {
     },
     CacheBatch {
         job: u64,
+        position: usize,
         batch: Arc<Snapshot>,
     },
     CacheDone {
@@ -128,6 +130,9 @@ struct Worker {
     complete: bool,
     failure: Option<String>,
     cache_loaded: bool,
+    cache_legacy: bool,
+    cache_identity: Option<cache::Identity>,
+    loaded_blocks: HashSet<usize>,
     loading: bool,
     cache_cancel: Arc<AtomicBool>,
     cache_job: u64,
@@ -148,6 +153,7 @@ struct Worker {
     idle_at: Option<Instant>,
     serial: u64,
     scoring: bool,
+    score_at: Option<Instant>,
     dirty: bool,
     queries: VecDeque<(Key, Response, bool)>,
     report: Value,
@@ -196,6 +202,9 @@ pub(super) fn run(
         complete: false,
         failure: None,
         cache_loaded: false,
+        cache_legacy: false,
+        cache_identity: None,
+        loaded_blocks: HashSet::new(),
         loading: false,
         cache_cancel: Arc::new(AtomicBool::new(false)),
         cache_job: 0,
@@ -216,6 +225,7 @@ pub(super) fn run(
         idle_at: None,
         serial: 0,
         scoring: false,
+        score_at: None,
         dirty: false,
         queries: VecDeque::new(),
         samples: VecDeque::new(),
@@ -226,7 +236,15 @@ pub(super) fn run(
     };
     let mut history_loaded = false;
     loop {
-        match receive.recv_timeout(Duration::from_millis(50)) {
+        let timeout =
+            worker
+                .score_at
+                .filter(|_| !worker.scoring)
+                .map_or(Duration::from_millis(50), |at| {
+                    at.saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(50))
+                });
+        match receive.recv_timeout(timeout) {
             Ok(Message::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                 worker.release();
                 break;
@@ -268,6 +286,8 @@ impl Worker {
         self.report["query_cache_entries"] = json!(self.queries.len());
         self.report["physical_footprint_bytes"] = json!(physical_footprint());
         self.report["cache_loaded"] = json!(self.cache_loaded);
+        self.report["indexed_event_id"] = json!(self.event.map(|event| event.id));
+        self.report["latest_event_id"] = json!(self.latest_event);
         self.report["stages"] = json!(self.samples);
         let waker = if let Ok(mut state) = self.shared.lock() {
             let changed = status.as_ref().is_some_and(|s| s != &state.status)
@@ -347,6 +367,7 @@ impl Worker {
                 self.report["idle_released"] = json!(false);
                 self.epoch.fetch_add(1, Ordering::AcqRel);
                 self.scoring = false;
+                self.score_at = None;
                 let key = Key {
                     query,
                     boosts: cache::boosts(&self.history),
@@ -462,12 +483,33 @@ impl Worker {
                 }
             }
             Message::WarmBatch { job, batch }
-                if self.active.is_some() && job == self.cache_job && !self.complete =>
+                if self.active.is_some()
+                    && job == self.cache_job
+                    && !self.complete
+                    && self.loaded_blocks.is_empty() =>
             {
                 self.append(batch);
             }
-            Message::CacheBatch { job, batch } if self.loading && job == self.cache_job => {
-                self.append(batch);
+            Message::CacheBatch {
+                job,
+                position,
+                batch,
+            } if self.loading && job == self.cache_job => {
+                if !self.loaded_blocks.insert(position) {
+                    return;
+                }
+                // Saved batches are disjoint. Only the small warm listing can overlap;
+                // do not build a second million-row table while restoring the cache.
+                let batch = self.unique.as_ref().map_or_else(
+                    || Some(Arc::clone(&batch)),
+                    |warm| warm.without_existing(Arc::clone(&batch)),
+                );
+                if let Some(batch) = batch {
+                    self.batches.push(batch);
+                    self.invalidate();
+                    self.schedule_index_score();
+                    self.status();
+                }
             }
             Message::CacheDone {
                 job,
@@ -478,10 +520,12 @@ impl Worker {
             } if self.loading && job == self.cache_job => {
                 self.loading = false;
                 self.cache_loaded = true;
+                self.unique = None;
                 self.report["cache_load_ms"] = json!(milliseconds);
                 if let Some(warning) = warning {
                     self.report["cache_error"] = json!(warning);
                 }
+                self.dirty = true;
                 if event != self.cache_expected || (!valid && self.cache_expected.is_some()) {
                     self.fallback("cache changed");
                 } else if self.replay.is_none() {
@@ -492,10 +536,7 @@ impl Worker {
                     };
                     self.begin_scan(changes);
                 }
-                self.dirty = true;
-                if !self.scoring {
-                    self.score();
-                }
+                self.schedule_index_score();
                 self.status();
             }
             Message::Scan {
@@ -526,7 +567,8 @@ impl Worker {
                             let behind = self
                                 .event
                                 .map_or(0.0, |e| e.date - self.saved.map_or(0.0, |s| s.date));
-                            if changed || !scan.incremental || behind > 3600.0 {
+                            if changed || !scan.incremental || behind > 3600.0 || self.cache_legacy
+                            {
                                 self.persist();
                             }
                             if changed
@@ -667,7 +709,7 @@ impl Worker {
                     self.scoring = false;
                 }
                 if final_pass && self.dirty {
-                    self.score();
+                    self.schedule_index_score();
                     return;
                 }
                 let cacheable = response.complete && final_pass;
@@ -689,6 +731,7 @@ impl Worker {
                 self.report["cache_save_error"] = json!(error);
                 if error.is_none() {
                     self.saved = event;
+                    self.cache_legacy = false;
                 }
                 self.notify(None, None);
             }
@@ -728,9 +771,7 @@ impl Worker {
         if let Some(addition) = addition {
             self.batches.push(addition);
             self.invalidate();
-            if !self.scoring {
-                self.score();
-            }
+            self.schedule_index_score();
             self.status();
         }
     }
@@ -772,12 +813,26 @@ impl Worker {
                 });
             });
         let reader = Reader::open(&self.cache_file, &self.root).map(|mut reader| {
+            if self.cache_identity != Some(reader.identity) {
+                // Only an atomically replaced cache invalidates a partial restore.
+                // The visible Response keeps its hits until the new query publishes.
+                self.batches.clear();
+                self.unique = None;
+                self.loaded_blocks.clear();
+                self.invalidate();
+            }
+            self.cache_identity = Some(reader.identity);
+            self.report["cache_reused_batches"] = json!(self.loaded_blocks.len());
+            reader.skip_loaded(&self.loaded_blocks);
             if let Some(active) = &self.active {
                 reader.prioritize(&active.key.query.text);
             }
             reader
         });
+        self.cache_legacy = reader.as_ref().is_ok_and(|r| r.legacy);
         self.saved = reader.as_ref().ok().and_then(|r| r.event);
+        self.report["cache_version"] = json!(if self.cache_legacy { 4 } else { 5 });
+        self.report["saved_event_id"] = json!(self.saved.map(|e| e.id));
         self.cache_expected = self.saved;
         self.event = self.saved;
         let saved = self.saved.filter(|e| {
@@ -817,8 +872,15 @@ impl Worker {
                             return;
                         }
                         match reader.next() {
-                            Ok(Some(batch)) => {
-                                if tx.send(Message::CacheBatch { job, batch }).is_err() {
+                            Ok(Some((position, batch))) => {
+                                if tx
+                                    .send(Message::CacheBatch {
+                                        job,
+                                        position,
+                                        batch,
+                                    })
+                                    .is_err()
+                                {
                                     return;
                                 }
                             }
@@ -876,11 +938,7 @@ impl Worker {
                 continue;
             }
             if relative.split('/').any(|p| p.starts_with('.'))
-                || Path::new(relative)
-                    .ancestors()
-                    .skip(1)
-                    .filter_map(Path::to_str)
-                    .any(|p| self.excluded.contains(p))
+                || discovery::parent_contains(relative, &self.excluded)
             {
                 continue;
             }
@@ -935,9 +993,13 @@ impl Worker {
             self.complete = true;
             if self.watch_active && self.latest_event > self.event.map_or(0, |e| e.id) {
                 self.event = Some(Event::now(self.latest_event));
-                if self.saved.is_none_or(|e| cache::now() - e.date > 3600.0) {
-                    self.persist();
-                }
+            }
+            if self.cache_legacy
+                || self
+                    .event
+                    .is_some_and(|e| e.date - self.saved.map_or(0.0, |s| s.date) > 3600.0)
+            {
+                self.persist();
             }
             self.restart();
             self.status();
@@ -1095,11 +1157,32 @@ impl Worker {
         self.scoring = false;
         self.score();
     }
+    fn schedule_index_score(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        // The first usable result and every typed query still start immediately.
+        // Coalesce index arrivals after that result, rather than rescoring the
+        // growing cache dozens of times before its restore finishes.
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| !active.first_result)
+        {
+            if !self.scoring {
+                self.score();
+            }
+        } else if self.active.is_some() {
+            self.score_at
+                .get_or_insert_with(|| Instant::now() + Duration::from_millis(40));
+        }
+    }
     fn score(&mut self) {
         if self.scoring {
             self.dirty = true;
             return;
         }
+        self.score_at = None;
         let Some(active) = &self.active else {
             return;
         };
@@ -1245,6 +1328,7 @@ impl Worker {
     }
     fn pause(&mut self) {
         self.active = None;
+        self.score_at = None;
         self.epoch.fetch_add(1, Ordering::AcqRel);
         self.scoring = false;
         if self.loading {
@@ -1278,6 +1362,8 @@ impl Worker {
         self.complete = false;
         self.failure = None;
         self.cache_loaded = false;
+        self.cache_identity = None;
+        self.loaded_blocks.clear();
         self.pending.clear();
         self.excluded.clear();
         self.queries.clear();
@@ -1287,6 +1373,9 @@ impl Worker {
         self.status();
     }
     fn tick(&mut self) {
+        if !self.scoring && self.score_at.is_some_and(|at| at <= Instant::now()) {
+            self.score();
+        }
         if self.active.is_some()
             && self
                 .supplement_refresh_at

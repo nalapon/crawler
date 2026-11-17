@@ -1,7 +1,8 @@
 use super::snapshot::{BATCH, Snapshot, equal};
+use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use objc2_foundation::{NSArray, NSNumber, NSString, NSURL, NSURLIsPackageKey};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::VecDeque,
     fs,
     hash::{BuildHasher, Hasher},
     path::{Path, PathBuf},
@@ -34,12 +35,15 @@ struct Directory {
 }
 pub struct Paths {
     batches: Vec<Arc<Snapshot>>,
-    hash: std::collections::hash_map::RandomState,
+    hash: foldhash::fast::RandomState,
     locations: HashMap<u64, (u32, u16)>,
     collisions: HashMap<u64, Vec<(u32, u16)>>,
 }
 impl Paths {
     pub fn new(batches: &[Arc<Snapshot>]) -> Self {
+        Self::selected(batches, None)
+    }
+    fn selected(batches: &[Arc<Snapshot>], prefixes: Option<&HashSet<String>>) -> Self {
         let mut this = Self {
             batches: batches.to_vec(),
             hash: Default::default(),
@@ -48,7 +52,10 @@ impl Paths {
         };
         for (batch, value) in batches.iter().enumerate() {
             for row in 0..value.len() {
-                this.insert(value.path(row), (batch as u32, row as u16));
+                let path = value.path(row);
+                if prefixes.is_none_or(|prefixes| ancestors_contain(path, prefixes)) {
+                    this.insert(path, (batch as u32, row as u16));
+                }
             }
         }
         this
@@ -85,7 +92,7 @@ impl Paths {
             }
         }
     }
-    pub fn append_unique(&mut self, batch: Arc<Snapshot>) -> Option<Arc<Snapshot>> {
+    pub fn without_existing(&self, batch: Arc<Snapshot>) -> Option<Arc<Snapshot>> {
         let rows: Vec<_> = (0..batch.len())
             .filter(|&r| self.find(batch.path(r)).is_none())
             .collect();
@@ -102,6 +109,10 @@ impl Paths {
                     .collect::<Vec<_>>(),
             ))
         };
+        Some(batch)
+    }
+    pub fn append_unique(&mut self, batch: Arc<Snapshot>) -> Option<Arc<Snapshot>> {
+        let batch = self.without_existing(batch)?;
         let id = self.batches.len();
         for row in 0..batch.len() {
             self.insert(batch.path(row), (id as u32, row as u16));
@@ -267,7 +278,6 @@ fn scan(
     cancel: &Arc<AtomicBool>,
     progress: &(impl Fn(Progress) + Send + Sync),
 ) -> Result<Scan, String> {
-    let old = Paths::new(previous);
     let mut seen: Vec<Vec<bool>> = previous.iter().map(|b| vec![false; b.len()]).collect();
     let mut excluded = HashSet::new();
     let mut pending = VecDeque::new();
@@ -280,14 +290,8 @@ fn scan(
             if cancel.load(Ordering::Relaxed) {
                 return Err("cancelled".into());
             }
-            if closed_ancestor(root, path, &mut memo, &mut excluded) {
-                continue;
-            }
-            if Path::new(path)
-                .ancestors()
-                .skip(1)
-                .filter_map(Path::to_str)
-                .any(|a| changes.contains(a))
+            if parent_contains(path, changes)
+                || closed_ancestor(root, path, &mut memo, &mut excluded)
             {
                 continue;
             }
@@ -316,6 +320,7 @@ fn scan(
     } else {
         pending.push_back(String::new());
     }
+    let old = Paths::selected(previous, changes.as_ref().map(|_| &prefixes));
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(8)
         .thread_name(|i| format!("crawler-read-{i}"))
@@ -488,12 +493,19 @@ fn scan(
     })
 }
 pub fn ancestors_contain(path: &str, paths: &HashSet<String>) -> bool {
-    paths.contains(path)
-        || Path::new(path)
-            .ancestors()
-            .skip(1)
-            .filter_map(Path::to_str)
-            .any(|p| paths.contains(p))
+    !paths.is_empty() && (paths.contains(path) || parent_contains(path, paths))
+}
+pub fn parent_contains(path: &str, paths: &HashSet<String>) -> bool {
+    if paths.is_empty() {
+        return false;
+    }
+    // A slash is always a UTF-8 boundary. No Path component parsing or allocations.
+    for (at, &byte) in path.as_bytes().iter().enumerate().rev() {
+        if byte == b'/' && paths.contains(&path[..at]) {
+            return true;
+        }
+    }
+    paths.contains("")
 }
 pub fn alias_scope(scope: &Path) -> bool {
     fs::canonicalize(scope).is_ok_and(|resolved| resolved != scope)

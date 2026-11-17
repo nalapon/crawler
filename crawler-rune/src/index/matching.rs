@@ -5,7 +5,8 @@ use fff_search::{
 };
 use rayon::prelude::*;
 use std::{
-    collections::{BTreeMap, HashMap},
+    cell::RefCell,
+    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -13,15 +14,23 @@ use std::{
     },
 };
 use unicode_normalization::UnicodeNormalization;
-pub type Boosts = HashMap<String, i16>;
+pub enum Boosts {
+    Sparse(Vec<(String, i16)>),
+    Indexed(foldhash::HashMap<String, i16>),
+}
 pub fn boosts(values: &[(String, i16)], root: &Path) -> Boosts {
-    values
+    let relative = values
         .iter()
         .filter_map(|(path, value)| {
             let relative = Path::new(path).strip_prefix(root).ok()?.to_str()?;
             Some((relative.nfc().collect(), *value))
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if relative.len() <= 8 {
+        Boosts::Sparse(relative)
+    } else {
+        Boosts::Indexed(relative.into_iter().collect())
+    }
 }
 use super::{
     Hit, Query, Response, Scope,
@@ -153,8 +162,33 @@ pub fn batch(
     boosts: &Boosts,
     literal: bool,
 ) -> Matches {
-    let mut files = Vec::with_capacity(batch.len());
-    let mut rows = Vec::with_capacity(batch.len());
+    INPUTS.with_borrow_mut(|inputs| {
+        batch_with_inputs(batch, query, root, exclude, boosts, literal, inputs)
+    })
+}
+
+// FFF scoring never reads file contents or mutates these metadata fields. Reuse
+// one bounded input allocation per matching thread, without keeping a FileItem
+// for every indexed path or retaining an arena after a query ends.
+#[derive(Default)]
+struct Inputs {
+    files: Vec<FileItem>,
+    rows: Vec<usize>,
+}
+thread_local! {
+    static INPUTS: RefCell<Inputs> = RefCell::default();
+}
+fn batch_with_inputs(
+    batch: &Arc<Snapshot>,
+    query: &Query,
+    root: &Path,
+    exclude: Option<&Path>,
+    boosts: &Boosts,
+    literal: bool,
+    inputs: &mut Inputs,
+) -> Matches {
+    let Inputs { files, rows } = inputs;
+    rows.clear();
     let scope = match &query.scope {
         Scope::Mac => None,
         Scope::Under(p) => p.strip_prefix(root).ok().and_then(Path::to_str),
@@ -166,37 +200,64 @@ pub fn batch(
         .and_then(|p| p.strip_prefix(root).ok())
         .and_then(Path::to_str);
     for row in 0..batch.len() {
-        let path = batch.path(row);
-        if scope.is_some_and(|s| !s.is_empty() && !descendant(path, s))
-            || excluded.is_some_and(|s| descendant(path, s))
-        {
+        if (scope.is_some_and(|s| !s.is_empty()) || excluded.is_some()) && {
+            let path = batch.path(row);
+            scope.is_some_and(|s| !s.is_empty() && !descendant(path, s))
+                || excluded.is_some_and(|s| descendant(path, s))
+        } {
             continue;
         }
         let prepared = &batch.paths[row];
-        let mut file = FileItem::new_raw(prepared.filename_offset, 0, 0, None, false);
-        set_path(&mut file, prepared.clone());
-        file.access_frecency_score = if path.is_ascii() {
-            boosts.get(path).copied()
-        } else {
-            boosts.get(&path.nfc().collect::<String>()).copied()
+        let position = rows.len();
+        if position == files.len() {
+            files.push(FileItem::new_raw(0, 0, 0, None, false));
         }
-        .unwrap_or(0);
-        files.push(file);
+        let file = &mut files[position];
+        set_path(file, prepared.clone());
+        file.access_frecency_score = 0;
         rows.push(row);
     }
+    let files = &mut files[..rows.len()];
     if files.is_empty() {
         return Matches::default();
+    }
+    match boosts {
+        // Normal history is sparse. Avoid hashing every indexed path for a handful
+        // of visits; keep the lookup bounded when the history grows.
+        Boosts::Sparse(boosts) => {
+            for (path, boost) in boosts {
+                for (file, &row) in files.iter_mut().zip(rows.iter()) {
+                    let original = batch.path(row);
+                    if original == path || (!batch.ascii(row) && original.nfc().eq(path.chars())) {
+                        file.access_frecency_score = *boost;
+                    }
+                }
+            }
+        }
+        Boosts::Indexed(boosts) => {
+            for (file, &row) in files.iter_mut().zip(rows.iter()) {
+                let path = batch.path(row);
+                file.access_frecency_score = if batch.ascii(row) {
+                    boosts.get(path)
+                } else {
+                    boosts.get(&path.nfc().collect::<String>())
+                }
+                .copied()
+                .unwrap_or(0);
+            }
+        }
     }
     let parser = QueryParser::new(MixedSearchConfig);
     let parsed = parsed(&parser, &query.text, literal);
     let context = context(&parsed, &query.text);
     let arena = batch.arena();
     let (items, scores, total) =
-        fuzzy_match_and_score_files(&files, &context, files.len(), arena, arena);
+        fuzzy_match_and_score_files(files, &context, files.len(), arena, arena);
     let mut result = Matches {
         total,
         ..Matches::default()
     };
+    let mut counts = foldhash::HashMap::default();
     for (position, (item, score)) in items.into_iter().zip(scores).enumerate() {
         // The matcher returns references into this exact, unmoved files allocation.
         let index = (std::ptr::from_ref(item) as usize - files.as_ptr() as usize)
@@ -209,11 +270,7 @@ pub fn batch(
             .unwrap_or(path)
             .trim_start_matches('/');
         if let Some((child, _)) = relative.split_once('/') {
-            let base = match &query.scope {
-                Scope::Mac => root,
-                Scope::Under(p) => p,
-            };
-            *result.counts.entry(base.join(child)).or_default() += 1;
+            *counts.entry(child).or_insert(0usize) += 1;
         }
         if position < 100 {
             result.hits.push(Ranked {
@@ -223,6 +280,14 @@ pub fn batch(
             });
         }
     }
+    let base = match &query.scope {
+        Scope::Mac => root,
+        Scope::Under(p) => p,
+    };
+    result.counts = counts
+        .into_iter()
+        .map(|(child, count)| (base.join(child), count))
+        .collect();
     result
 }
 pub fn descendant(path: &str, scope: &str) -> bool {
