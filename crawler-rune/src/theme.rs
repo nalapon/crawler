@@ -210,9 +210,25 @@ impl Look {
             Theme::WindowsRetro => Family::Named("Tahoma"),
             Theme::LinuxRetro => Family::Named("Helvetica"),
             Theme::Terminal => Family::Named("IBM Plex Mono"),
-            _ => Family::Sans,
+            _ => Family::Named("System Font"),
         };
         TextStyle::new(size, weight).family(family)
+    }
+
+    /// Cupertino's titlebar material resolves to this neutral gray in the reference captures.
+    pub fn chrome(&self) -> Color {
+        if self.theme == Theme::Cupertino {
+            rgb(0xe4e4e4)
+        } else {
+            self.sidebar
+        }
+    }
+    pub fn separator(&self) -> Color {
+        if self.era() == Era::Classic {
+            Color::BLACK
+        } else {
+            self.line
+        }
     }
 
     /// The rune-kit components' tokens, derived from the same semantic roles as the shell.

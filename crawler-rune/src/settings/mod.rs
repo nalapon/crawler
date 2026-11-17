@@ -9,8 +9,11 @@ use crate::{
 use rune::{
     Cx, El, FileDialogOptions, Key, KeyEvent, Latest, TextEdit, Tx, Waker, col, el, row, text,
 };
-use rune_kit::{Dialog, Select, SelectAppearance, TextInput};
-use std::path::{Path, PathBuf};
+use rune_kit::TextInput;
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Page {
@@ -58,7 +61,9 @@ pub struct State {
     context: platform::Context,
     request: Latest<platform::Context>,
     font_theme: Option<Theme>,
-    editor_open: bool,
+    icon_paths: Vec<PathBuf>,
+    editor_icons: HashMap<PathBuf, rune::Pixels>,
+    icon_request: Latest<HashMap<PathBuf, rune::Pixels>>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -72,12 +77,15 @@ impl Default for State {
             context: platform::Context::default(),
             request: Latest::default(),
             font_theme: None,
-            editor_open: false,
+            icon_paths: Vec::new(),
+            editor_icons: HashMap::new(),
+            icon_request: Latest::default(),
         }
     }
 }
 pub fn setup(app: &mut App, waker: &Waker) {
     app.settings.request.set_waker(waker.clone());
+    app.settings.icon_request.set_waker(waker.clone());
 }
 pub fn poll(app: &mut App, tx: &mut Tx) -> bool {
     let theme = app.theme_preview.unwrap_or(app.theme);
@@ -89,11 +97,25 @@ pub fn poll(app: &mut App, tx: &mut Tx) -> bool {
             Theme::WindowsRetro => "Tahoma",
             Theme::LinuxRetro => "Helvetica",
             Theme::Terminal => "IBM Plex Mono",
-            _ => "Inter",
+            _ => "System Font",
         };
         tx.set_font_families(family, "IBM Plex Mono");
     }
     let mut changed = false;
+    let paths: Vec<_> = app.opening.editors.iter().map(|e| e.path.clone()).collect();
+    if paths != app.settings.icon_paths {
+        app.settings.icon_paths = paths.clone();
+        app.settings.icon_request.request(paths, |paths| {
+            paths
+                .into_iter()
+                .filter_map(|path| platform::application_icon(&path).map(|icon| (path, icon)))
+                .collect()
+        });
+    }
+    if let Some(icons) = app.settings.icon_request.take() {
+        app.settings.editor_icons = icons;
+        changed = true;
+    }
     if let Some(context) = app.settings.request.take() {
         app.settings.context = context;
         changed = app.settings.open;
@@ -585,6 +607,7 @@ pub fn bar_buttons(_app: &App, p: &Paint, _layer: &mut Vec<El>) -> El {
         )
 }
 pub fn overlays(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) {
+    let size = cx.layout_size("workspace").unwrap_or([1050.0, 760.0]);
     if app.settings.open {
         let title = match app.settings.page {
             Page::Commands => "Commands",
@@ -595,11 +618,13 @@ pub fn overlays(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) {
         };
         let input = TextInput::new(&app.settings.query)
             .placeholder(if app.settings.page == Page::Commands {
-                "What would you like to do?"
+                "Type a command…"
             } else {
                 "Filter choices…"
             })
             .label(title)
+            .plain()
+            .text_style(p.look.font(21.0, 400.0))
             .height(34.0)
             .on_edit(|a: &mut App| &mut a.settings.query)
             .on_change(|a: &mut App, tx| {
@@ -631,9 +656,35 @@ pub fn overlays(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) {
                             } else {
                                 rune::Color::TRANSPARENT
                             })
+                            .child(match &c.action {
+                                Action::Section(section) => {
+                                    shell::shell_icon(p, (*section).into(), active, 19.0)
+                                }
+                                Action::Folder(_)
+                                | Action::ChooseFolder
+                                | Action::Pin
+                                | Action::ChoosePin => {
+                                    shell::shell_icon(p, shell::ShellIcon::Folder, active, 19.0)
+                                }
+                                Action::AirDrop => {
+                                    shell::shell_icon(p, shell::ShellIcon::AirDrop, active, 19.0)
+                                }
+                                Action::Help => {
+                                    shell::control_icon(shell::ControlIcon::Help, p.look.text, 19.0)
+                                }
+                                _ => shell::control_icon(
+                                    shell::ControlIcon::Command,
+                                    if active {
+                                        p.look.selection_text
+                                    } else {
+                                        p.look.muted
+                                    },
+                                    19.0,
+                                ),
+                            })
                             .child(
                                 text(&c.title)
-                                    .font(p.look.font(14.0, 500.0))
+                                    .font(p.look.font(15.0, 500.0))
                                     .color(if active {
                                         p.look.selection_text
                                     } else {
@@ -681,41 +732,86 @@ pub fn overlays(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) {
                     .padding(12.0),
             );
         }
+        let top = (size[1] * 0.12).min(100.0);
+        let height = (size[1] - top - 24.0).min(540.0);
+        let width = (size[0] - 48.0).min(640.0);
         let body = col()
-            .w_full()
-            .min_h(0.0)
-            .gap(10.0)
-            .px(16.0)
-            .pb(12.0)
-            .child(input)
+            .key("commands-dialog")
+            .role("dialog")
+            .label(title)
+            .w(width)
+            .h(height)
+            .radius(if p.look.era() == Era::Modern {
+                18.0
+            } else {
+                0.0
+            })
+            .fill(p.look.background)
+            .border(1.0, p.look.line)
+            .shadow(8.0, 24.0, rune::Color::BLACK.alpha(0.18))
+            .transition(rune::Transition::opacity().combined(rune::Transition::offset(0.0, -6.0)))
+            .motion(rune::tok::motion::SNAPPY)
+            .child(
+                col()
+                    .w_full()
+                    .h(66.0)
+                    .px(22.0)
+                    .pt(16.0)
+                    .border_sides([0., 0., 1., 0.], p.look.line)
+                    .child(input),
+            )
+            .child(
+                text(title)
+                    .font(p.look.font(11.0, 500.0))
+                    .color(p.look.muted)
+                    .h(20.0)
+                    .mx(24.0)
+                    .mt(11.0),
+            )
             .child(
                 col()
                     .key("command-results")
-                    .h(220.0)
+                    .w(width - 32.0)
+                    .grow(1.0)
+                    .min_h(0.0)
+                    .mx(16.0)
+                    .mt(6.0)
+                    .mb(8.0)
                     .scroll(rune::ScrollSpec {
                         stick_bottom: false,
                     })
                     .child(rows),
             )
             .child(
-                text("↑ ↓ Select    ↵ Run    Esc Back / close")
-                    .font(p.look.font(11.0, 400.0))
-                    .color(p.look.muted),
-            );
-        Dialog::new("commands", title)
-            .open(true)
-            .width(660.0)
-            .fit()
-            .on_close(close_palette)
-            .child(body)
-            .build(&p.kit, layer);
+                row()
+                    .w_full()
+                    .h(42.0)
+                    .px(24.0)
+                    .items_center()
+                    .justify_end()
+                    .border_sides([1., 0., 0., 0.], p.look.line)
+                    .child(
+                        text(if app.settings.page == Page::Themes {
+                            "Apply theme   ↵"
+                        } else {
+                            "Run command   ↵"
+                        })
+                        .font(p.look.font(11.0, 500.0))
+                        .color(p.look.text),
+                    ),
+            )
+            .modal(true, close_palette);
+        layer.push(
+            el().key("commands-layer")
+                .absolute((size[0] - width) / 2.0, top)
+                .child(body),
+        );
     }
     if app.show_help {
-        let height = cx.layout_size("workspace").map_or(760.0, |size| size[1]);
-        help_sheet(app, p, layer, (height - 140.0).max(180.0));
+        help_sheet(app, p, layer, size);
     }
 }
-fn help_sheet(app: &App, p: &Paint, layer: &mut Vec<El>, max_height: f32) {
+fn help_sheet(app: &App, p: &Paint, layer: &mut Vec<El>, size: [f32; 2]) {
     let mut entries = vec![
         ("⌘1 … ⌘4", "Search, Folders, Activity, Transfers"),
         ("⌘,", "Settings"),
@@ -760,79 +856,129 @@ fn help_sheet(app: &App, p: &Paint, layer: &mut Vec<El>, max_height: f32) {
         ]);
     }
     entries.push(("⌘?", "Toggle this sheet"));
+    let height = (66.0 + entries.len() as f32 * 21.0).min(size[1] - 76.0);
     let mut body = col()
         .key("shortcut-entries")
-        .max_h(max_height)
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
         .scroll(rune::ScrollSpec {
             stick_bottom: false,
         })
-        .gap(5.0)
         .px(18.0)
-        .pb(18.0);
+        .pb(13.0);
     for (keys, action) in entries {
         body = body.child(
             row()
-                .gap(12.0)
+                .w_full()
+                .h(21.0)
+                .gap(4.0)
                 .items_center()
                 .child(
                     text(keys)
-                        .w(140.0)
+                        .w(104.0)
                         .font(p.look.font(11.0, 500.0))
                         .color(p.look.text),
                 )
                 .child(
                     text(action)
                         .font(p.look.font(11.0, 400.0))
-                        .color(p.look.muted),
+                        .color(p.look.muted)
+                        .truncate(),
                 ),
         );
     }
-    Dialog::new("shortcuts", "Keyboard shortcuts")
-        .open(true)
-        .width(480.0)
-        .fit()
-        .on_close(|a: &mut App| a.show_help = false)
+    let panel = col()
+        .key("shortcuts-dialog")
+        .role("dialog")
+        .label("Keyboard shortcuts")
+        .w(344.0)
+        .h(height)
+        .radius(if p.look.era() == Era::Modern {
+            12.0
+        } else {
+            0.0
+        })
+        .fill(p.look.background)
+        .border(1.0, p.look.line)
+        .shadow(6.0, 20.0, rune::Color::BLACK.alpha(0.14))
+        .transition(rune::Transition::opacity().combined(rune::Transition::offset(0.0, 6.0)))
+        .motion(rune::tok::motion::SNAPPY)
+        .child(
+            row()
+                .w_full()
+                .h(53.0)
+                .px(18.0)
+                .items_center()
+                .justify_between()
+                .child(
+                    text("Keyboard shortcuts")
+                        .font(p.look.font(14.0, 600.0))
+                        .color(p.look.text),
+                )
+                .child(
+                    p.kit
+                        .interactive(
+                            el().key("shortcut-close")
+                                .role("button")
+                                .label("Close shortcuts")
+                                .size(28.0, 28.0)
+                                .center(),
+                        )
+                        .press_scale(0.98)
+                        .child(shell::control_icon(
+                            shell::ControlIcon::Close,
+                            p.look.muted,
+                            14.0,
+                        ))
+                        .on_press(|a: &mut App| a.show_help = false),
+                ),
+        )
         .child(body)
-        .build(&p.kit, layer);
+        .modal(true, |a: &mut App| a.show_help = false);
+    layer.push(
+        el().key("shortcuts-layer")
+            .absolute((size[0] - 362.0).max(12.0), size[1] - height - 18.0)
+            .child(panel),
+    );
 }
 
 fn theme_tile(theme: Theme, selected: bool, p: &Paint) -> El {
     let look = theme.look();
-    let mut miniature = col()
+    let radius = if theme.era() == Era::Modern { 4.0 } else { 0.0 };
+    let mut miniature = el()
         .key("miniature")
         .size(72.0, 44.0)
-        .radius(if theme.era() == Era::Modern { 4.0 } else { 0.0 })
+        .radius(radius)
+        .clip_rounded(radius)
         .fill(look.background)
-        .border(1.0, look.line)
-        .child(
-            row()
-                .h(10.0)
-                .w_full()
-                .fill(look.sidebar)
-                .px(4.0)
-                .items_center()
-                .child(el().size(14.0, 4.0).fill(look.selection)),
+        .child(el().absolute(0., 0.).size(72., 10.).fill(look.sidebar))
+        .child(el().absolute(5., 3.).size(14., 5.).fill(look.selection))
+        .child(el().absolute(0., 10.).size(72., 1.).fill(look.line))
+        .child(el().absolute(28., 11.).size(1., 33.).fill(look.line))
+        .child(el().absolute(3., 15.).size(22., 6.).fill(look.selection));
+    for y in [25., 31., 37.] {
+        miniature = miniature.child(
+            el().absolute(4., y)
+                .size(18., 2.)
+                .fill(look.muted.alpha(0.55)),
         );
-    let mut lines = col().grow(1.0).padding(4.0).gap(4.0);
-    for width in [28.0, 28.0, 28.0, 18.0] {
-        lines = lines.child(el().w(width).h(2.0).fill(look.text.alpha(0.7)));
     }
-    miniature = miniature.child(
-        row()
-            .grow(1.0)
-            .child(
-                col()
-                    .w(28.0)
-                    .h_full()
-                    .padding(3.0)
-                    .gap(4.0)
-                    .border_sides([0.0, 1.0, 0.0, 0.0], look.line)
-                    .child(el().w_full().h(5.0).fill(look.selection))
-                    .child(el().size(18.0, 2.0).fill(look.muted))
-                    .child(el().size(18.0, 2.0).fill(look.muted)),
-            )
-            .child(lines),
-    );
+    for (i, width) in [34., 34., 34., 22.].into_iter().enumerate() {
+        miniature = miniature.child(
+            el().absolute(33., 16. + i as f32 * 6.)
+                .size(width, 2.)
+                .fill(look.text.alpha(0.7)),
+        );
+    }
+    miniature = miniature
+        .child(el().absolute(33., 40.).size(12., 3.).fill(look.accent))
+        .child(
+            el().pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                .radius(radius)
+                .border(1.0, look.separator())
+                .inert(),
+        );
     p.kit
         .interactive(
             row()
@@ -885,10 +1031,11 @@ fn theme_tile(theme: Theme, selected: bool, p: &Paint) -> El {
             a.set_theme(theme);
         })
 }
-pub fn view(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) -> El {
+pub fn view(app: &App, cx: &mut Cx<App>, p: &Paint, _layer: &mut Vec<El>) -> El {
     let heading = |title: &str, detail: &str| {
         col()
-            .gap(8.0)
+            .h(46.0)
+            .gap(4.0)
             .child(
                 text(title)
                     .font(p.look.font(15.0, 600.0))
@@ -901,19 +1048,17 @@ pub fn view(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) -> El {
                     .wrap(),
             )
     };
-    let mut content=col().key("settings-content").w_full().max_w(972.0).padding(36.0).gap(12.0)
+    let mut content=col().key("settings-content").w_full().max_w(972.0).px(36.0).pt(32.0).pb(36.0).gap(12.0)
         .child(heading("Theme","Colours, controls and lines for the whole window. Retro themes use square edges and classic bevels."));
     let width = cx
         .layout_size("settings-scroll")
         .map_or(1180.0, |size| size[0]);
-    let columns = (((width - 72.0).clamp(560.0, 900.0) + 12.0) / 212.0) as usize;
+    let content_width = (width - 72.0).clamp(560.0, 900.0);
+    let columns = ((content_width + 12.0) / 212.0) as usize;
     for themes in Theme::ALL.chunks(columns) {
-        let mut line = row().w_full().gap(12.0);
+        let mut line = row().w_full().equal_columns(columns).gap(12.0);
         for theme in themes {
             line = line.child(theme_tile(*theme, *theme == app.theme, p));
-        }
-        for _ in themes.len()..columns {
-            line = line.child(el().grow(1.0));
         }
         content = content.child(line);
     }
@@ -922,60 +1067,107 @@ pub fn view(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) -> El {
             "Default text editor",
             "Code and plain text open with this app, as do files you send from the reader with E.",
         )
-        .mt(24.0),
+        .mt(30.0),
     );
-    let mut options = vec!["System default".to_string()];
-    options.extend(app.opening.editors.iter().map(|e| e.name.clone()));
-    let current = app
-        .opening
-        .default_editor
-        .as_ref()
-        .and_then(|id| app.opening.editors.iter().find(|e| &e.bundle_id == id))
-        .map_or("System default", |e| e.name.as_str());
-    let editors = Select::new("default-editor", &options)
+    let selected = opening::selected_editor(app);
+    let current = selected.map_or("No text editor found", |e| e.name.as_str());
+    let editors = el()
+        .key("default-editor")
+        .role("button")
         .label("Default text editor")
-        .appearance(SelectAppearance::Field)
-        .width(300.0)
-        .current(Some(current))
-        .open(app.settings.editor_open)
-        .on_toggle(|a: &mut App| a.settings.editor_open = !a.settings.editor_open)
-        .on_close(|a: &mut App| a.settings.editor_open = false)
-        .on_choose(|a: &mut App, name, _| {
-            let bundle = a
-                .opening
-                .editors
-                .iter()
-                .find(|e| e.name == name)
-                .map(|e| e.bundle_id.clone());
-            opening::set_default_editor(a, bundle);
-            a.settings.editor_open = false;
-        })
-        .build(&p.kit, layer);
-    content=content.child(editors)
-        .child(text(if app.opening.editors.is_empty() { "No text editor found. Installed editor discovery runs in the background.".into() } else if app.opening.default_editor.as_ref().is_some_and(|id|!app.opening.editors.iter().any(|e|&e.bundle_id==id)) { "Your saved editor is unavailable. Choose another editor above.".into() } else { format!("{} installed editors · This choice applies only in Crawler.",app.opening.editors.len()) }).font(p.look.font(11.0,400.0)).color(p.look.muted).wrap())
-        .child(heading("PDFs, Markdown and Word","PDFs, Markdown and Word documents open in Crawler's reader. Images and video use the macOS default apps.").mt(24.0));
-    col()
-        .key("settings")
-        .min_h(0.0)
-        .child(shell::pane_title(
-            p,
-            "settings-title",
-            "Settings",
-            None,
-            true,
-        ))
-        .child(
-            col()
-                .key("settings-scroll")
-                .grow(1.0)
-                .min_h(0.0)
-                .scroll(rune::ScrollSpec {
-                    stick_bottom: false,
-                })
-                .child(content),
+        .w(292.0)
+        .h(20.0)
+        .radius(5.0)
+        .fill(crate::theme::rgb(if p.look.dark {
+            0x555759
+        } else {
+            0xffffff
+        }))
+        .border(
+            0.5,
+            crate::theme::rgb(if p.look.dark { 0x646668 } else { 0xc8c8c8 }),
         )
+        .shadow(1.0, 2.0, rune::Color::BLACK.alpha(0.12))
+        .child(
+            row()
+                .w_full()
+                .h_full()
+                .px(7.0)
+                .gap(5.0)
+                .items_center()
+                .child(editor_icon(app, p, 16.0))
+                .child(
+                    text(current)
+                        .font(p.look.font(12.0, 400.0))
+                        .color(if p.look.dark {
+                            rune::Color::WHITE
+                        } else {
+                            rune::Color::BLACK
+                        })
+                        .truncate()
+                        .grow(1.0)
+                        .min_w(0.0),
+                )
+                .child(
+                    col()
+                        .w(14.0)
+                        .h(16.0)
+                        .radius(3.0)
+                        .fill(crate::theme::rgb(0x377df6))
+                        .center()
+                        .child(rune::icon(p.kit.glyph.chevron_up, 9.0).color(rune::Color::WHITE))
+                        .child(rune::icon(p.kit.glyph.chevron_down, 9.0).color(rune::Color::WHITE)),
+                ),
+        );
+    let editors = p
+        .kit
+        .interactive(editors)
+        .press_scale(0.99)
+        .disabled(app.opening.editors.is_empty())
+        .on_press_tx(|a: &mut App, tx| {
+            let mut menu = rune::PopupMenu::new();
+            for editor in &a.opening.editors {
+                menu = menu.item(
+                    rune::PopupItem::new(editor.bundle_id.clone(), editor.name.clone())
+                        .checked(opening::selected_editor(a) == Some(editor)),
+                );
+            }
+            tx.popup_menu(menu, "default-editor", |a: &mut App, picked, _| {
+                if let Some(id) = picked {
+                    opening::set_default_editor(a, Some(id.to_owned()));
+                }
+            });
+        });
+    let editors = row().h(30.0).gap(20.0).items_center().child(editors).child(
+        shell::shell_button(p, "refresh-editors", "Refresh editors", false)
+            .w(136.0)
+            .on_press(opening::refresh_editors),
+    );
+    content=content.child(editors)
+        .child(text(if app.opening.editors.is_empty() { "No text editor found. Installed editor discovery runs in the background.".into() } else if app.opening.default_editor.as_ref().is_some_and(|id|!app.opening.editors.iter().any(|e|&e.bundle_id==id)) { "Your saved editor is unavailable. Choose another editor above.".into() } else { format!("{} installed editors · This choice applies only in Crawler.",app.opening.editors.len()) }).font(p.look.font(11.0,400.0)).color(p.look.muted).wrap().h(34.0))
+        .child(heading("PDFs, Markdown and Word","PDFs, Markdown and Word documents open in Crawler's reader. Images and video use the macOS default apps.").mt(16.0));
+    col().key("settings").min_h(0.0).child(
+        col()
+            .key("settings-scroll")
+            .grow(1.0)
+            .min_h(0.0)
+            .scroll(rune::ScrollSpec {
+                stick_bottom: false,
+            })
+            .child(content),
+    )
 }
 
 pub fn palette_visible(app: &App) -> bool {
     app.settings.open
+}
+
+/// The cached icon is shared by Settings and the titlebar's Open button.
+pub fn editor_icon(app: &App, p: &Paint, size: f32) -> El {
+    opening::selected_editor(app)
+        .and_then(|editor| app.settings.editor_icons.get(&editor.path))
+        .map_or_else(
+            || shell::control_icon(shell::ControlIcon::Document, p.look.text, size),
+            |pixels| el().size(size, size).pixels(pixels).inert(),
+        )
 }

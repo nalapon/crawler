@@ -1800,7 +1800,16 @@ fn context_pane(app: &App, p: &Paint) -> El {
 }
 fn place(app: &App, p: &Paint, key: &str, label: &str, path: PathBuf, kind: PlaceKind) -> El {
     let dest = path.clone();
-    let active = session(app).folder.0 == path;
+    let current = &session(app).folder.0;
+    let home = crate::app::home();
+    let active = current.starts_with(&path)
+        && ![home.clone(), home.join("Downloads"), home.join("Desktop")]
+            .iter()
+            .chain(app.funnel.pinned.iter().map(|pin| &pin.0))
+            .chain(app.funnel.mounted.iter().map(|volume| &volume.path))
+            .any(|candidate| {
+                candidate != &path && candidate.starts_with(&path) && current.starts_with(candidate)
+            });
     crate::shell::place_button(p, key, label, active, kind)
         .on_press_tx(move |a: &mut App, tx| open_folder(a, path.clone(), tx))
         .on_drop_files(move |a: &mut App, files, tx| {
@@ -1808,15 +1817,25 @@ fn place(app: &App, p: &Paint, key: &str, label: &str, path: PathBuf, kind: Plac
         })
 }
 fn places(app: &App, p: &Paint) -> El {
+    let is_pinned = app.funnel.pinned.as_ref() == Some(&session(app).folder);
     let mut bar = row()
         .key("places-bar")
         .w_full()
-        .h(36.0)
-        .px(8.0)
-        .gap(3.0)
+        .h(44.0)
+        .px(12.0)
+        .gap(2.0)
         .items_center()
-        .fill(p.look.sidebar)
-        .border_sides([0.0, 0.0, 1.0, 0.0], p.look.line);
+        .fill(
+            if matches!(
+                p.look.era(),
+                crate::theme::Era::WindowsBevel | crate::theme::Era::UnixBevel
+            ) {
+                p.look.sidebar
+            } else {
+                p.look.background
+            },
+        )
+        .border_sides([0.0, 0.0, 1.0, 0.0], p.look.separator());
     if app.funnel.path_editing {
         return bar.child(
             TextInput::new(&app.funnel.path_edit)
@@ -1852,12 +1871,15 @@ fn places(app: &App, p: &Paint) -> El {
     bar = bar
         .child(
             crate::shell::shell_button(p, "folder-back", "‹", false)
+                .w(28.0)
                 .opacity(if app.funnel.history_at > 0 { 1.0 } else { 0.35 })
                 .help("Back · ⌘[")
                 .on_press_tx(|a: &mut App, tx| travel(a, -1, tx)),
         )
         .child(
             crate::shell::shell_button(p, "folder-forward", "›", false)
+                .w(28.0)
+                .mr(12.0)
                 .opacity(if app.funnel.history_at + 1 < app.funnel.history.len() {
                     1.0
                 } else {
@@ -1899,7 +1921,7 @@ fn places(app: &App, p: &Paint) -> El {
             "place-pinned",
             &name(&pin.0),
             pin.0.clone(),
-            PlaceKind::Folder,
+            PlaceKind::Pin,
         ));
     }
     for volume in &app.funnel.mounted {
@@ -1925,6 +1947,7 @@ fn places(app: &App, p: &Paint) -> El {
     bar.child(el().grow(1.0))
         .child(
             crate::shell::shell_button(p, "folder-refresh", "↻", false)
+                .w(28.0)
                 .help("Refresh · ⌘R")
                 .on_press(|a: &mut App| {
                     let folder = a.funnel.folders.folder.clone();
@@ -1932,9 +1955,18 @@ fn places(app: &App, p: &Paint) -> El {
                 }),
         )
         .child(
-            crate::shell::place_button(p, "folder-pin", "Pin", false, PlaceKind::Pin)
-                .help("Pin current folder")
-                .on_press(pin_current),
+            crate::shell::place_button(
+                p,
+                "folder-pin",
+                if is_pinned { "Pinned" } else { "Pin folder" },
+                false,
+                PlaceKind::Pin,
+            )
+            .w(100.0)
+            .disabled(is_pinned)
+            .opacity(if is_pinned { 0.45 } else { 1.0 })
+            .help("Pin current folder")
+            .on_press(pin_current),
         )
 }
 fn eject_volume(app: &mut App, path: PathBuf) {
