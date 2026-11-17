@@ -36,7 +36,7 @@ struct Header {
     #[serde(default)]
     signatures: bool,
 }
-struct Block {
+pub struct Block {
     bytes: std::ops::Range<usize>,
     signature: Option<std::ops::Range<usize>>,
     checksum: Option<std::ops::Range<usize>>,
@@ -162,15 +162,30 @@ impl Reader {
         self.blocks
             .retain(|block| !positions.contains(&block.bytes.start));
     }
-    pub fn next(&mut self) -> io::Result<Option<(usize, Arc<Snapshot>)>> {
-        let Some(Block {
+    /// The blocks in arrival order and what decodes one. Blocks are independent, so several
+    /// threads can take from the queue and decode at once.
+    pub fn split(self) -> (Decoder, std::collections::VecDeque<Block>) {
+        (
+            Decoder {
+                map: self.map,
+                legacy: self.legacy,
+            },
+            self.blocks,
+        )
+    }
+}
+pub struct Decoder {
+    map: Arc<Mmap>,
+    legacy: bool,
+}
+impl Decoder {
+    /// Verifies and decodes one block into its position in the file and its snapshot.
+    pub fn decode(&self, block: Block) -> io::Result<(usize, Arc<Snapshot>)> {
+        let Block {
             bytes: range,
             checksum,
             ..
-        }) = self.blocks.pop_front()
-        else {
-            return Ok(None);
-        };
+        } = block;
         if let Some(checksum) = checksum
             && blake3::hash(&self.map[range.clone()]).as_bytes() != &self.map[checksum]
         {
@@ -178,7 +193,7 @@ impl Reader {
         }
         let position = range.start;
         Snapshot::decode(Arc::clone(&self.map), range, self.legacy)
-            .map(|batch| Some((position, Arc::new(batch))))
+            .map(|batch| (position, Arc::new(batch)))
             .ok_or_else(corrupt)
     }
 }

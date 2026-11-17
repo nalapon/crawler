@@ -39,12 +39,17 @@ impl ItemID {
     }
 }
 
+/// What a path is, from its name alone. This is the only extension table: icons' labels, the
+/// Enter policy and the preview formats all read it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DocumentKind {
     Folder,
     Pdf,
     Markdown,
+    /// Word and the legacy formats converted through it (`.doc`, `.rtf`, `.odt`).
     Word,
+    /// Workbooks and delimited text shown as a grid.
+    Sheet,
     Text,
     Image,
     Video,
@@ -71,19 +76,32 @@ impl DocumentKind {
         }
         match ext.as_str() {
             "pdf" => Self::Pdf,
-            "md" | "markdown" | "mdown" => Self::Markdown,
-            "docx" | "docm" | "dotx" => Self::Word,
-            "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "tif" | "tiff" | "bmp" | "svg"
-            | "avif" => Self::Image,
-            "mp4" | "mov" | "m4v" | "mkv" | "avi" | "webm" | "mpeg" | "mpg" => Self::Video,
+            "md" | "markdown" | "mdown" | "mkd" => Self::Markdown,
+            "docx" | "docm" | "dotx" | "doc" | "rtf" | "odt" => Self::Word,
+            "xlsx" | "xlsm" | "xlsb" | "xls" | "ods" | "csv" | "tsv" => Self::Sheet,
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "heif" | "tif" | "tiff" | "bmp"
+            | "ico" | "svg" | "avif" => Self::Image,
+            "mp4" | "m4v" | "mov" | "mkv" | "webm" | "avi" | "mpg" | "mpeg" | "mts" | "m2ts"
+            | "ogv" | "wmv" | "flv" => Self::Video,
             "mp3" | "m4a" | "wav" | "flac" | "ogg" | "aiff" => Self::Audio,
-            "txt" | "text" | "log" | "rs" | "swift" | "go" | "mod" | "sum" | "js" | "jsx"
-            | "ts" | "tsx" | "json" | "yaml" | "yml" | "toml" | "xml" | "html" | "css" | "scss"
-            | "py" | "rb" | "c" | "h" | "cpp" | "hpp" | "java" | "kt" | "sh" | "zsh" | "bash"
-            | "sql" | "conf" | "ini" | "env" | "dockerfile" | "makefile" => Self::Text,
+            "txt" | "text" | "log" | "ini" | "conf" | "cfg" | "env" | "mod" | "sum" => Self::Text,
+            _ if rune_kit::syntax::lang_for_path(&path.to_string_lossy()).is_some() => Self::Text,
             _ if matches!(
-                path.file_name().and_then(|s| s.to_str()).unwrap_or(""),
-                "Makefile" | "Dockerfile" | "LICENSE" | "Gemfile" | "go.mod" | "go.sum"
+                path.file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "makefile"
+                    | "dockerfile"
+                    | "license"
+                    | "readme"
+                    | "gemfile"
+                    | ".env"
+                    | ".gitignore"
+                    | ".editorconfig"
+                    | "go.work"
+                    | "go.work.sum"
             ) =>
             {
                 Self::Text
@@ -97,6 +115,7 @@ impl DocumentKind {
             Self::Pdf => "PDF document",
             Self::Markdown => "Markdown",
             Self::Word => "Word document",
+            Self::Sheet => "Spreadsheet",
             Self::Text | Self::Other => "File",
             Self::Image => "Image",
             Self::Video => "Video",
@@ -122,8 +141,14 @@ pub struct Item {
 impl Item {
     pub fn read(path: &Path) -> Result<Self, String> {
         let path = standardized(path);
+        use std::os::macos::fs::MetadataExt;
         let link = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
         let symlink = link.is_symlink();
+        // The same rule as NSURLIsHiddenKey, read from the lstat already in hand.
+        let hidden = link.st_flags() & libc::UF_HIDDEN != 0
+            || path
+                .file_name()
+                .is_some_and(|n| n.as_encoded_bytes().starts_with(b"."));
         let meta = if symlink {
             std::fs::metadata(&path).ok()
         } else {
@@ -142,7 +167,7 @@ impl Item {
             modified: meta.as_ref().and_then(|m| m.modified().ok()),
             created: meta.as_ref().and_then(|m| m.created().ok()),
             symlink,
-            hidden: crate::opening::platform::is_hidden(&path),
+            hidden,
             highlights: Vec::new(),
             path_highlights: Vec::new(),
         })

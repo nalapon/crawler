@@ -105,6 +105,24 @@ pub fn markdown(path: &Path, cancelled: &impl Fn() -> bool) -> Result<String, St
     Ok(converter.output)
 }
 
+/// `.doc`, `.rtf` and `.odt`: macOS's `textutil` rewrites them as Word Open XML in a temporary
+/// folder, and the same conversion as `.docx` reads that. The original is only read.
+pub fn legacy(path: &Path, cancelled: &impl Fn() -> bool) -> Result<String, String> {
+    let folder = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let converted = folder.path().join("converted.docx");
+    let output = std::process::Command::new("/usr/bin/textutil")
+        .args(["-convert", "docx", "-output"])
+        .arg(&converted)
+        .arg(path)
+        .output()
+        .map_err(|e| format!("Could not convert this document: {e}"))?;
+    if !output.status.success() {
+        let reason = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Could not convert this document: {}", reason.trim()));
+    }
+    markdown(&converted, cancelled)
+}
+
 fn part(zip: &mut ZipArchive<File>, name: &str) -> Result<Option<String>, String> {
     let mut entry = match zip.by_name(name) {
         Ok(v) => v,

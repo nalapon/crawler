@@ -613,7 +613,11 @@ fn finish_close(app: &mut App, intent: CloseIntent, tx: &mut Tx) {
     match intent {
         CloseIntent::Reader => {
             app.close_reader();
-            crate::funnel::focus_section(app, tx);
+            if app.reader == Reader::Document {
+                crate::preview::focus_reader(tx);
+            } else {
+                crate::funnel::focus_section(app, tx);
+            }
         }
         CloseIntent::Window => tx.close_window(),
         CloseIntent::Quit => tx.quit(),

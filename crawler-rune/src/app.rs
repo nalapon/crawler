@@ -1,7 +1,7 @@
 //! The whole app's state, its sections and the routing between them.
 //!
 //! Every module keeps its own state struct inside [`App`]. Handlers receive `&mut App`, so a
-//! module reaches another only through that module's public functions (`crate::opening::open_file`,
+//! module reaches another only through that module's public functions (`crate::opening::open_path`,
 //! `crate::transfers::start_copy`, …), never by editing its fields.
 
 use std::path::PathBuf;
@@ -77,7 +77,8 @@ impl Section {
 pub enum Reader {
     #[default]
     None,
-    Markdown,
+    /// Markdown, Word, spreadsheets, code, text, images and video.
+    Document,
     Pdf,
 }
 
@@ -212,8 +213,15 @@ impl App {
     pub fn close_reader(&mut self) {
         match self.reader {
             Reader::None => return,
-            Reader::Markdown => preview::reader_closed(self),
-            Reader::Pdf => pdf::reader_closed(self),
+            Reader::Document => preview::reader_closed(self),
+            Reader::Pdf => {
+                pdf::reader_closed(self);
+                // A PDF opened from a link in a document returns to that document.
+                if preview::resume_reader(self) {
+                    self.reader_escape_at = None;
+                    return;
+                }
+            }
         }
         self.reader = Reader::None;
         self.reader_escape_at = None;
@@ -231,7 +239,6 @@ pub fn setup(app: &mut App, waker: Waker) {
     transfers::setup(app, &waker);
     opening::setup(app, &waker);
     settings::setup(app, &waker);
-    preview::set_editor_opener(app, opening::open_in_editor);
     preview::set_reader_display_observer(app, opening::record_recent);
     if let Some(path) = app
         .launch
@@ -332,7 +339,7 @@ pub fn on_key(app: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
 /// Close keys shared by every reader: X, ⌘W, or two non-repeated Escapes within 700 ms.
 fn reader_key(app: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
     let handled = match app.reader {
-        Reader::Markdown => preview::reader_key(app, ev, tx),
+        Reader::Document => preview::reader_key(app, ev, tx),
         Reader::Pdf => pdf::reader_key(app, ev, tx),
         Reader::None => false,
     };
@@ -341,14 +348,22 @@ fn reader_key(app: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
     }
     match ev.key {
         Key::Command('w') => app.close_reader(),
-        Key::Text(ref t) if t.eq_ignore_ascii_case("x") && !ev.mods.cmd => app.close_reader(),
+        Key::Text(ref t)
+            if t.eq_ignore_ascii_case("x") && !ev.mods.cmd && !preview::typing(app) =>
+        {
+            app.close_reader()
+        }
         Key::Escape => match app.reader_escape_at {
             Some(at) if app.clock - at <= 0.7 => app.close_reader(),
             _ => app.reader_escape_at = Some(app.clock),
         },
         _ => return false,
     }
-    funnel::focus_section(app, tx);
+    if app.reader == Reader::Document {
+        preview::focus_reader(tx);
+    } else {
+        funnel::focus_section(app, tx);
+    }
     true
 }
 
@@ -360,7 +375,7 @@ pub fn view(app: &App, cx: &mut Cx<App>) -> El {
     };
     let mut layer = Vec::new();
     let body = match app.reader {
-        Reader::Markdown => preview::reader_view(app, cx, &p, &mut layer),
+        Reader::Document => preview::reader_view(app, cx, &p, &mut layer),
         Reader::Pdf => pdf::reader_view(app, cx, &p, &mut layer),
         Reader::None => {
             let content = match app.section {
@@ -557,7 +572,6 @@ fn poll_reports(app: &mut App, tx: &mut Tx) {
         "funnel":funnel,"index":index,"activity_monitor":activity::report(app),
         "shortcuts_visible":app.show_help,"palette_visible":settings::palette_visible(app),
         "reader":format!("{:?}",app.reader),"recent_opened_files":app.opening.recent,
-        "default_text_editor":app.opening.default_editor,
         "file_search_engine":"fff","file_search_status":status,
         "file_search_engine_revision":index["engine_revision"],
         "file_search_first_result_ms":index["first_result_ms"],

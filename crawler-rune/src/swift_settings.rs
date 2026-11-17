@@ -1,5 +1,5 @@
 //! One-time import of the Swift app's settings, so replacing it keeps the theme, pinned folder,
-//! recent files, default editor and Markdown reader zoom. The Swift preferences are only read.
+//! recent files and Markdown reader zoom. The Swift preferences are only read.
 
 use std::path::PathBuf;
 
@@ -42,11 +42,6 @@ fn copy(prefs: &mut Prefs, swift: &NSDictionary<NSString, AnyObject>) {
         && let Some(path) = string("pinnedFolder")
     {
         let _ = prefs.set("pinnedFolder", &PathBuf::from(path));
-    }
-    if prefs.get::<String>("defaultTextEditorBundleID").is_none()
-        && let Some(id) = string("defaultTextEditorBundleID")
-    {
-        let _ = prefs.set("defaultTextEditorBundleID", &id);
     }
     if prefs.get::<Vec<PathBuf>>("recentOpenedFiles").is_none()
         && let Some(list) = value("recentOpenedFiles").and_then(|v| v.downcast::<NSArray>().ok())

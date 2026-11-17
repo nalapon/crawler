@@ -1,4 +1,9 @@
-use super::{native, word};
+use super::{
+    native,
+    sheet::{self, Workbook},
+    word,
+};
+use crate::funnel::model::DocumentKind;
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use rune::{Image, ImageCache};
 use rune_kit::syntax::{self, Highlight};
@@ -16,53 +21,37 @@ use std::{
     time::SystemTime,
 };
 
+/// How a file is drawn. `DocumentKind` owns the extension table; this only groups its kinds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
     Pdf,
     Markdown,
     Text,
     Word,
+    Sheet,
     Image,
     Video,
     Thumbnail,
 }
 impl Format {
     pub fn of(path: &Path) -> Self {
-        let extension = extension(path);
-        match extension.as_str() {
-            "pdf" => Self::Pdf,
-            "md" | "markdown" | "mdown" | "mkd" => Self::Markdown,
-            "docx" | "docm" | "dotx" => Self::Word,
-            "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "heif" | "tiff" | "tif" | "bmp"
-            | "ico" | "avif" => Self::Image,
-            "mp4" | "m4v" | "mov" | "mkv" | "webm" | "avi" | "mpg" | "mpeg" | "mts" | "m2ts"
-            | "ogv" | "wmv" | "flv" => Self::Video,
-            _ if syntax::lang_for_path(&path.to_string_lossy()).is_some()
-                || matches!(
-                    extension.as_str(),
-                    "txt" | "log" | "csv" | "tsv" | "ini" | "conf" | "cfg" | "rtf"
-                )
-                || matches!(
-                    path.file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("")
-                        .to_ascii_lowercase()
-                        .as_str(),
-                    "license"
-                        | "readme"
-                        | ".env"
-                        | ".gitignore"
-                        | ".editorconfig"
-                        | "go.mod"
-                        | "go.sum"
-                        | "go.work"
-                        | "go.work.sum"
-                ) =>
-            {
-                Self::Text
-            }
-            _ => Self::Thumbnail,
+        match DocumentKind::for_path(path, false) {
+            DocumentKind::Pdf => Self::Pdf,
+            DocumentKind::Markdown => Self::Markdown,
+            DocumentKind::Word => Self::Word,
+            DocumentKind::Sheet => Self::Sheet,
+            DocumentKind::Text => Self::Text,
+            DocumentKind::Image => Self::Image,
+            DocumentKind::Video => Self::Video,
+            DocumentKind::Folder
+            | DocumentKind::Audio
+            | DocumentKind::Package
+            | DocumentKind::Other => Self::Thumbnail,
         }
+    }
+    /// Whether the full-window document reader shows it. PDFs have their own reader.
+    pub fn readable(self) -> bool {
+        !matches!(self, Self::Pdf | Self::Thumbnail)
     }
 }
 pub fn extension(path: &Path) -> String {
@@ -77,40 +66,126 @@ pub enum Budget {
     Reader,
 }
 impl Budget {
-    fn bytes(self) -> usize {
-        match self {
-            Self::Preview => 256 * 1024,
-            Self::Reader => 4 * 1024 * 1024,
+    fn bytes(self, format: Format) -> usize {
+        match (self, format) {
+            (Self::Preview, _) => 256 * 1024,
+            // Plain text and delimited rows cost little per line, so the reader takes more.
+            (Self::Reader, Format::Text | Format::Sheet) => 16 * 1024 * 1024,
+            (Self::Reader, _) => 4 * 1024 * 1024,
         }
     }
-    fn lines(self) -> usize {
-        match self {
-            Self::Preview => 5_000,
-            Self::Reader => 100_000,
+    fn lines(self, format: Format) -> usize {
+        match (self, format) {
+            (Self::Preview, _) => 5_000,
+            (Self::Reader, Format::Text | Format::Sheet) => usize::MAX,
+            (Self::Reader, _) => 100_000,
         }
     }
-    pub fn notice(self) -> &'static str {
-        match self {
-            Self::Preview => {
-                "Partial preview · limited to 256 KB, 5,000 lines and 4,096 characters per line"
+    pub fn notice(self, format: Format) -> &'static str {
+        match (self, format) {
+            (Self::Preview, Format::Sheet) => "Partial preview · first 200 rows and 40 columns",
+            (Self::Preview, _) => "Partial preview · limited to 256 KB and 5,000 lines",
+            (Self::Reader, Format::Sheet) => {
+                "Partial sheet · limited to 200,000 rows, 512 columns and 4 million cells"
             }
-            Self::Reader => "Partial document · limited to 4 MB and 100,000 lines",
+            (Self::Reader, Format::Text) => "Partial document · limited to 16 MB",
+            (Self::Reader, _) => "Partial document · limited to 4 MB and 100,000 lines",
         }
     }
 }
-#[derive(Clone)]
+
+pub struct Heading {
+    /// The GitHub-style anchor `#fragment` links scroll to.
+    pub slug: String,
+    pub title: String,
+    pub level: u8,
+}
+/// One top-level Markdown block, rendered as one virtual row.
 pub struct Block {
     pub source: String,
-    pub code: bool,
-    pub highlights: Vec<Highlight>,
-    pub heading: Option<String>,
+    pub heading: Option<Heading>,
+}
+
+/// Code or plain text: one buffer, the offset where each line starts and one sorted list of
+/// syntax colours. A line costs four bytes, not an allocation.
+pub struct Text {
+    source: String,
+    starts: Vec<u32>,
+    highlights: Vec<Highlight>,
+}
+impl Text {
+    /// Characters of one line that are drawn; a longer line (minified code) is cut.
+    const LINE_BYTES: usize = 4096;
+
+    fn new(source: String, language: Option<&str>, cancelled: &impl Fn() -> bool) -> Self {
+        let mut starts = vec![0];
+        starts.extend(
+            source
+                .bytes()
+                .enumerate()
+                .filter(|(_, b)| *b == b'\n')
+                .map(|(at, _)| at as u32 + 1),
+        );
+        // Rune colours the first 128 KiB of a source; the rest stays plain.
+        let highlights = if cancelled() {
+            Vec::new()
+        } else {
+            syntax::highlight(language, &source).to_vec()
+        };
+        Self {
+            source,
+            starts,
+            highlights,
+        }
+    }
+    pub fn lines(&self) -> usize {
+        self.starts.len()
+    }
+    fn range(&self, line: usize) -> Range<usize> {
+        let start = self.starts[line] as usize;
+        let end = self
+            .starts
+            .get(line + 1)
+            .map_or(self.source.len(), |next| *next as usize - 1);
+        let end = end.min(start + Self::LINE_BYTES);
+        let mut end = end;
+        while !self.source.is_char_boundary(end) {
+            end -= 1;
+        }
+        start..end
+    }
+    pub fn line(&self, line: usize) -> &str {
+        self.source[self.range(line)].trim_end_matches('\r')
+    }
+    /// The line's syntax colours, with ranges relative to its start.
+    pub fn highlights(&self, line: usize) -> Vec<Highlight> {
+        let Range { start, end } = self.range(line);
+        let first = self.highlights.partition_point(|(r, _)| r.end <= start);
+        self.highlights[first..]
+            .iter()
+            .take_while(|(r, _)| r.start < end)
+            .filter_map(|(r, paint)| {
+                let a = r.start.max(start);
+                let b = r.end.min(end);
+                (a < b).then(|| (a - start..b - start, *paint))
+            })
+            .collect()
+    }
+}
+
+pub enum Body {
+    /// Pictures, video and thumbnails carry no rows.
+    None,
+    Blocks(Vec<Block>),
+    Text(Text),
+    Sheet(Workbook),
 }
 pub struct Document {
     pub path: PathBuf,
     pub format: Format,
     pub bytes: Option<u64>,
     pub modified: Option<SystemTime>,
-    pub blocks: Vec<Block>,
+    pub body: Body,
     pub truncated: bool,
     pub budget: Budget,
     pub images: HashMap<String, Image>,
@@ -127,11 +202,28 @@ impl Document {
             .to_string_lossy()
             .into_owned()
     }
+    /// Virtual rows: Markdown blocks, text lines or sheet rows.
+    pub fn rows(&self) -> usize {
+        match &self.body {
+            Body::None => 0,
+            Body::Blocks(blocks) => blocks.len(),
+            Body::Text(text) => text.lines(),
+            Body::Sheet(book) => book.sheet.rows(),
+        }
+    }
+    pub fn blocks(&self) -> &[Block] {
+        match &self.body {
+            Body::Blocks(blocks) => blocks,
+            _ => &[],
+        }
+    }
 }
 #[derive(Clone)]
 pub struct Request {
     pub path: PathBuf,
     pub budget: Budget,
+    /// The sheet of a workbook to load.
+    pub sheet: usize,
     pub revision: u64,
     pub generation: Arc<AtomicU64>,
     pub cache: Arc<ImageCache>,
@@ -159,7 +251,7 @@ pub fn load(request: Request) -> Result<Arc<Document>, String> {
         format,
         bytes: metadata.is_file().then_some(metadata.len()),
         modified: metadata.modified().ok(),
-        blocks: Vec::new(),
+        body: Body::None,
         truncated: false,
         budget: request.budget,
         images: HashMap::new(),
@@ -168,28 +260,68 @@ pub fn load(request: Request) -> Result<Arc<Document>, String> {
         fenced: Arc::default(),
         revision: request.revision,
     };
+    let kind = extension(&request.path);
     match format {
-        Format::Markdown | Format::Text => {
-            let (source, truncated) = read_text(file, request.budget, &cancelled)?;
-            document.truncated = truncated;
-            if format == Format::Markdown {
-                prepare_markdown(&mut document, &source, &request)?;
-            } else {
-                prepare_text(&mut document, &source, &cancelled)?;
-            }
-        }
-        Format::Word if request.budget == Budget::Reader => {
-            let source = word::markdown(&request.path, &cancelled)?;
-            let (source, truncated) = bound_text(source, request.budget);
+        Format::Markdown => {
+            let (source, truncated) = read_text(file, request.budget, format, &cancelled)?;
             document.truncated = truncated;
             prepare_markdown(&mut document, &source, &request)?;
         }
+        Format::Text => {
+            let (source, truncated) = read_text(file, request.budget, format, &cancelled)?;
+            document.truncated = truncated;
+            let path = request.path.to_string_lossy();
+            document.body = Body::Text(Text::new(
+                source,
+                syntax::lang_for_path(&path),
+                &cancelled,
+            ));
+        }
+        Format::Word if request.budget == Budget::Reader => {
+            let source = if kind == "docx" || kind == "docm" || kind == "dotx" {
+                word::markdown(&request.path, &cancelled)?
+            } else {
+                word::legacy(&request.path, &cancelled)?
+            };
+            let (source, truncated) = bound_text(source, request.budget, format);
+            document.truncated = truncated;
+            prepare_markdown(&mut document, &source, &request)?;
+        }
+        Format::Sheet if kind == "csv" || kind == "tsv" => {
+            let (source, cut) = read_text(file, request.budget, format, &cancelled)?;
+            let (book, truncated) =
+                sheet::delimited(&source, kind == "tsv", sheet::Limits::of(request.budget));
+            document.truncated = cut || truncated;
+            document.body = Body::Sheet(book);
+        }
+        // Only the streaming formats are cheap enough to parse for a pane preview.
+        Format::Sheet
+            if request.budget == Budget::Reader || matches!(kind.as_str(), "xlsx" | "xlsm" | "xlsb") =>
+        {
+            let (book, truncated) = sheet::workbook(
+                &request.path,
+                request.sheet,
+                sheet::Limits::of(request.budget),
+                &cancelled,
+            )?;
+            document.truncated = truncated;
+            document.body = Body::Sheet(book);
+        }
         Format::Image => {
-            if let Ok(bitmap) = native::image(&request.path, 1920) {
+            // The pane never draws more than its own width; the reader keeps detail for zoom.
+            let pixels = match request.budget {
+                Budget::Preview => 1280,
+                Budget::Reader => 3072,
+            };
+            // ImageIO has no SVG decoder; Quick Look draws those.
+            if let Some(bitmap) = native::image(&request.path, pixels)
+                .ok()
+                .or_else(|| native::thumbnail(&request.path, &cancelled))
+            {
                 document.thumbnail = Some(decoded_image(&request.cache, bitmap));
             }
         }
-        Format::Thumbnail | Format::Word => {
+        Format::Thumbnail | Format::Word | Format::Sheet => {
             if let Some(bitmap) = native::thumbnail(&request.path, &cancelled) {
                 document.thumbnail = Some(decoded_image(&request.cache, bitmap));
             }
@@ -198,7 +330,8 @@ pub fn load(request: Request) -> Result<Arc<Document>, String> {
     }
     if request.budget == Budget::Preview
         && document.thumbnail.is_none()
-        && matches!(format, Format::Word | Format::Thumbnail | Format::Image)
+        && matches!(document.body, Body::None)
+        && !matches!(format, Format::Pdf | Format::Video)
     {
         let icon = request.cache.app_icon(&request.path, 64.0);
         let _ = icon.wait();
@@ -213,9 +346,10 @@ pub fn load(request: Request) -> Result<Arc<Document>, String> {
 fn read_text(
     mut file: File,
     budget: Budget,
+    format: Format,
     cancelled: &impl Fn() -> bool,
 ) -> Result<(String, bool), String> {
-    let limit = budget.bytes();
+    let limit = budget.bytes(format);
     let mut data = Vec::with_capacity(limit.min(64 * 1024));
     let mut buffer = [0u8; 64 * 1024];
     while data.len() <= limit {
@@ -265,71 +399,29 @@ fn read_text(
         String::from_utf8(data)
             .map_err(|_| "This file is binary or uses an unsupported text encoding.")?
     };
-    let (source, bounded) = bound_text(source, budget);
+    let (source, bounded) = bound_text(source, budget, format);
     Ok((source, truncated || bounded))
 }
-fn bound_text(mut source: String, budget: Budget) -> (String, bool) {
+fn bound_text(mut source: String, budget: Budget, format: Format) -> (String, bool) {
     let mut truncated = false;
-    if source.len() > budget.bytes() {
-        let mut end = budget.bytes();
+    if source.len() > budget.bytes(format) {
+        let mut end = budget.bytes(format);
         while !source.is_char_boundary(end) {
             end -= 1;
         }
         source.truncate(end);
         truncated = true;
     }
-    let mut output = String::with_capacity(source.len());
-    for (i, line) in source.split_inclusive('\n').enumerate() {
-        if i == budget.lines() {
+    if let Some((end, _)) = source
+        .match_indices('\n')
+        .nth(budget.lines(format).saturating_sub(1))
+    {
+        if end + 1 < source.len() {
+            source.truncate(end + 1);
             truncated = true;
-            break;
-        }
-        if budget == Budget::Preview
-            && let Some((end, _)) = line.char_indices().nth(4096)
-        {
-            output.push_str(&line[..end]);
-            output.push('\n');
-            truncated = true;
-        } else {
-            output.push_str(line);
         }
     }
-    (output, truncated)
-}
-fn prepare_text(
-    doc: &mut Document,
-    source: &str,
-    cancelled: &impl Fn() -> bool,
-) -> Result<(), String> {
-    let highlights = syntax::highlight(syntax::lang_for_path(&doc.path.to_string_lossy()), source);
-    let mut offset = 0;
-    let mut token_start = 0;
-    for line in source.split('\n') {
-        if cancelled() {
-            return Err("Cancelled".into());
-        }
-        let end = offset + line.len();
-        while token_start < highlights.len() && highlights[token_start].0.end <= offset {
-            token_start += 1;
-        }
-        let ranges = highlights[token_start..]
-            .iter()
-            .take_while(|(r, _)| r.start < end)
-            .filter_map(|(r, p)| {
-                let a = r.start.max(offset);
-                let b = r.end.min(end);
-                (a < b).then(|| (a - offset..b - offset, *p))
-            })
-            .collect();
-        doc.blocks.push(Block {
-            source: line.to_owned(),
-            code: true,
-            highlights: ranges,
-            heading: None,
-        });
-        offset = end + 1;
-    }
-    Ok(())
+    (source, truncated)
 }
 
 fn prepare_markdown(doc: &mut Document, source: &str, request: &Request) -> Result<(), String> {
@@ -368,8 +460,9 @@ fn prepare_markdown(doc: &mut Document, source: &str, request: &Request) -> Resu
         .collect::<String>();
     let mut depth = 0usize;
     let mut start = 0;
-    let mut heading = None;
+    let mut heading: Option<u8> = None;
     let mut heading_text = String::new();
+    let mut blocks = Vec::new();
     let mut slugs: HashMap<String, usize> = HashMap::new();
     let mut fenced = HashMap::new();
     let mut code_language = None;
@@ -386,8 +479,8 @@ fn prepare_markdown(doc: &mut Document, source: &str, request: &Request) -> Resu
                     heading = None;
                     heading_text.clear();
                 }
-                if matches!(tag, Tag::Heading { .. }) {
-                    heading = Some(String::new());
+                if let Tag::Heading { level, .. } = tag {
+                    heading = Some(*level as u8);
                 }
                 if let Tag::CodeBlock(kind) = tag {
                     code_language = Some(match kind {
@@ -435,35 +528,37 @@ fn prepare_markdown(doc: &mut Document, source: &str, request: &Request) -> Resu
                 }
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
-                    if heading.is_some() {
+                    let heading = heading.take().map(|level| {
                         let slug = slug(&heading_text);
                         let count = slugs.entry(slug.clone()).or_default();
-                        heading = Some(if *count == 0 {
+                        let slug = if *count == 0 {
                             slug
                         } else {
                             format!("{slug}-{count}")
-                        });
+                        };
                         *count += 1;
-                    }
+                        Heading {
+                            slug,
+                            title: heading_text.trim().to_owned(),
+                            level,
+                        }
+                    });
                     let mut block = sanitized[start..range.end].to_owned();
                     block.push_str(&references);
-                    doc.blocks.push(Block {
+                    blocks.push(Block {
                         source: block,
-                        code: false,
-                        highlights: Vec::new(),
-                        heading: heading.take(),
+                        heading,
                     });
                 }
             }
-            Event::Rule if depth == 0 => doc.blocks.push(Block {
+            Event::Rule if depth == 0 => blocks.push(Block {
                 source: sanitized[range].to_owned(),
-                code: false,
-                highlights: Vec::new(),
                 heading: None,
             }),
             _ => {}
         }
     }
+    doc.body = Body::Blocks(blocks);
     for source in image_paths {
         if request.cancelled() {
             return Err("Cancelled".into());
@@ -541,20 +636,61 @@ pub struct Found {
     pub block: usize,
     pub ranges: Vec<Range<usize>>,
 }
+/// Case-insensitive matches, at most 10,000. `block` is the row: a Markdown block, a text
+/// line or a sheet row (whose `ranges` stay empty: the whole row is the match).
 pub fn find(doc: &Document, needle: &str) -> Vec<Found> {
     if needle.is_empty() {
         return Vec::new();
     }
-    doc.blocks
-        .iter()
-        .enumerate()
-        .flat_map(|(block, b)| {
-            rune_kit::markdown::find(&b.source, needle, rune_kit::markdown::Case::Insensitive)
-                .into_iter()
-                .map(move |ranges| Found { block, ranges })
-        })
-        .take(10_000)
-        .collect()
+    match &doc.body {
+        Body::None => Vec::new(),
+        Body::Blocks(blocks) => blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(block, b)| {
+                rune_kit::markdown::find(&b.source, needle, rune_kit::markdown::Case::Insensitive)
+                    .into_iter()
+                    .map(move |ranges| Found { block, ranges })
+            })
+            .take(10_000)
+            .collect(),
+        Body::Text(text) => (0..text.lines())
+            .flat_map(|line| {
+                occurrences(text.line(line), needle).map(move |range| Found {
+                    block: line,
+                    ranges: vec![range],
+                })
+            })
+            .take(10_000)
+            .collect(),
+        Body::Sheet(book) => (0..book.sheet.rows())
+            .filter(|row| {
+                (0..book.sheet.columns)
+                    .any(|column| occurrences(book.sheet.cell(*row, column), needle).next().is_some())
+            })
+            .map(|block| Found {
+                block,
+                ranges: Vec::new(),
+            })
+            .take(10_000)
+            .collect(),
+    }
+}
+/// Byte ranges of `needle` in `text`, ignoring ASCII case.
+fn occurrences<'a>(text: &'a str, needle: &'a str) -> impl Iterator<Item = Range<usize>> + 'a {
+    let (haystack, needle) = (text.as_bytes(), needle.as_bytes());
+    let mut at = 0;
+    std::iter::from_fn(move || {
+        while at + needle.len() <= haystack.len() {
+            let start = at;
+            at += 1;
+            if haystack[start..start + needle.len()].eq_ignore_ascii_case(needle) {
+                at = start + needle.len();
+                return Some(start..at);
+            }
+        }
+        None
+    })
 }
 
 fn decoded_image(cache: &ImageCache, bitmap: native::Bitmap) -> Image {

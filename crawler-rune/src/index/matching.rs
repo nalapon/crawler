@@ -8,10 +8,7 @@ use std::{
     cell::RefCell,
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
 };
 use unicode_normalization::UnicodeNormalization;
 pub enum Boosts {
@@ -334,20 +331,23 @@ fn highlights(query: &Query, hit: &Ranked, literal: bool) -> Vec<(u32, u32)> {
     .collect()
 }
 
-pub fn group(
-    batches: &[Arc<Snapshot>],
+/// One parallel pass over the Mac batches and a drive's supplemental batches, merged once.
+/// Duplicate Mac coverage of the drive (`exclude`) is skipped in the Mac batches only.
+pub fn pass(
+    mac: &[Arc<Snapshot>],
+    supplement: &[Arc<Snapshot>],
     query: &Query,
     root: &Path,
     exclude: Option<&Path>,
     boosts: &Boosts,
     literal: bool,
-    generation: &AtomicU64,
-    id: u64,
+    cancelled: &(impl Fn() -> bool + Sync),
 ) -> Matches {
-    batches
-        .par_iter()
-        .map(|snapshot| {
-            if generation.load(Ordering::Relaxed) != id {
+    mac.par_iter()
+        .map(|snapshot| (snapshot, exclude))
+        .chain(supplement.par_iter().map(|snapshot| (snapshot, None)))
+        .map(|(snapshot, exclude)| {
+            if cancelled() {
                 return Matches::default();
             }
             batch(snapshot, query, root, exclude, boosts, literal)

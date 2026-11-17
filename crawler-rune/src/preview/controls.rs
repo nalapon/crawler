@@ -16,6 +16,21 @@ pub const BACK: Icon = Icon {
     view: 24.0,
     body: r#"<path d="m14 5-7 7 7 7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
+pub const ZOOM_IN: Icon = Icon {
+    name: "reader-zoom-in",
+    view: 24.0,
+    body: r#"<path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>"#,
+};
+pub const ZOOM_OUT: Icon = Icon {
+    name: "reader-zoom-out",
+    view: 24.0,
+    body: r#"<path d="M5 12h14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>"#,
+};
+pub const FIT: Icon = Icon {
+    name: "reader-fit",
+    view: 24.0,
+    body: r#"<path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
 pub const SELECT: Icon = Icon {
     name: "pdf-select",
     view: 24.0,

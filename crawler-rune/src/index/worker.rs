@@ -72,12 +72,30 @@ pub(super) enum Message {
         response: Response,
         final_pass: bool,
         fuzzy: bool,
+        /// A final pass hands back what it scored, for the next pass to extend.
+        partial: Option<Box<Partial>>,
     },
     Saved {
         event: Option<Event>,
         milliseconds: f64,
         error: Option<String>,
     },
+}
+/// The matches of the last finished pass and exactly which batches they cover. When the next
+/// pass has the same query over the same batches plus new ones at the end, it scores only the
+/// new ones and merges: the top 100, the counts and the total come out the same as a full pass.
+pub(super) struct Partial {
+    key: Key,
+    exclude: Option<PathBuf>,
+    fallback: bool,
+    literal: bool,
+    mac: Vec<Arc<Snapshot>>,
+    supplement: Vec<Arc<Snapshot>>,
+    matches: Matches,
+}
+/// Whether `old` is the start of `new`, batch for batch.
+fn extends(old: &[Arc<Snapshot>], new: &[Arc<Snapshot>]) -> bool {
+    old.len() <= new.len() && old.iter().zip(new).all(|(a, b)| Arc::ptr_eq(a, b))
 }
 #[derive(Clone, PartialEq, Eq)]
 struct Key {
@@ -155,6 +173,7 @@ struct Worker {
     scoring: bool,
     score_at: Option<Instant>,
     dirty: bool,
+    partial: Option<Box<Partial>>,
     queries: VecDeque<(Key, Response, bool)>,
     report: Value,
     samples: VecDeque<Value>,
@@ -227,6 +246,7 @@ pub(super) fn run(
         scoring: false,
         score_at: None,
         dirty: false,
+        partial: None,
         queries: VecDeque::new(),
         samples: VecDeque::new(),
         report: json!({"workers": workers, "engine_revision": snapshot::REVISION, "cache_loaded": false, "query_cache_hits": 0, "engine_passes": 0}),
@@ -702,11 +722,13 @@ impl Worker {
                 response,
                 final_pass,
                 fuzzy,
+                partial,
             } if epoch == self.epoch.load(Ordering::Acquire)
                 && self.active.as_ref().is_some_and(|a| a.id == response.id) =>
             {
                 if final_pass {
                     self.scoring = false;
+                    self.partial = partial;
                 }
                 if final_pass && self.dirty {
                     self.schedule_index_score();
@@ -853,6 +875,7 @@ impl Worker {
         let cancel = Arc::clone(&self.cache_cancel);
         let tx = self.sender.clone();
         let job = self.cache_job;
+        let loaders = self.workers.min(8);
         let _ = std::thread::Builder::new()
             .name("crawler-cache-load".into())
             .spawn(move || {
@@ -865,34 +888,58 @@ impl Worker {
                 {
                     warning = Some(error.to_string());
                 }
-                if let Ok(mut reader) = reader {
+                if let Ok(reader) = reader {
                     event = reader.event;
-                    loop {
-                        if cancel.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        match reader.next() {
-                            Ok(Some((position, batch))) => {
-                                if tx
-                                    .send(Message::CacheBatch {
-                                        job,
-                                        position,
-                                        batch,
-                                    })
-                                    .is_err()
-                                {
-                                    return;
+                    // Blocks are independent: verify and decode them on several threads.
+                    // The queue keeps the query's priority order for arrival.
+                    let (decoder, blocks) = reader.split();
+                    let queue = Mutex::new(blocks);
+                    let failure = Mutex::new(None::<String>);
+                    std::thread::scope(|scope| {
+                        for _ in 0..loaders {
+                            let tx = tx.clone();
+                            let (decoder, queue, failure, cancel) =
+                                (&decoder, &queue, &failure, &cancel);
+                            scope.spawn(move || {
+                                loop {
+                                    if cancel.load(Ordering::Relaxed)
+                                        || failure.lock().is_ok_and(|f| f.is_some())
+                                    {
+                                        return;
+                                    }
+                                    let Some(block) =
+                                        queue.lock().ok().and_then(|mut q| q.pop_front())
+                                    else {
+                                        return;
+                                    };
+                                    match decoder.decode(block) {
+                                        Ok((position, batch)) => {
+                                            let sent = tx.send(Message::CacheBatch {
+                                                job,
+                                                position,
+                                                batch,
+                                            });
+                                            if sent.is_err() {
+                                                return;
+                                            }
+                                        }
+                                        Err(error) => {
+                                            if let Ok(mut failure) = failure.lock() {
+                                                failure.get_or_insert(error.to_string());
+                                            }
+                                            return;
+                                        }
+                                    }
                                 }
-                            }
-                            Ok(None) => {
-                                valid = true;
-                                break;
-                            }
-                            Err(error) => {
-                                warning = Some(error.to_string());
-                                break;
-                            }
+                            });
                         }
+                    });
+                    if cancel.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    match failure.into_inner().ok().flatten() {
+                        Some(error) => warning = Some(error),
+                        None => valid = true,
                     }
                 }
                 if !cancel.load(Ordering::Relaxed) {
@@ -1190,13 +1237,13 @@ impl Worker {
         if self.generation.load(Ordering::Acquire) != id {
             return;
         }
-        let query = active.key.query.clone();
-        let boosts = matching::boosts(&active.key.boosts, &self.root);
-        let batches = self.batches.clone();
-        let supplemental = self
-            .supplement
-            .as_ref()
-            .map(|s| (s.path.clone(), s.batches.clone()));
+        let key = active.key.clone();
+        let boosts = matching::boosts(&key.boosts, &self.root);
+        let mac = self.batches.clone();
+        let (exclude, supplement) = match &self.supplement {
+            Some(s) => (Some(s.path.clone()), s.batches.clone()),
+            None => (None, Vec::new()),
+        };
         let root = self.root.clone();
         let epoch = self.epoch.fetch_add(1, Ordering::AcqRel) + 1;
         let token = Arc::clone(&self.epoch);
@@ -1204,8 +1251,9 @@ impl Worker {
         let tx = self.sender.clone();
         let complete = self.ready();
         let publish_early = !active.first_result;
-        let fallback = self.cache_loaded && query.text.split_whitespace().count() > 1;
+        let fallback = self.cache_loaded && key.query.text.split_whitespace().count() > 1;
         let workers = self.workers;
+        let previous = self.partial.take();
         self.scoring = true;
         self.dirty = false;
         self.report["engine_passes"] =
@@ -1215,78 +1263,112 @@ impl Worker {
             let cancelled = || {
                 token.load(Ordering::Acquire) != epoch || generation.load(Ordering::Acquire) != id
             };
-            let mut all = batches;
-            let split = all.len();
-            if let Some((_, supplemental)) = &supplemental {
-                all.extend(supplemental.iter().cloned());
+            let query = &key.query;
+            let score = |mac: &[Arc<Snapshot>], supplement: &[Arc<Snapshot>], literal: bool| {
+                matching::pass(
+                    mac,
+                    supplement,
+                    query,
+                    &root,
+                    exclude.as_deref(),
+                    &boosts,
+                    literal,
+                    &cancelled,
+                )
+            };
+            let previous = previous.filter(|p| {
+                p.key == key
+                    && p.exclude == exclude
+                    && p.fallback == fallback
+                    && extends(&p.mac, &mac)
+                    && extends(&p.supplement, &supplement)
+            });
+            let (matches, literal) = if let Some(previous) = previous {
+                // Only the batches that arrived since the last pass are scored.
+                let new_mac = &mac[previous.mac.len()..];
+                let new_supplement = &supplement[previous.supplement.len()..];
+                let mut matches = previous.matches;
+                let added = score(new_mac, new_supplement, true);
+                if previous.literal {
+                    matches.merge(added);
+                    (matches, true)
+                } else if added.total > 0 {
+                    // The earlier batches had no literal match, so the fuzzy fallback stood
+                    // in. A new literal match takes priority over that fallback.
+                    (added, true)
+                } else {
+                    matches.merge(score(new_mac, new_supplement, false));
+                    (matches, false)
+                }
+            } else {
+                let mut literal = true;
+                loop {
+                    let mut matches = Matches::default();
+                    let mut scored = 0;
+                    // Until the first usable result is out, score a few batches at a time
+                    // and publish as soon as one of them matches. Cache blocks arrive in the
+                    // query's priority order, so a match is normally among the first groups.
+                    let early = (workers * 8).min(mac.len());
+                    while publish_early && literal && scored < early && matches.hits.is_empty() {
+                        if cancelled() {
+                            return;
+                        }
+                        let end = (scored + workers).min(mac.len());
+                        matches.merge(score(&mac[scored..end], &[], literal));
+                        scored = end;
+                        if !matches.hits.is_empty() {
+                            let response = matches.response(query, &root, id, false, literal);
+                            let _ = tx.send(Message::Scored {
+                                epoch,
+                                response,
+                                final_pass: false,
+                                fuzzy: !literal,
+                                partial: None,
+                            });
+                        }
+                    }
+                    // Everything else is one parallel pass with a single merge.
+                    matches.merge(score(&mac[scored..], &supplement, literal));
+                    if cancelled() {
+                        return;
+                    }
+                    if matches.total == 0 && literal && fallback {
+                        literal = false;
+                        continue;
+                    }
+                    break (matches, literal);
+                }
+            };
+            if cancelled() {
+                return;
             }
-            let mut literal = true;
-            loop {
-                let mut matches = Matches::default();
-                let mut first_nonempty = false;
-                for (group_id, group) in all.chunks(workers).enumerate() {
-                    if cancelled() {
-                        return;
-                    }
-                    // Keep the Mac/supplement boundary: duplicate Mac coverage is excluded first.
-                    let start = group_id * workers;
-                    let mut part = Matches::default();
-                    let mac_count = split.saturating_sub(start).min(group.len());
-                    if mac_count > 0 {
-                        part.merge(matching::group(
-                            &group[..mac_count],
-                            &query,
-                            &root,
-                            supplemental.as_ref().map(|s| s.0.as_path()),
-                            &boosts,
-                            literal,
-                            &generation,
-                            id,
-                        ));
-                    }
-                    if mac_count < group.len() {
-                        part.merge(matching::group(
-                            &group[mac_count..],
-                            &query,
-                            &root,
-                            None,
-                            &boosts,
-                            literal,
-                            &generation,
-                            id,
-                        ));
-                    }
-                    matches.merge(part);
-                    if cancelled() {
-                        return;
-                    }
-                    if publish_early && !matches.hits.is_empty() && !first_nonempty {
-                        first_nonempty = true;
-                        let response = matches.response(&query, &root, id, false, literal);
-                        let _ = tx.send(Message::Scored {
-                            epoch,
-                            response,
-                            final_pass: false,
-                            fuzzy: !literal,
-                        });
-                    }
-                }
-                if cancelled() {
-                    return;
-                }
-                if matches.total == 0 && literal && fallback {
-                    literal = false;
-                    continue;
-                }
-                let response = matches.response(&query, &root, id, complete, literal);
+            // A final response is dropped when batches arrived meanwhile. The first usable
+            // result must not wait for arrivals to stop, so it goes out on its own first.
+            if publish_early && !matches.hits.is_empty() {
                 let _ = tx.send(Message::Scored {
                     epoch,
-                    response,
-                    final_pass: true,
+                    response: matches.response(query, &root, id, false, literal),
+                    final_pass: false,
                     fuzzy: !literal,
+                    partial: None,
                 });
-                break;
             }
+            let response = matches.response(query, &root, id, complete, literal);
+            let _ = tx.send(Message::Scored {
+                epoch,
+                response,
+                final_pass: true,
+                fuzzy: !literal,
+                partial: Some(Box::new(Partial {
+                    key,
+                    exclude,
+                    fallback,
+                    literal,
+                    mac,
+                    supplement,
+                    matches,
+                })),
+            });
         });
     }
     fn persist(&mut self) {
@@ -1328,6 +1410,7 @@ impl Worker {
     }
     fn pause(&mut self) {
         self.active = None;
+        self.partial = None;
         self.score_at = None;
         self.epoch.fetch_add(1, Ordering::AcqRel);
         self.scoring = false;

@@ -2,9 +2,9 @@
 
 ## Product and current scope
 
-Crawler is a native macOS app for finding and reading files. The shipping app is the Rust port built on Rune in `crawler-rune/`. The Swift/AppKit app in `Sources/Crawler/` is the reference implementation that the rest of this document describes; the port must match it feature for feature. The title bar holds five sections: Search, Folders, Activity, Transfers and Settings. Search and Folders share the scope funnel. `prototype/` contains HTML mockups, including the historical Finder mockup and the section shell prototype; changes there do not affect the native app.
+Crawler is a native macOS app for finding and reading files. The shipping app is the Rust port built on Rune in `crawler-rune/`. The Swift/AppKit app in `Sources/Crawler/` is the reference implementation that the rest of this document describes; the port matches it feature for feature except where "Opening files in the Rust port" says otherwise. The title bar holds five sections: Search, Folders, Activity, Transfers and Settings. Search and Folders share the scope funnel. `prototype/` contains HTML mockups, including the historical Finder mockup and the section shell prototype; changes there do not affect the native app.
 
-Folders shows places for Home, Downloads, Desktop, at most one user-pinned folder and connected volumes. Search starts at Home, with recent files inside the empty-query view. Activity is the process monitor, Transfers is AirDrop and Settings holds the theme and default text editor. There are no tabs, sidebar, Columns view, System Settings workspace or Trash workspace. Crawler does not move, rename or delete files. Do not restore synthetic data or add destructive disk operations unless the maintainer asks for them.
+Folders shows places for Home, Downloads, Desktop, at most one user-pinned folder and connected volumes. Search starts at Home, with recent files inside the empty-query view. Activity is the process monitor, Transfers is AirDrop and Settings holds the theme (the Swift app also keeps a default text editor there). There are no tabs, sidebar, Columns view, System Settings workspace or Trash workspace. Crawler does not move, rename or delete files. Do not restore synthetic data or add destructive disk operations unless the maintainer asks for them.
 
 ## Collaboration rules
 
@@ -90,7 +90,7 @@ Folders keeps one Back/Forward history for the session. Search and Folders each 
 
 ## Navigation and layout
 
-The title bar (`SectionBar`) shows Search ⌘1, Folders ⌘2, Activity ⌘3, Transfers ⌘4 and Settings ⌘, after the window controls, then the Open menu, the command palette and keyboard help. `ShellButton` draws section and place buttons in the current theme: a tinted block in modern themes, an inverted block in System 7 and raised or pressed bevels in Windows Retro and Linux Retro. Folders adds `PlacesBar`: Back and Forward (⌘[ and ⌘]), the places, refresh and pin. ⌘L swaps the places for a path field. The scope funnel owns its search and two-panel folder layouts below these bars.
+The title bar (`SectionBar`) shows Search ⌘1, Folders ⌘2, Activity ⌘3, Transfers ⌘4 and Settings ⌘, after the window controls, then the command palette and keyboard help (the Swift app also has an Open menu there). `ShellButton` draws section and place buttons in the current theme: a tinted block in modern themes, an inverted block in System 7 and raised or pressed bevels in Windows Retro and Linux Retro. Folders adds `PlacesBar`: Back and Forward (⌘[ and ⌘]), the places, refresh and pin. ⌘L swaps the places for a path field. The scope funnel owns its search and two-panel folder layouts below these bars.
 
 Every pane starts with a `PaneTitle` strip. The active pane, where keyboard navigation goes, is drawn the way each theme marks an active window: pinstripes behind the title in System 7, a navy gradient in Windows Retro, the green accent in Linux Retro, an inverted bar in Terminal and an accent dot in the modern themes. Do not add focus rings around panes. Folders shows the folder name and its parent in the current pane's strip, not as a separate path line.
 
@@ -156,7 +156,27 @@ Enter/double-click and search activation open Markdown in `MarkdownReader` insid
 
 Enter/double-click and search activation open Word documents (`.docx`, `.docm`, `.dotx`) read-only in `MarkdownReader`: `WordDocument` reads the package parts with the system `unzip` inside `PreviewTextLoader` and converts headings (Title and heading styles), bold, italics, strikethrough, lists, tables and external links to Markdown, so zoom, column, find and themes match Markdown. Fonts, colors, images and page layout are dropped. Panes keep the Quick Look thumbnail. E or Open in app opens the original in its default app. `.doc`, `.odt` and `.pages` still open in their default app.
 
-Code and plain text open through `FileOpening` and the chosen installed editor; other formats use macOS defaults. Crawler Settings and the Open dropdown share `defaultTextEditorBundleID`. Discover app declarations in the background; do not hard-code editors or modify global file associations. Record recent-file history only after a successful open/display.
+In the Swift app, code and plain text open through `FileOpening` and the chosen installed editor; other formats use macOS defaults. Its Settings and Open dropdown share `defaultTextEditorBundleID`. Record recent-file history only after a successful open/display.
+
+## Opening files in the Rust port
+
+Every file opens inside Crawler. There is no Open button, no default text editor, no editor discovery and no hand-off to another app: do not add them back. Enter on a file Crawler cannot draw (archives, disk images, audio, apps and other packages) does nothing. Terminal for the current folder and Reveal in Finder stay in the command palette.
+
+`DocumentKind::for_path` in `funnel/model.rs` is the only extension table. `preview::content::Format::of` groups its kinds and `opening::dispatch` routes them: folders to Folders, PDFs to the PDF reader and Markdown, Word, spreadsheets, code, plain text, images and video to the document reader (`Reader::Document`, `preview/mod.rs`). Add a format to that table, never to a second list.
+
+The document reader has one header for every format: Back, the name, the position, then only the controls that document can use. A `Document` has one `Body`:
+
+- `Blocks`: Markdown, `.docx` and, through `/usr/bin/textutil` into a temporary `.docx`, `.doc`, `.rtf` and `.odt`. O or the header shows the heading outline.
+- `Text`: code and plain text up to 16 MB. One buffer, a `u32` offset per line and one sorted highlight list; never a `String` per line. Rune colours the first 128 KiB. Lines show their numbers, W toggles wrapping (unwrapped text scrolls sideways) and Command-L goes to a line.
+- `Sheet`: one sheet at a time in a flat cell arena (`preview/sheet.rs`). `.xlsx`, `.xlsm` and `.xlsb` stream cell by cell through calamine and stop at 200,000 rows, 512 columns or 4 million cells; `.xls` and `.ods` have no streaming reader, so calamine reads their sheet whole and panes show their Quick Look thumbnail instead. `.csv` and `.tsv` use the same grid. Column letters and the first row stay at the top, row numbers at the left, sheet tabs at the bottom, and Command-L goes to a row.
+- `None`: images (ImageIO, 3072 px in the reader and 1280 px in panes, with click, pinch and Command-plus/minus zoom) and video.
+
+Images decode through ImageIO's `SubsampleFactor`, so the decoder drops pixels by two, four or eight; the single draw into the RGBA buffer does the last step down and applies the EXIF orientation (`preview/native.rs`). Do not go back to `CGImageSourceCreateThumbnail` for files: its resampling took 42 ms on a 2400 px JPEG that subsampling decodes in 11 ms.
+
+In the port's index, cache blocks are verified and decoded on up to eight threads, in the query's priority order. A scoring pass is one parallel pass with a single merge. When a pass has the same query over the same batches plus new ones at the end, it scores only the new ones and merges them into the previous pass (`Partial` in `index/worker.rs`); the top 100, scope counts and total are the same as a full pass. The first usable result is sent on its own before the final response, because a final response is dropped while batches keep arriving. Check any change here by comparing `file_search_results`, `total_matches` and the scope counts of the old and new builds on the same cache.
+
+Find (Command-F) works in blocks, text lines and sheet rows. Command-[ goes back through documents opened from links, whatever their format; closing a PDF opened from a link returns to that document. All rows are virtual: build nothing per row outside the visible window, and build theme tokens once per view, not once per row.
+
 
 ## Video previews
 

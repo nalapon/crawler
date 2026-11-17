@@ -1416,7 +1416,11 @@ fn file_list(app: &App, p: &Paint, list: List) -> El {
         List::Child => "child-scroll".into(),
         List::Context => "context-scroll".into(),
     };
-    let look = p.look;
+    // The theme's tokens are built once per list, not once per row.
+    let paint = Paint {
+        look: p.look,
+        kit: p.kit.clone(),
+    };
     let version = (session(app).revision, Arc::as_ptr(rows(app, list)) as usize);
     let stack = col()
         .key(format!("{key}-rows"))
@@ -1426,17 +1430,7 @@ fn file_list(app: &App, p: &Paint, list: List) -> El {
             count,
             row_height(app, list),
             move |a: &App, i| rows(a, list)[i].id.key().into(),
-            move |a: &App, i| {
-                file_row(
-                    a,
-                    &Paint {
-                        look,
-                        kit: look.kit(),
-                    },
-                    list,
-                    &rows(a, list)[i],
-                )
-            },
+            move |a: &App, i| file_row(a, &paint, list, &rows(a, list)[i]),
         )
         .virtual_rows_version((
             version,

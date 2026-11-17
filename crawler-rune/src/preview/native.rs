@@ -2,15 +2,16 @@
 use block2::RcBlock;
 use objc2::{AllocAnyThread, rc::autoreleasepool};
 use objc2_core_foundation::{
-    CFBoolean, CFDictionary, CFNumber, CFString, CFType, CFURL, CGPoint, CGRect, CGSize,
+    CFDictionary, CFNumber, CFString, CFType, CFURL, CGPoint, CGRect, CGSize,
 };
 use objc2_core_graphics::{
-    CGBitmapContextCreate, CGColorSpace, CGContext, CGImage, CGImageAlphaInfo, CGImageByteOrderInfo,
+    CGBitmapContextCreate, CGColorSpace, CGContext, CGImage, CGImageAlphaInfo,
+    CGImageByteOrderInfo, CGInterpolationQuality,
 };
 use objc2_foundation::{NSError, NSString, NSURL};
 use objc2_image_io::{
-    CGImageSource, kCGImageSourceCreateThumbnailFromImageAlways,
-    kCGImageSourceCreateThumbnailWithTransform, kCGImageSourceThumbnailMaxPixelSize,
+    CGImageSource, kCGImagePropertyOrientation, kCGImagePropertyPixelHeight,
+    kCGImagePropertyPixelWidth, kCGImageSourceSubsampleFactor,
 };
 use objc2_quick_look_thumbnailing::{
     QLThumbnailGenerationRequest, QLThumbnailGenerationRequestRepresentationTypes,
@@ -28,30 +29,100 @@ pub struct Bitmap {
     pub rgba: Vec<u8>,
 }
 
+/// Decodes an image at about `max_pixels` on its longer side.
+///
+/// The decoder itself drops pixels by a factor of two, four or eight (`SubsampleFactor`), which
+/// for JPEG costs a fraction of ImageIO's thumbnail resampling. The last step down to
+/// `max_pixels`, and the EXIF rotation, happen in the one draw that fills the RGBA buffer.
 pub fn image(path: &Path, max_pixels: u32) -> Result<Bitmap, String> {
     let url = CFURL::from_file_path(path).ok_or("Invalid image path")?;
-    let limit = CFNumber::new_i32(max_pixels as i32);
-    // ImageIO takes these exact CFString keys and CFBoolean/CFNumber values. It decodes a
-    // transformed thumbnail directly, rather than allocating the full camera image first.
-    let image = unsafe {
-        let options = CFDictionary::<CFString, CFType>::from_slices(
-            &[
-                kCGImageSourceCreateThumbnailFromImageAlways,
-                kCGImageSourceCreateThumbnailWithTransform,
-                kCGImageSourceThumbnailMaxPixelSize,
-            ],
-            &[
-                CFBoolean::new(true).as_ref(),
-                CFBoolean::new(true).as_ref(),
-                AsRef::<CFType>::as_ref(&*limit),
-            ],
-        );
+    // SAFETY: ImageIO takes these exact CFString keys with CFNumber values, and returns its
+    // properties as a CFString-keyed dictionary.
+    let (image, orientation) = unsafe {
         let source = CGImageSource::with_url(&url, None).ok_or("This image could not be read.")?;
-        source
-            .thumbnail_at_index(0, Some(options.as_opaque()))
-            .ok_or("This image could not be decoded.")?
+        let properties = source.properties_at_index(0, None);
+        let number = |key: &CFString| {
+            let properties = properties.as_deref()?;
+            let typed = &*std::ptr::from_ref(properties).cast::<CFDictionary<CFString, CFType>>();
+            typed.get(key)?.downcast::<CFNumber>().ok()?.as_i32()
+        };
+        let longest = number(kCGImagePropertyPixelWidth)
+            .max(number(kCGImagePropertyPixelHeight))
+            .unwrap_or(0);
+        let factor = [8, 4, 2]
+            .into_iter()
+            .find(|factor| longest / factor >= max_pixels as i32)
+            .unwrap_or(1);
+        let factor = CFNumber::new_i32(factor);
+        let options = CFDictionary::<CFString, CFType>::from_slices(
+            &[kCGImageSourceSubsampleFactor],
+            &[AsRef::<CFType>::as_ref(&*factor)],
+        );
+        let image = source
+            .image_at_index(0, Some(options.as_opaque()))
+            .ok_or("This image could not be decoded.")?;
+        (image, number(kCGImagePropertyOrientation).unwrap_or(1))
     };
-    rgba(&image)
+    let (width, height) = (
+        CGImage::width(Some(&image)) as f64,
+        CGImage::height(Some(&image)) as f64,
+    );
+    if width < 1.0 || height < 1.0 {
+        return Err("This image could not be decoded.".into());
+    }
+    let scale = (f64::from(max_pixels) / width.max(height)).min(1.0);
+    let (drawn_width, drawn_height) = ((width * scale).round().max(1.0), (height * scale).round().max(1.0));
+    // EXIF orientations 5 to 8 turn the picture a quarter, so the bitmap swaps its sides.
+    let (out_width, out_height) = if orientation >= 5 {
+        (drawn_height, drawn_width)
+    } else {
+        (drawn_width, drawn_height)
+    };
+    draw_rgba(out_width as usize, out_height as usize, |context| {
+        let (w, h) = (out_width, out_height);
+        // Each case maps the stored picture onto the upright one (Core Graphics is y-up).
+        match orientation {
+            2 => {
+                CGContext::translate_ctm(Some(context), w, 0.0);
+                CGContext::scale_ctm(Some(context), -1.0, 1.0);
+            }
+            3 => {
+                CGContext::translate_ctm(Some(context), w, h);
+                CGContext::rotate_ctm(Some(context), std::f64::consts::PI);
+            }
+            4 => {
+                CGContext::translate_ctm(Some(context), 0.0, h);
+                CGContext::scale_ctm(Some(context), 1.0, -1.0);
+            }
+            5 => {
+                CGContext::translate_ctm(Some(context), w, h);
+                CGContext::scale_ctm(Some(context), 1.0, -1.0);
+                CGContext::rotate_ctm(Some(context), std::f64::consts::FRAC_PI_2);
+            }
+            6 => {
+                CGContext::translate_ctm(Some(context), 0.0, h);
+                CGContext::rotate_ctm(Some(context), -std::f64::consts::FRAC_PI_2);
+            }
+            7 => {
+                CGContext::scale_ctm(Some(context), -1.0, 1.0);
+                CGContext::rotate_ctm(Some(context), std::f64::consts::FRAC_PI_2);
+            }
+            8 => {
+                CGContext::translate_ctm(Some(context), w, 0.0);
+                CGContext::rotate_ctm(Some(context), std::f64::consts::FRAC_PI_2);
+            }
+            _ => {}
+        }
+        CGContext::set_interpolation_quality(Some(context), CGInterpolationQuality::Medium);
+        CGContext::draw_image(
+            Some(context),
+            CGRect::new(
+                CGPoint::new(0.0, 0.0),
+                CGSize::new(drawn_width, drawn_height),
+            ),
+            Some(&image),
+        );
+    })
 }
 
 pub fn thumbnail(path: &Path, cancelled: &impl Fn() -> bool) -> Option<Bitmap> {
@@ -98,6 +169,20 @@ pub fn thumbnail(path: &Path, cancelled: &impl Fn() -> bool) -> Option<Bitmap> {
 fn rgba(image: &CGImage) -> Result<Bitmap, String> {
     let width = CGImage::width(Some(image));
     let height = CGImage::height(Some(image));
+    draw_rgba(width, height, |context| {
+        CGContext::draw_image(
+            Some(context),
+            CGRect::new(
+                CGPoint::new(0.0, 0.0),
+                CGSize::new(width as f64, height as f64),
+            ),
+            Some(image),
+        );
+    })
+}
+
+/// Fills a straight-alpha RGBA bitmap of this size with whatever `draw` paints.
+fn draw_rgba(width: usize, height: usize, draw: impl FnOnce(&CGContext)) -> Result<Bitmap, String> {
     if width == 0 || height == 0 || width > 4096 || height > 4096 {
         return Err("The preview image is too large.".into());
     }
@@ -116,17 +201,14 @@ fn rgba(image: &CGImage) -> Result<Bitmap, String> {
         )
     }
     .ok_or("Could not create a preview bitmap.")?;
-    CGContext::draw_image(
-        Some(&context),
-        CGRect::new(
-            CGPoint::new(0.0, 0.0),
-            CGSize::new(width as f64, height as f64),
-        ),
-        Some(image),
-    );
+    draw(&context);
     drop(context);
     for pixel in data.as_chunks_mut::<4>().0 {
         let alpha = u32::from(pixel[3]);
+        // Photos are opaque: their premultiplied colours are already straight.
+        if alpha == 255 {
+            continue;
+        }
         for c in &mut pixel[..3] {
             *c = (u32::from(*c) * 255 + alpha / 2)
                 .checked_div(alpha)

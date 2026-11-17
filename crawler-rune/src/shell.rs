@@ -18,7 +18,7 @@ pub struct Toast {
 }
 
 /// Search ⌘1, Folders ⌘2, Activity ⌘3, Transfers ⌘4 and Settings ⌘, after the window controls,
-/// then the Open menu, the command palette and keyboard help.
+/// then the command palette and keyboard help.
 pub fn section_bar(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) -> El {
     let inset = cx.titlebar_inset().max(LIGHTS_INSET);
     let mut buttons = row()
@@ -58,13 +58,6 @@ pub fn section_bar(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) 
                 .key("section-bar-trailing")
                 .gap(6.0)
                 .items_center()
-                .child(
-                    if matches!(app.section, Section::Search | Section::Folders) {
-                        crate::opening::open_menu(app, p, layer)
-                    } else {
-                        el()
-                    },
-                )
                 .child(settings::bar_buttons(app, p, layer)),
         )
 }
@@ -150,7 +143,7 @@ fn shell_button_with_icon(
     let action = match key {
         "folder-back" | "map-back" => Some(ControlIcon::Back),
         "folder-forward" => Some(ControlIcon::Forward),
-        "folder-refresh" | "airdrop-refresh" | "refresh-editors" => Some(ControlIcon::Refresh),
+        "folder-refresh" | "airdrop-refresh" => Some(ControlIcon::Refresh),
         "activity-pause" => Some(if active {
             ControlIcon::Play
         } else {
@@ -161,7 +154,6 @@ fn shell_button_with_icon(
         "airdrop-clear" => Some(ControlIcon::Close),
         "commands-button" => Some(ControlIcon::Command),
         "help-button" => Some(ControlIcon::Help),
-        "open-editor-menu" => Some(ControlIcon::Down),
         _ => None,
     };
     if key.starts_with("eject-") {
@@ -177,7 +169,6 @@ fn shell_button_with_icon(
                 | "folder-refresh"
                 | "commands-button"
                 | "help-button"
-                | "open-editor-menu"
         );
     if !icon_only {
         content = content.child(
@@ -205,7 +196,6 @@ fn shell_button_with_icon(
 pub enum ControlIcon {
     Back,
     Forward,
-    Down,
     Refresh,
     Pause,
     Play,
@@ -214,14 +204,12 @@ pub enum ControlIcon {
     Close,
     Command,
     Help,
-    Document,
 }
 pub fn control_icon(kind: ControlIcon, ink: rune::Color, size: f32) -> El {
     use ControlIcon::*;
     let lines: Vec<Vec<[f32; 2]>> = match kind {
         Back => vec![vec![[9., 2.], [4., 7.], [9., 12.]]],
         Forward => vec![vec![[5., 2.], [10., 7.], [5., 12.]]],
-        Down => vec![vec![[3., 5.], [7., 9.], [11., 5.]]],
         Pause => vec![vec![[5., 3.], [5., 11.]], vec![[9., 3.], [9., 11.]]],
         Play => vec![vec![[4., 2.], [11., 7.], [4., 12.], [4., 2.]]],
         Add => vec![vec![[7., 2.], [7., 12.]], vec![[2., 7.], [12., 7.]]],
@@ -276,17 +264,6 @@ pub fn control_icon(kind: ControlIcon, ink: rune::Color, size: f32) -> El {
             [11., 5.],
             [5., 5.],
         ]],
-        Document => vec![
-            vec![
-                [3., 1.],
-                [8., 1.],
-                [11., 4.],
-                [11., 13.],
-                [3., 13.],
-                [3., 1.],
-            ],
-            vec![[8., 1.], [8., 4.], [11., 4.]],
-        ],
     };
     let mut shape = rune::Shape::new();
     for line in lines {

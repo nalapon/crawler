@@ -10,18 +10,13 @@ use rune::{
     Cx, El, FileDialogOptions, Key, KeyEvent, Latest, TextEdit, Tx, Waker, col, el, row, text,
 };
 use rune_kit::TextInput;
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Page {
     #[default]
     Commands,
     Themes,
-    Editors,
-    FolderEditors,
     Drives,
 }
 #[derive(Clone)]
@@ -35,7 +30,6 @@ enum Action {
     AirDrop,
     Page(Page),
     Theme(Theme),
-    Editor(PathBuf),
     Terminal,
     ChooseFolder,
     Pin,
@@ -61,9 +55,6 @@ pub struct State {
     context: platform::Context,
     request: Latest<platform::Context>,
     font_theme: Option<Theme>,
-    icon_paths: Vec<PathBuf>,
-    editor_icons: HashMap<PathBuf, rune::Pixels>,
-    icon_request: Latest<HashMap<PathBuf, rune::Pixels>>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -77,15 +68,11 @@ impl Default for State {
             context: platform::Context::default(),
             request: Latest::default(),
             font_theme: None,
-            icon_paths: Vec::new(),
-            editor_icons: HashMap::new(),
-            icon_request: Latest::default(),
         }
     }
 }
 pub fn setup(app: &mut App, waker: &Waker) {
     app.settings.request.set_waker(waker.clone());
-    app.settings.icon_request.set_waker(waker.clone());
 }
 pub fn poll(app: &mut App, tx: &mut Tx) -> bool {
     let theme = app.theme_preview.unwrap_or(app.theme);
@@ -102,20 +89,6 @@ pub fn poll(app: &mut App, tx: &mut Tx) -> bool {
         tx.set_font_families(family, "IBM Plex Mono");
     }
     let mut changed = false;
-    let paths: Vec<_> = app.opening.editors.iter().map(|e| e.path.clone()).collect();
-    if paths != app.settings.icon_paths {
-        app.settings.icon_paths = paths.clone();
-        app.settings.icon_request.request(paths, |paths| {
-            paths
-                .into_iter()
-                .filter_map(|path| platform::application_icon(&path).map(|icon| (path, icon)))
-                .collect()
-        });
-    }
-    if let Some(icons) = app.settings.icon_request.take() {
-        app.settings.editor_icons = icons;
-        changed = true;
-    }
     if let Some(context) = app.settings.request.take() {
         app.settings.context = context;
         changed = app.settings.open;
@@ -171,28 +144,6 @@ fn commands(app: &App) -> Vec<Command> {
                     path.display().to_string(),
                     "volume disk",
                     Action::Folder(path.clone()),
-                );
-            }
-        }
-        Page::Editors => {
-            for application in &s.context.applications {
-                add(
-                    application.path.display().to_string(),
-                    application.name.clone(),
-                    String::new(),
-                    "app editor",
-                    Action::Editor(application.path.clone()),
-                );
-            }
-        }
-        Page::FolderEditors => {
-            for editor in &app.opening.editors {
-                add(
-                    editor.bundle_id.clone(),
-                    editor.name.clone(),
-                    String::new(),
-                    "editor",
-                    Action::Editor(editor.path.clone()),
                 );
             }
         }
@@ -262,13 +213,6 @@ fn commands(app: &App) -> Vec<Command> {
                     Action::Open,
                 );
                 if !s.context.selected_is_folder {
-                    add(
-                        "open-with".into(),
-                        format!("Open {name} with…"),
-                        String::new(),
-                        "open app editor",
-                        Action::Page(Page::Editors),
-                    );
                     add(
                         "preview".into(),
                         format!("Quick Look {name}"),
@@ -344,13 +288,6 @@ fn commands(app: &App) -> Vec<Command> {
                     String::new(),
                     "shell console",
                     Action::Terminal,
-                );
-                add(
-                    "folder-editor".into(),
-                    "Open current folder in editor…".into(),
-                    String::new(),
-                    "code project",
-                    Action::Page(Page::FolderEditors),
                 );
             }
             add(
@@ -438,7 +375,6 @@ fn activate(app: &mut App, tx: &mut Tx) {
     }
     let files = app.settings.files.clone();
     let folder = app.settings.folder.clone();
-    let folder_editor = app.settings.page == Page::FolderEditors;
     close_palette(app);
     match c.action {
         Action::Section(section) => {
@@ -475,15 +411,6 @@ fn activate(app: &mut App, tx: &mut Tx) {
         Action::Theme(theme) => {
             tx.color_motion(rune::tok::motion::CALM);
             app.set_theme(theme);
-        }
-        Action::Editor(editor) => {
-            if let Some(path) = if folder_editor {
-                folder
-            } else {
-                files.first().cloned()
-            } {
-                opening::open_with_application(app, &path, &editor, !folder_editor);
-            }
         }
         Action::Terminal => {
             if let Some(folder) = folder {
@@ -612,8 +539,6 @@ pub fn overlays(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) {
         let title = match app.settings.page {
             Page::Commands => "Commands",
             Page::Themes => "Choose a theme",
-            Page::Editors => "Open with",
-            Page::FolderEditors => "Choose editor",
             Page::Drives => "Connected drives",
         };
         let input = TextInput::new(&app.settings.query)
@@ -717,12 +642,6 @@ pub fn overlays(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) {
         if choices.is_empty() {
             let empty = match app.settings.page {
                 Page::Drives if funnel::connected_volumes(app).is_empty() => "No connected drives",
-                Page::FolderEditors if app.opening.editors.is_empty() => {
-                    "No installed editors support opening this folder."
-                }
-                Page::Editors if app.settings.context.applications.is_empty() => {
-                    "No installed apps support this file."
-                }
                 _ => "No matches",
             };
             rows = rows.child(
@@ -849,7 +768,11 @@ fn help_sheet(app: &App, p: &Paint, layer: &mut Vec<El>, size: [f32; 2]) {
             ("↵", "Open file / enter folder"),
             ("⌘↵", "Show in Folders"),
             ("Space", "Preview file"),
-            ("Esc Esc", "Close the reader"),
+            ("Esc Esc / X", "Close the reader"),
+            ("⌘F / ⌘G", "Find in the document / next match"),
+            ("⌘L", "Go to a line or sheet row in the reader"),
+            ("O / W", "Outline of headings / wrap code lines"),
+            ("⌘+ ⌘− ⌘0", "Zoom the document or picture"),
             ("⌘[ / ⌘]", "Back / forward in Folders"),
             ("⌘L", "Go to a folder path"),
             ("⌘R", "Refresh"),
@@ -1064,88 +987,11 @@ pub fn view(app: &App, cx: &mut Cx<App>, p: &Paint, _layer: &mut Vec<El>) -> El 
     }
     content = content.child(
         heading(
-            "Default text editor",
-            "Code and plain text open with this app, as do files you send from the reader with E.",
+            "Documents",
+            "Every file opens inside Crawler: PDFs, Markdown, Word, spreadsheets, code, plain text, images and video. Crawler never hands a file to another app.",
         )
         .mt(30.0),
     );
-    let selected = opening::selected_editor(app);
-    let current = selected.map_or("No text editor found", |e| e.name.as_str());
-    let editors = el()
-        .key("default-editor")
-        .role("button")
-        .label("Default text editor")
-        .w(292.0)
-        .h(20.0)
-        .radius(5.0)
-        .fill(crate::theme::rgb(if p.look.dark {
-            0x555759
-        } else {
-            0xffffff
-        }))
-        .border(
-            0.5,
-            crate::theme::rgb(if p.look.dark { 0x646668 } else { 0xc8c8c8 }),
-        )
-        .shadow(1.0, 2.0, rune::Color::BLACK.alpha(0.12))
-        .child(
-            row()
-                .w_full()
-                .h_full()
-                .px(7.0)
-                .gap(5.0)
-                .items_center()
-                .child(editor_icon(app, p, 16.0))
-                .child(
-                    text(current)
-                        .font(p.look.font(12.0, 400.0))
-                        .color(if p.look.dark {
-                            rune::Color::WHITE
-                        } else {
-                            rune::Color::BLACK
-                        })
-                        .truncate()
-                        .grow(1.0)
-                        .min_w(0.0),
-                )
-                .child(
-                    col()
-                        .w(14.0)
-                        .h(16.0)
-                        .radius(3.0)
-                        .fill(crate::theme::rgb(0x377df6))
-                        .center()
-                        .child(rune::icon(p.kit.glyph.chevron_up, 9.0).color(rune::Color::WHITE))
-                        .child(rune::icon(p.kit.glyph.chevron_down, 9.0).color(rune::Color::WHITE)),
-                ),
-        );
-    let editors = p
-        .kit
-        .interactive(editors)
-        .press_scale(0.99)
-        .disabled(app.opening.editors.is_empty())
-        .on_press_tx(|a: &mut App, tx| {
-            let mut menu = rune::PopupMenu::new();
-            for editor in &a.opening.editors {
-                menu = menu.item(
-                    rune::PopupItem::new(editor.bundle_id.clone(), editor.name.clone())
-                        .checked(opening::selected_editor(a) == Some(editor)),
-                );
-            }
-            tx.popup_menu(menu, "default-editor", |a: &mut App, picked, _| {
-                if let Some(id) = picked {
-                    opening::set_default_editor(a, Some(id.to_owned()));
-                }
-            });
-        });
-    let editors = row().h(30.0).gap(20.0).items_center().child(editors).child(
-        shell::shell_button(p, "refresh-editors", "Refresh editors", false)
-            .w(136.0)
-            .on_press(opening::refresh_editors),
-    );
-    content=content.child(editors)
-        .child(text(if app.opening.editors.is_empty() { "No text editor found. Installed editor discovery runs in the background.".into() } else if app.opening.default_editor.as_ref().is_some_and(|id|!app.opening.editors.iter().any(|e|&e.bundle_id==id)) { "Your saved editor is unavailable. Choose another editor above.".into() } else { format!("{} installed editors · This choice applies only in Crawler.",app.opening.editors.len()) }).font(p.look.font(11.0,400.0)).color(p.look.muted).wrap().h(34.0))
-        .child(heading("PDFs, Markdown and Word","PDFs, Markdown and Word documents open in Crawler's reader. Images and video use the macOS default apps.").mt(16.0));
     col().key("settings").min_h(0.0).child(
         col()
             .key("settings-scroll")
@@ -1160,14 +1006,4 @@ pub fn view(app: &App, cx: &mut Cx<App>, p: &Paint, _layer: &mut Vec<El>) -> El 
 
 pub fn palette_visible(app: &App) -> bool {
     app.settings.open
-}
-
-/// The cached icon is shared by Settings and the titlebar's Open button.
-pub fn editor_icon(app: &App, p: &Paint, size: f32) -> El {
-    opening::selected_editor(app)
-        .and_then(|editor| app.settings.editor_icons.get(&editor.path))
-        .map_or_else(
-            || shell::control_icon(shell::ControlIcon::Document, p.look.text, size),
-            |pixels| el().size(size, size).pixels(pixels).inert(),
-        )
 }

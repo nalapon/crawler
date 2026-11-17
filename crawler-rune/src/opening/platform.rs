@@ -1,5 +1,5 @@
 //! Cocoa calls stay here. Callers send only owned Rust paths and results across threads.
-use super::{Editor, OpenResult};
+use super::OpenResult;
 use objc2::{msg_send, rc::autoreleasepool};
 use objc2_app_kit::{NSRunningApplication, NSWorkspace, NSWorkspaceOpenConfiguration};
 use objc2_foundation::{
@@ -11,79 +11,36 @@ use rune::Waker;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 
-pub fn registered_apps() -> Vec<PathBuf> {
-    autoreleasepool(|_| {
-        let workspace = NSWorkspace::sharedWorkspace();
-        let mut out = Vec::new();
-        for ext in ["txt", "swift", "md"] {
-            let url = NSURL::fileURLWithPath(&NSString::from_str(&format!("/Crawler.{ext}")));
-            for url in workspace.URLsForApplicationsToOpenURL(&url).iter() {
-                if let Some(path) = url.path() {
-                    out.push(PathBuf::from(path.to_string()));
-                }
-            }
-        }
-        out
-    })
-}
-
-pub fn open(
-    path: &Path,
-    editor: Option<&Editor>,
-    result: Sender<OpenResult>,
-    waker: Option<Waker>,
-) {
-    open_url(path, editor.map(|e| e.path.as_path()), true, result, waker);
-}
+/// Hands `path` to an application (Terminal for a folder). The result arrives on `result`.
 pub fn open_application(
     path: &Path,
     application: &Path,
-    record: bool,
-    result: Sender<OpenResult>,
-    waker: Option<Waker>,
-) {
-    open_url(path, Some(application), record, result, waker);
-}
-fn open_url(
-    path: &Path,
-    application: Option<&Path>,
-    record: bool,
     result: Sender<OpenResult>,
     waker: Option<Waker>,
 ) {
     unsafe {
         let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
-        let path = path.to_owned();
         let completion = block2::RcBlock::new(
             move |_app: *mut NSRunningApplication, error: *mut NSError| {
-                let outcome = if let Some(error) = error.as_ref() {
-                    Err(error.localizedDescription().to_string())
-                } else {
-                    Ok(())
+                let outcome = match error.as_ref() {
+                    Some(error) => Err(error.localizedDescription().to_string()),
+                    None => Ok(()),
                 };
-                let _ = result.send(OpenResult {
-                    path: record.then(|| path.clone()),
-                    outcome,
-                });
+                let _ = result.send(outcome);
                 if let Some(w) = &waker {
                     w();
                 }
             },
         );
-        let workspace = NSWorkspace::sharedWorkspace();
-        let config = NSWorkspaceOpenConfiguration::new();
-        if let Some(application) = application {
-            let application =
-                NSURL::fileURLWithPath(&NSString::from_str(&application.to_string_lossy()));
-            workspace.openURLs_withApplicationAtURL_configuration_completionHandler(
+        let application =
+            NSURL::fileURLWithPath(&NSString::from_str(&application.to_string_lossy()));
+        NSWorkspace::sharedWorkspace()
+            .openURLs_withApplicationAtURL_configuration_completionHandler(
                 &NSArray::from_slice(&[&*url]),
                 &application,
-                &config,
+                &NSWorkspaceOpenConfiguration::new(),
                 Some(&completion),
             );
-        } else {
-            workspace.openURL_configuration_completionHandler(&url, &config, Some(&completion));
-        }
     }
 }
 
@@ -195,14 +152,6 @@ pub fn observe_volumes(tx: Sender<()>, waker: Waker) -> WorkspaceObserver {
     }
 }
 
-pub fn source_type(identifier: &str) -> bool {
-    use objc2_uniform_type_identifiers::{UTType, UTTypeSourceCode};
-    autoreleasepool(|_| unsafe {
-        UTType::typeWithIdentifier(&NSString::from_str(identifier))
-            .is_some_and(|t| t.conformsToType(UTTypeSourceCode))
-    })
-}
-
 pub fn is_package(path: &Path) -> bool {
     autoreleasepool(|_| unsafe {
         let url =
@@ -219,55 +168,6 @@ pub fn is_package(path: &Path) -> bool {
             b
         })
     })
-}
-
-pub fn is_hidden(path: &Path) -> bool {
-    autoreleasepool(|_| unsafe {
-        let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
-        let mut value = None;
-        if url
-            .getResourceValue_forKey_error(&mut value, objc2_foundation::NSURLIsHiddenKey)
-            .is_err()
-        {
-            return false;
-        }
-        value.is_some_and(|v| {
-            let b: bool = msg_send![&*v, boolValue];
-            b
-        })
-    })
-}
-
-pub fn observe_activation(tx: Sender<()>, waker: Waker) -> WorkspaceObserver {
-    use objc2_app_kit::{NSWorkspaceApplicationKey, NSWorkspaceDidActivateApplicationNotification};
-    use objc2_foundation::NSNotification;
-    use std::ptr::NonNull;
-    unsafe {
-        let center = NSWorkspace::sharedWorkspace().notificationCenter();
-        let block = block2::RcBlock::new(move |notification: NonNull<NSNotification>| {
-            let Some(info) = notification.as_ref().userInfo() else {
-                return;
-            };
-            let Some(app) = info.objectForKey(NSWorkspaceApplicationKey) else {
-                return;
-            };
-            let pid: i32 = msg_send![&*app, processIdentifier];
-            if pid == std::process::id() as i32 {
-                let _ = tx.send(());
-                waker();
-            }
-        });
-        let token = center.addObserverForName_object_queue_usingBlock(
-            Some(NSWorkspaceDidActivateApplicationNotification),
-            None,
-            None,
-            &block,
-        );
-        WorkspaceObserver {
-            center,
-            tokens: vec![token],
-        }
-    }
 }
 
 pub fn terminal_application() -> Option<PathBuf> {
