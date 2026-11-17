@@ -247,6 +247,7 @@ pub fn launched(app: &mut App) {
     consume_local(app);
 }
 pub fn setup(app: &mut App, waker: &Waker) {
+    crate::icons::setup(waker);
     app.funnel.in_workspace = active(app);
     let s = &mut app.funnel;
     s.waker = Some(waker.clone());
@@ -366,6 +367,7 @@ fn browse(app: &mut App, folder: FolderID, record: bool, tx: &mut Tx) {
     s.source_rows = None;
     s.scroll.set(0.0);
     s.saved_scroll = 0.0;
+    s.chrome.reset_anchor();
     s.chrome.hide_keyboard();
     s.revision += 1;
     app.funnel.browse_revision += 1;
@@ -470,6 +472,7 @@ fn query_changed(app: &mut App, _tx: &mut Tx) {
         s.usable = true;
         s.scope = None;
         s.scope_counts.clear();
+        s.chrome.reset_anchor();
         s.revision += 1;
         app.index.idle();
         prepare_browsing(app);
@@ -514,7 +517,7 @@ fn submit_query(app: &mut App) {
     s.pending = None;
     s.has_nonempty = false;
 }
-fn publish(app: &mut App, response: Response) -> bool {
+fn publish(app: &mut App, response: Response, tx: &mut Tx) -> bool {
     let id = response.id;
     let started = std::time::Instant::now();
     app.index.mark_stage(id, "publication_ms");
@@ -522,11 +525,21 @@ fn publish(app: &mut App, response: Response) -> bool {
     let s = session_mut(app);
     let rows: Vec<_> = response.hits.iter().map(Item::from_hit).collect();
     let changed = s.rows.as_ref() != &rows || !s.usable || s.complete != response.complete;
-    let changed = changed || s.scope_counts != response.scope_counts;
+    let scopes_changed = s.scope_counts != response.scope_counts;
+    let changed = changed || scopes_changed;
+    if scopes_changed {
+        s.revision += 1;
+    }
     s.scope_counts = response.scope_counts;
     if s.rows.as_ref() != &rows {
         s.rows = Arc::new(rows);
         s.revision += 1;
+    }
+    // A newer immediate publication supersedes a response waiting in the 40 ms window.
+    // Otherwise that older response can roll the rows and completion state backwards.
+    s.pending = None;
+    if s.published_query != Some(id) {
+        s.neighbor = None;
     }
     s.usable = true;
     s.published_query = Some(id);
@@ -534,6 +547,11 @@ fn publish(app: &mut App, response: Response) -> bool {
     s.has_nonempty |= !s.rows.is_empty();
     s.last_publication = clock;
     s.reconcile_selection();
+    // Rune anchors inserted virtual rows automatically. Until the user navigates or scrolls,
+    // keep the first result visible instead of following an early partial hit down the ranking.
+    if !s.chrome.has_interacted() {
+        tx.scroll_to_instant(list_key(app), 0.0, 0.0);
+    }
     app.index.mark_stage(id, "first_rows_ms");
     app.index.trace_stage(
         id,
@@ -666,7 +684,7 @@ fn update_context(app: &mut App) {
 }
 pub fn poll(app: &mut App, tx: &mut Tx) -> bool {
     let visible = active(app);
-    let mut changed = false;
+    let mut changed = crate::icons::poll();
     if let Some(volumes) = app.funnel.volumes.take() {
         let updated = app.funnel.mounted != volumes;
         changed |= visible && app.section == Section::Folders && updated;
@@ -712,7 +730,7 @@ pub fn poll(app: &mut App, tx: &mut Tx) -> bool {
                 if (!session(app).has_nonempty && !response.hits.is_empty())
                     || app.clock - session(app).last_publication >= 0.040
                 {
-                    changed |= publish(app, response);
+                    changed |= publish(app, response, tx);
                 } else {
                     session_mut(app).pending = Some(response);
                 }
@@ -722,7 +740,7 @@ pub fn poll(app: &mut App, tx: &mut Tx) -> bool {
             let remaining = 0.040 - (app.clock - session(app).last_publication);
             if remaining <= 0.0 {
                 if let Some(response) = session_mut(app).pending.take() {
-                    changed |= publish(app, response);
+                    changed |= publish(app, response, tx);
                 }
             } else {
                 tx.wake_after(Duration::from_secs_f64(remaining));
@@ -741,6 +759,9 @@ pub fn poll(app: &mut App, tx: &mut Tx) -> bool {
                 changed |= app.funnel.context_rows != context.rows;
                 app.funnel.context_rows = context.rows.clone();
                 app.funnel.context_error = context.error.clone();
+                if let Some(path) = focused_path(app) {
+                    tx.scroll_into_view_in("context-scroll", ItemID::new(&path).key());
+                }
                 app.funnel
                     .context_cache
                     .retain(|c| c.parent != context.parent);
@@ -794,14 +815,19 @@ fn select(app: &mut App, id: ItemID, mods: Mods, tx: &mut Tx, keyboard: bool) {
         s.anchor = Some(id.clone());
     }
     s.focused = Some(id.clone());
+    s.chrome.mark_interacted();
     s.query_focused = false;
     if keyboard {
         session(app).chrome.hide_keyboard();
+        session(app).chrome.mark_interacted();
         tx.scroll_into_view_in(list_key(app), id.key());
     }
     tx.focus(format!("{}-main-list", prefix(app)), false);
     sync_child(app);
     update_context(app);
+    if session(app).searching() {
+        tx.scroll_into_view_in("context-scroll", id.key());
+    }
 }
 fn move_selection(app: &mut App, delta: isize, shift: bool, tx: &mut Tx) {
     let s = session(app);
@@ -886,7 +912,7 @@ fn half_page_key(app: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
         if t.eq_ignore_ascii_case("d") || t.eq_ignore_ascii_case("u") {
             let count = session(app)
                 .chrome
-                .half_page(if browsing(app) { 32.0 } else { 44.0 });
+                .half_page(if browsing(app) { 44.0 } else { 58.0 });
             move_selection(
                 app,
                 if t.eq_ignore_ascii_case("d") {
@@ -1089,9 +1115,8 @@ pub fn status_line(app: &App) -> String {
         return match state {
             None | Some(Listing::Loading) => "Loading folder…".into(),
             Some(Listing::Failed(e)) => e.clone(),
-            Some(Listing::Ready(rows)) => format!(
-                "{} items{} · ↑↓ select · Return open · Space preview · ⌘R refresh",
-                rows.len(),
+            Some(Listing::Ready(_)) => format!(
+                "NAVIGATE{} · j/k Files · h/l Scope · / Search · Space Preview · ↵ Open",
                 if s.selected.len() > 1 {
                     format!(" · {} selected", s.selected.len())
                 } else {
@@ -1104,18 +1129,18 @@ pub fn status_line(app: &App) -> String {
         if let crate::index::Status::Failed(error) = app.index.status() {
             return error;
         }
-        format!(
-            "{} · ↑↓ select · Return open · Space preview",
-            if !s.usable {
-                "Searching…"
-            } else if !s.complete {
-                "Searching…"
-            } else {
-                "Search ready"
-            }
-        )
+        if !s.usable || s.rows.is_empty() && !s.complete {
+            "Searching… · Esc Navigate · Ctrl D/U Half page · ↵ Open".into()
+        } else if s.rows.len() >= 100 {
+            "Showing the best 100 results · Narrow your search".into()
+        } else {
+            format!(
+                "{} results · Esc Navigate · Ctrl D/U Half page · ↵ Open",
+                s.rows.len()
+            )
+        }
     } else {
-        "Recent files · Type to search · $ search this folder · Return open · Space preview".into()
+        "SEARCH · Esc Navigate · Ctrl D/U Half page · ↵ Open".into()
     }
 }
 
@@ -1131,9 +1156,10 @@ pub fn view(app: &App, cx: &mut Cx<App>, p: &Paint, _layer: &mut Vec<El>) -> El 
         body = body.child(places(app, p));
     }
     let query = TextInput::new(&s.query)
-        .placeholder("Search files…")
+        .placeholder("Find a file…")
         .label("Search files")
         .height(32.0)
+        .text_style(p.look.font(21.0, 400.0))
         .plain()
         .on_edit(|a: &mut App| &mut session_mut(a).query)
         .on_change(query_changed)
@@ -1141,12 +1167,11 @@ pub fn view(app: &App, cx: &mut Cx<App>, p: &Paint, _layer: &mut Vec<El>) -> El 
         .build(&p.kit)
         .key(query_key(app))
         .w_full();
+    let (_, root_title) = search_root(app);
     let scope_label = if s.local {
-        format!("In {}", name(&s.folder.0))
-    } else if let Some(scope) = &s.scope {
-        format!("In {}", scope.0.display())
+        "Current folder"
     } else {
-        "This Mac".into()
+        &root_title
     };
     body = body.child(
         col()
@@ -1164,25 +1189,25 @@ pub fn view(app: &App, cx: &mut Cx<App>, p: &Paint, _layer: &mut Vec<El>) -> El 
                     .px(14.0)
                     .gap(8.0)
                     .items_center()
-                    .border(1.0, p.look.line)
+                    .border(1.0, if s.local { p.look.accent } else { p.look.muted })
                     .radius(if p.look.era() == crate::theme::Era::Modern {
                         8.0
                     } else {
                         0.0
                     })
                     .fill(if s.local {
-                        p.look.selection.alpha(0.45)
+                        p.look.accent.alpha(0.07)
                     } else {
-                        p.look.raised
+                        p.look.background
                     })
                     .child(query.grow(1.0).min_w(0.0))
                     .child(
                         text(scope_label)
                             .key("search-scope-label")
-                            .font(rune::tok::type_::LABEL)
-                            .color(p.look.muted)
+                            .font(p.look.font(11.0, 500.0))
+                            .color(if s.local { p.look.accent } else { p.look.muted })
                             .truncate()
-                            .max_w(120.0)
+                            .max_w(110.0)
                             .inert(),
                     ),
             ),
@@ -1195,13 +1220,32 @@ pub fn view(app: &App, cx: &mut Cx<App>, p: &Paint, _layer: &mut Vec<El>) -> El 
         "Recently opened".into()
     };
     let detail = if browsing(app) {
-        s.folder.0.parent().map(|p| p.display().to_string())
+        s.folder
+            .0
+            .parent()
+            .map(|p| format!("in {}", model::display_path(p)))
+    } else if s.searching() {
+        let (root, title) = search_root(app);
+        let relative = s
+            .scope
+            .as_ref()
+            .and_then(|f| f.0.strip_prefix(&root).ok())
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| format!("  /  {}", p.display().to_string().replace('/', "  /  ")))
+            .unwrap_or_default();
+        Some(format!("in {title}{relative}"))
     } else {
         None
     };
     let main = col()
         .key(format!("{}-main-pane", prefix(app)))
-        .grow(1.0)
+        .grow(if s.searching() {
+            0.43
+        } else if browsing(app) {
+            0.5
+        } else {
+            0.46
+        })
         .min_w(0.0)
         .min_h(0.0)
         .h_full()
@@ -1226,12 +1270,21 @@ pub fn view(app: &App, cx: &mut Cx<App>, p: &Paint, _layer: &mut Vec<El>) -> El 
                 .motion(rune::tok::motion::SNAPPY)
                 .child(main_content(app, p)),
         );
-    let mut panels = row().key("funnel-panels").w_full().grow(1.0).min_h(0.0);
+    let mut panels = row()
+        .key("funnel-panels")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .border_sides([1.0, 0.0, 0.0, 0.0], p.look.line);
     if s.searching() {
         panels = panels.child(
             col()
                 .key("funnel-rail")
-                .w(240.0)
+                .transition(Transition::opacity().combined(Transition::offset(-8.0, 0.0)))
+                .motion(rune::tok::motion::SNAPPY)
+                .w_frac(0.23)
+                .min_w(180.0)
+                .max_w(250.0)
                 .h_full()
                 .min_h(0.0)
                 .child(scope_rail(app, p).grow(0.44))
@@ -1256,7 +1309,7 @@ pub fn view(app: &App, cx: &mut Cx<App>, p: &Paint, _layer: &mut Vec<El>) -> El 
                 p,
                 "child-title",
                 &name(&folder.0),
-                folder.0.parent().map(|p| p.to_string_lossy()).as_deref(),
+                None,
                 false,
             ))
             .child(directory_content(app, p, folder, List::Child))
@@ -1269,7 +1322,7 @@ pub fn view(app: &App, cx: &mut Cx<App>, p: &Paint, _layer: &mut Vec<El>) -> El 
                 p,
                 "preview-title",
                 &item.name,
-                None,
+                Some(item.kind.label()),
                 false,
             ))
             .child(
@@ -1292,11 +1345,24 @@ pub fn view(app: &App, cx: &mut Cx<App>, p: &Paint, _layer: &mut Vec<El>) -> El 
             ))
             .child(empty(p, "Select a file to preview"))
     };
-    let right = right.grow(1.0).min_w(0.0);
+    let right = right
+        .grow(if s.searching() {
+            0.57
+        } else if browsing(app) {
+            0.5
+        } else {
+            0.54
+        })
+        .min_w(0.0)
+        .transition(Transition::opacity())
+        .motion(rune::tok::motion::SNAPPY);
     body.child(panels.child(right))
 }
 fn empty(p: &Paint, message: &str) -> El {
     col()
+        .key(format!("empty-{message}"))
+        .transition(Transition::opacity())
+        .motion(rune::tok::motion::SNAPPY)
         .w_full()
         .grow(1.0)
         .min_h(0.0)
@@ -1304,7 +1370,7 @@ fn empty(p: &Paint, message: &str) -> El {
         .padding(24.0)
         .child(
             text(message)
-                .font(rune::tok::type_::BODY)
+                .font(p.look.font(12.0, 400.0))
                 .color(p.look.muted)
                 .wrap(),
         )
@@ -1336,19 +1402,7 @@ fn directory_content(app: &App, p: &Paint, folder: &FolderID, list: List) -> El 
         Some(Listing::Ready(rows)) if rows.is_empty() => {
             empty(p, "This folder is empty").key("folder-empty")
         }
-        Some(Listing::Ready(_)) => {
-            let content = file_list(app, p, list);
-            if list == List::Main {
-                col()
-                    .w_full()
-                    .grow(1.0)
-                    .min_h(0.0)
-                    .child(sort_header(app, p))
-                    .child(content)
-            } else {
-                content
-            }
-        }
+        Some(Listing::Ready(_)) => file_list(app, p, list),
     }
 }
 fn rows(app: &App, list: List) -> &Arc<Vec<Item>> {
@@ -1366,18 +1420,14 @@ fn file_list(app: &App, p: &Paint, list: List) -> El {
         List::Context => "context-scroll".into(),
     };
     let look = p.look;
-    let version = Arc::as_ptr(rows(app, list)) as usize;
+    let version = (session(app).revision, Arc::as_ptr(rows(app, list)) as usize);
     let stack = col()
         .key(format!("{key}-rows"))
         .w_full()
         .growth(GrowthSpec::default())
         .virtual_rows(
             count,
-            if list == List::Main && !browsing(app) {
-                44.0
-            } else {
-                32.0
-            },
+            row_height(app, list),
             move |a: &App, i| rows(a, list)[i].id.key().into(),
             move |a: &App, i| {
                 file_row(
@@ -1404,6 +1454,14 @@ fn file_list(app: &App, p: &Paint, list: List) -> El {
         .scroll(ScrollSpec {
             stick_bottom: false,
         })
+        .px(if list == List::Context {
+            7.0
+        } else if list == List::Child || browsing(app) {
+            8.0
+        } else {
+            6.0
+        })
+        .py(4.0)
         .child(stack);
     if list == List::Main {
         let scroll = session(app).scroll.clone();
@@ -1443,6 +1501,9 @@ fn file_list(app: &App, p: &Paint, list: List) -> El {
             .min_h(0.0)
             .child(viewport);
     }
+    if list == List::Main && browsing(app) {
+        viewport = viewport.on_secondary_press(|a: &mut App, _, tx| sort_menu(a, tx));
+    }
     viewport
 }
 fn file_row(app: &App, p: &Paint, list: List, item: &Item) -> El {
@@ -1450,6 +1511,7 @@ fn file_row(app: &App, p: &Paint, list: List, item: &Item) -> El {
     let click = id.clone();
     let open = id.clone();
     let drag = id.clone();
+    let hover = id.clone();
     let selected = match list {
         List::Main => session(app).selected.contains(&id),
         List::Context => focused_path(app).as_ref() == Some(&id.0),
@@ -1460,15 +1522,19 @@ fn file_row(app: &App, p: &Paint, list: List, item: &Item) -> El {
     } else {
         p.look.text
     };
-    let single = list == List::Main && selected && session(app).selected.len() == 1;
+    let single = selected
+        && (list == List::Context || list == List::Main && session(app).selected.len() == 1);
     let path_detail = list == List::Main && !browsing(app);
     let mut title = text(&item.name)
-        .font(rune::tok::type_::BODY)
+        .font(p.look.font(
+            if path_detail { 14.0 } else { 11.0 },
+            if path_detail { 500.0 } else { 400.0 },
+        ))
         .color(ink)
         .spans(
             item.highlights
                 .iter()
-                .map(|r| rune::Span::new(r.start, r.end).bold())
+                .map(|r| rune::Span::new(r.start, r.end).bold().underline(ink))
                 .collect::<Vec<_>>(),
         )
         .truncate()
@@ -1504,10 +1570,16 @@ fn file_row(app: &App, p: &Paint, list: List, item: &Item) -> El {
                 item.id
                     .0
                     .parent()
-                    .map(|p| p.to_string_lossy().into_owned())
+                    .map(|p| {
+                        if session(app).searching() {
+                            p.to_string_lossy().trim_start_matches('/').to_owned() + "/"
+                        } else {
+                            model::display_path(&item.id.0)
+                        }
+                    })
                     .unwrap_or_default(),
             )
-            .font(rune::tok::type_::LABEL)
+            .font(p.look.font(11.0, 400.0))
             .color(if selected { ink } else { p.look.muted })
             .truncate()
             .w_full()
@@ -1519,48 +1591,104 @@ fn file_row(app: &App, p: &Paint, list: List, item: &Item) -> El {
             ),
         );
     }
+    let radius = if list == List::Context {
+        5.0
+    } else if path_detail {
+        6.0
+    } else if p.look.era() == crate::theme::Era::Modern {
+        4.0
+    } else {
+        0.0
+    };
+    let inset_x = if list == List::Context {
+        0.0
+    } else if path_detail {
+        2.0
+    } else {
+        1.0
+    };
+    let inset_y = if list == List::Context { 0.0 } else { 2.0 };
+    let highlight = if selected {
+        let highlight = el()
+            .key("selection-highlight")
+            .pin(Some(inset_x), Some(inset_y), Some(inset_x), Some(inset_y))
+            .radius(radius)
+            .fill(p.look.selection)
+            .motion(rune::tok::motion::SNAPPY)
+            .inert();
+        vec![if single {
+            highlight.matched(format!(
+                "{}-{}-selection-highlight",
+                prefix(app),
+                if list == List::Context {
+                    "context"
+                } else {
+                    "main"
+                }
+            ))
+        } else {
+            highlight
+        }]
+    } else {
+        Vec::new()
+    };
     let mut r = row()
         .role("option")
         .focus_selected(selected)
         .label(item.name.clone())
         .w_full()
-        .h(if path_detail { 44.0 } else { 32.0 })
-        .px(10.0)
-        .gap(8.0)
-        .items_center()
-        .fill(if selected && !single {
-            p.look.selection
+        .h(row_height(app, list))
+        .pl(if list == List::Context {
+            39.0
+        } else if path_detail {
+            12.0
         } else {
-            rune::Color::TRANSPARENT
+            10.0
         })
+        .pr(10.0)
+        .gap(if path_detail { 12.0 } else { 10.0 })
+        .radius(radius)
+        .items_center()
         .hover(p.look.selection.alpha(0.55))
         .motion(rune::tok::motion::SNAPPY)
-        .children(if single {
-            vec![
-                el().key("selection-highlight")
-                    .matched(format!("{}-selection-highlight", prefix(app)))
-                    .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-                    .fill(p.look.selection)
-                    .motion(rune::tok::motion::SNAPPY)
-                    .inert(),
-            ]
-        } else {
-            Vec::new()
-        })
-        .child(file_icon(p, item.kind, selected))
+        .children(highlight)
+        .child(
+            crate::icons::file(
+                &item.id.0,
+                item.kind == DocumentKind::Folder,
+                p.look.era() == crate::theme::Era::Classic,
+                if list == List::Context { 16.0 } else { 24.0 },
+            )
+            .w(if list == List::Context {
+                16.0
+            } else if path_detail {
+                24.0
+            } else {
+                22.0
+            }),
+        )
         .child(label);
-    if item.symlink {
-        r = r.child(text("↗").font(rune::tok::type_::LABEL).color(p.look.muted));
-    }
-    if list != List::Context {
+    if list != List::Context && !path_detail {
         r = r.child(
             text(model::size_label(item.size))
-                .font(rune::tok::type_::LABEL)
+                .font(p.look.font(9.0, 400.0))
                 .color(if selected { ink } else { p.look.muted }),
         );
     }
-    if item.kind == DocumentKind::Folder {
-        r = r.child(text("›").color(if selected { ink } else { p.look.muted }));
+    if path_detail {
+        r = r.on_pointer_move_local(move |a: &mut App, _, tx| {
+            let s = session_mut(a);
+            if !s.usable || s.focused.as_ref() == Some(&hover) {
+                tx.live_only();
+                return;
+            }
+            s.neighbor = None;
+            s.focused = Some(hover.clone());
+            s.selected.clear();
+            s.selected.insert(hover.clone());
+            s.anchor = Some(hover.clone());
+            s.chrome.mark_interacted();
+        });
     }
     r.transition(Transition::opacity())
         .on_press_tx(move |a: &mut App, tx| {
@@ -1601,215 +1729,320 @@ fn file_row(app: &App, p: &Paint, list: List, item: &Item) -> El {
             )
         })
 }
-pub fn file_icon(p: &Paint, kind: DocumentKind, selected: bool) -> El {
-    let ink = if selected {
-        p.look.selection_text
+fn row_height(app: &App, list: List) -> f32 {
+    if list == List::Context {
+        30.0
+    } else if list == List::Main && !browsing(app) {
+        58.0
     } else {
-        p.look.accent
-    };
-    if kind == DocumentKind::Folder {
-        el().key("file-icon")
-            .size(18.0, 16.0)
-            .child(
-                el().pin(Some(0.0), Some(1.0), None, None)
-                    .size(8.0, 5.0)
-                    .radius(1.0)
-                    .fill(ink.alpha(0.8)),
-            )
-            .child(
-                el().pin(Some(0.0), Some(4.0), None, None)
-                    .size(18.0, 12.0)
-                    .radius(2.0)
-                    .fill(ink.alpha(0.75)),
-            )
-    } else {
-        let mark = match kind {
-            DocumentKind::Pdf => "P",
-            DocumentKind::Markdown => "M",
-            DocumentKind::Word => "W",
-            DocumentKind::Text => "‹›",
-            DocumentKind::Image => "◇",
-            DocumentKind::Video => "▸",
-            DocumentKind::Audio => "♪",
-            DocumentKind::Package => "▧",
-            _ => "",
-        };
-        el().key("file-icon")
-            .size(16.0, 19.0)
-            .radius(2.0)
-            .border(1.0, ink.alpha(0.6))
-            .center()
-            .child(text(mark).font(rune::tok::type_::LABEL).color(ink))
+        44.0
     }
 }
+
 fn narrow(app: &mut App, path: Option<FolderID>) {
     let previous = session(app).scope.clone();
     session_mut(app).scope_history.push(previous);
     session_mut(app).scope = path;
     submit_query(app);
 }
+fn search_root(app: &App) -> (PathBuf, String) {
+    let s = session(app);
+    if s.local {
+        return (
+            s.folder.0.clone(),
+            if s.folder.0 == crate::app::home() {
+                "Home".into()
+            } else {
+                name(&s.folder.0)
+            },
+        );
+    }
+    if app.section == Section::Folders {
+        if let Some(volume) = app
+            .funnel
+            .mounted
+            .iter()
+            .filter(|v| s.folder.0.starts_with(&v.path))
+            .max_by_key(|v| v.path.components().count())
+        {
+            return (volume.path.clone(), volume.name.clone());
+        }
+    }
+    (PathBuf::from("/"), "This Mac".into())
+}
 fn scope_rail(app: &App, p: &Paint) -> El {
     let s = session(app);
-    let root_title = if s.local {
-        name(&s.folder.0)
-    } else {
-        "This Mac".into()
-    };
+    let (root, root_title) = search_root(app);
     let look = p.look;
-    let mut rail = col()
+    let root_selected = s.scope.is_none();
+    let subtitle = s
+        .scope
+        .as_ref()
+        .map(|folder| name(&folder.0))
+        .unwrap_or_else(|| root_title.clone());
+    let mut scopes = col().key("scope-rows").w_full().child(
+        rail_row(
+            p,
+            "scope-mac",
+            &format!("All files in {root_title}"),
+            &root,
+            0,
+            root_selected,
+        )
+        .on_press(|a: &mut App| narrow(a, None)),
+    );
+    if !s.scope_history.is_empty() {
+        scopes = scopes.child(
+            row()
+                .key("scope-back")
+                .w_full()
+                .h(30.0)
+                .px(9.0)
+                .items_center()
+                .child(
+                    text("Previous scope")
+                        .font(look.font(11.0, 400.0))
+                        .color(look.text),
+                )
+                .on_press(|a: &mut App| {
+                    let previous = session_mut(a).scope_history.pop().flatten();
+                    session_mut(a).scope = previous;
+                    submit_query(a);
+                }),
+        );
+    }
+    scopes = scopes.child(
+        col()
+            .key("scope-children")
+            .w_full()
+            .growth(GrowthSpec::default())
+            .virtual_rows(
+                s.scope_counts.len(),
+                30.0,
+                |a: &App, i| session(a).scope_counts[i].0.to_string_lossy(),
+                move |a: &App, i| {
+                    let path = session(a).scope_counts[i].0.clone();
+                    let p = Paint {
+                        look,
+                        kit: look.kit(),
+                    };
+                    rail_row(
+                        &p,
+                        &format!("scope-{}", path.display()),
+                        &name(&path),
+                        &path,
+                        0,
+                        false,
+                    )
+                    .on_press(move |a: &mut App| narrow(a, Some(FolderID::new(&path))))
+                },
+            )
+            .virtual_rows_version(s.revision),
+    );
+    col()
         .key("scope-rail")
         .w_full()
         .min_h(0.0)
-        .fill(p.look.sidebar)
-        .border_sides([0.0, 1.0, 0.0, 0.0], p.look.line)
+        .fill(look.raised)
+        .border_sides([0.0, 1.0, 0.0, 0.0], look.line)
         .child(crate::shell::pane_title(
             p,
             "scope-title",
             "Narrow the search",
-            None,
+            Some(&subtitle),
             false,
         ))
         .child(
-            crate::shell::shell_button(p, "scope-mac", &root_title, s.scope.is_none()).on_press(
-                |a: &mut App| {
-                    narrow(a, None);
-                },
-            ),
-        );
-    if s.scope.is_some() {
-        rail = rail.child(
-            crate::shell::shell_button(p, "scope-back", "Broaden", false).on_press(
-                |a: &mut App| {
-                    let previous = session_mut(a).scope_history.pop().flatten();
-                    session_mut(a).scope = previous;
-                    submit_query(a);
-                },
-            ),
-        );
-    }
-    let scopes = col()
-        .key("scope-rows")
+            col()
+                .key("scope-scroll")
+                .w_full()
+                .grow(1.0)
+                .min_h(0.0)
+                .px(7.0)
+                .py(4.0)
+                .scroll(ScrollSpec {
+                    stick_bottom: false,
+                })
+                .child(scopes)
+                .scroll_bar(&p.kit),
+        )
+}
+fn rail_row(p: &Paint, key: &str, title: &str, path: &Path, depth: usize, selected: bool) -> El {
+    row()
+        .key(key.to_owned())
         .w_full()
-        .growth(GrowthSpec::default())
-        .virtual_rows(
-            s.scope_counts.len(),
-            30.0,
-            |a: &App, i| session(a).scope_counts[i].0.to_string_lossy(),
-            move |a: &App, i| {
-                let path = session(a).scope_counts[i].0.clone();
-                let p = Paint {
-                    look,
-                    kit: look.kit(),
-                };
-                row()
-                    .w_full()
-                    .h(30.0)
-                    .px(10.0)
-                    .gap(7.0)
-                    .items_center()
-                    .hover(look.selection.alpha(0.5))
-                    .child(file_icon(&p, DocumentKind::Folder, false))
-                    .child(
-                        text(name(&path))
-                            .font(rune::tok::type_::LABEL)
-                            .color(look.text)
-                            .truncate()
-                            .grow(1.0)
-                            .min_w(0.0),
-                    )
-                    .on_press(move |a: &mut App| narrow(a, Some(FolderID::new(&path))))
-            },
-        );
-    rail.child(
-        col()
-            .key("scope-scroll")
-            .w_full()
-            .grow(1.0)
-            .min_h(0.0)
-            .scroll(ScrollSpec {
-                stick_bottom: false,
-            })
-            .child(scopes)
-            .scroll_bar(&p.kit),
-    )
+        .h(30.0)
+        .pl(9.0 + depth as f32 * 10.0)
+        .pr(9.0)
+        .gap(7.0)
+        .items_center()
+        .radius(5.0)
+        .fill(if selected {
+            p.look.selection
+        } else {
+            rune::Color::TRANSPARENT
+        })
+        .hover(p.look.selection.alpha(0.55))
+        .motion(rune::tok::motion::SNAPPY)
+        .child(crate::icons::file(
+            path,
+            true,
+            p.look.era() == crate::theme::Era::Classic,
+            16.0,
+        ))
+        .child(
+            text(title)
+                .font(p.look.font(11.0, if selected { 600.0 } else { 400.0 }))
+                .color(if selected {
+                    p.look.selection_text
+                } else {
+                    p.look.text
+                })
+                .truncate()
+                .grow(1.0)
+                .min_w(0.0),
+        )
+}
+
+fn context_ancestors(parent: &Path, root: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![parent.to_owned()];
+    let mut at = parent;
+    for _ in 0..3 {
+        if at == root {
+            break;
+        }
+        if let Some(p) = at.parent() {
+            paths.push(p.to_owned());
+            at = p;
+        } else {
+            break;
+        }
+    }
+    paths.reverse();
+    paths
 }
 fn context_pane(app: &App, p: &Paint) -> El {
-    let mut pane = col()
+    let pane = col()
         .key("context-pane")
         .w_full()
         .min_h(0.0)
+        .fill(p.look.raised)
         .border_sides([1.0, 1.0, 0.0, 0.0], p.look.line)
         .child(crate::shell::pane_title(
             p,
             "context-title",
             "Where it lives",
-            None,
+            app.funnel
+                .context_key
+                .as_ref()
+                .map(|p| p.to_string_lossy())
+                .as_deref(),
             false,
         ));
-    if let Some(parent) = &app.funnel.context_key {
-        let mut paths = vec![parent.clone()];
-        let mut at = parent.as_path();
-        for _ in 0..2 {
-            if let Some(p) = at.parent() {
-                paths.push(p.to_owned());
-                at = p;
-            } else {
-                break;
-            }
-        }
-        paths.reverse();
-        for (i, path) in paths.into_iter().enumerate() {
-            let title = if path == Path::new("/") {
-                "This Mac".into()
-            } else {
-                name(&path)
-            };
-            pane = pane.child(
-                row()
-                    .key(format!("context-ancestor-{}", path.display()))
-                    .w_full()
-                    .h(26.0)
-                    .pl(10.0 + i as f32 * 9.0)
-                    .pr(8.0)
-                    .hover(p.look.selection.alpha(0.5))
-                    .child(
-                        text(title)
-                            .font(rune::tok::type_::LABEL)
-                            .color(p.look.muted)
-                            .truncate(),
-                    )
-                    .on_press(move |a: &mut App| narrow(a, Some(FolderID::new(&path)))),
-            );
-        }
-    }
     if let Some(error) = &app.funnel.context_error {
         return pane.child(empty(p, error));
     }
-    pane.child(if app.funnel.context_rows.is_empty() {
-        empty(
+    let ancestors = Arc::new(
+        app.funnel
+            .context_key
+            .as_deref()
+            .map(|parent| context_ancestors(parent, &search_root(app).0))
+            .unwrap_or_default(),
+    );
+    let keys = ancestors.clone();
+    let look = p.look;
+    let count = ancestors.len() + app.funnel.context_rows.len();
+    if count == 0 {
+        return pane.child(empty(
             p,
             if app.funnel.context.is_pending() {
                 "Loading nearby entries…"
             } else {
                 "Select a result to see nearby files"
             },
+        ));
+    }
+    let stack = col()
+        .key("context-rows")
+        .w_full()
+        .growth(GrowthSpec::default())
+        .virtual_rows(
+            count,
+            30.0,
+            move |a: &App, i| {
+                if i < keys.len() {
+                    format!("context-ancestor-{}", keys[i].display()).into()
+                } else {
+                    a.funnel.context_rows[i - keys.len()].id.key().into()
+                }
+            },
+            move |a: &App, i| {
+                let p = Paint {
+                    look,
+                    kit: look.kit(),
+                };
+                if let Some(path) = ancestors.get(i) {
+                    let path = path.clone();
+                    let (root, root_title) = search_root(a);
+                    let title = if path == root {
+                        root_title
+                    } else if i == 0 {
+                        format!("… / {}", name(&path))
+                    } else {
+                        name(&path)
+                    };
+                    rail_row(
+                        &p,
+                        &format!("context-ancestor-{}", path.display()),
+                        &title,
+                        &path,
+                        i,
+                        false,
+                    )
+                    .on_press(move |a: &mut App| narrow(a, Some(FolderID::new(&path))))
+                } else {
+                    file_row(
+                        a,
+                        &p,
+                        List::Context,
+                        &a.funnel.context_rows[i - ancestors.len()],
+                    )
+                }
+            },
         )
-    } else {
-        file_list(app, p, List::Context)
-    })
+        .virtual_rows_version((
+            app.funnel.context_key.clone(),
+            Arc::as_ptr(&app.funnel.context_rows) as usize,
+        ));
+    let viewport = col()
+        .key("context-scroll")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .px(7.0)
+        .py(4.0)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .child(stack);
+    pane.child(scroll::wrap(
+        viewport,
+        "context-scroll".into(),
+        p.look.muted.alpha(0.55),
+        app.funnel.context_chrome.clone(),
+    ))
 }
+
 fn place(app: &App, p: &Paint, key: &str, label: &str, path: PathBuf, kind: PlaceKind) -> El {
     let dest = path.clone();
-    let current = &session(app).folder.0;
     let home = crate::app::home();
-    let active = current.starts_with(&path)
-        && ![home.clone(), home.join("Downloads"), home.join("Desktop")]
-            .iter()
-            .chain(app.funnel.pinned.iter().map(|pin| &pin.0))
-            .chain(app.funnel.mounted.iter().map(|volume| &volume.path))
-            .any(|candidate| {
-                candidate != &path && candidate.starts_with(&path) && current.starts_with(candidate)
-            });
+    let active = [home.clone(), home.join("Downloads"), home.join("Desktop")]
+        .into_iter()
+        .chain(app.funnel.pinned.iter().map(|f| f.0.clone()))
+        .chain(app.funnel.mounted.iter().map(|v| v.path.clone()))
+        .filter(|candidate| session(app).folder.0.starts_with(candidate))
+        .max_by_key(|candidate| candidate.components().count())
+        .is_some_and(|selected| selected == path);
     crate::shell::place_button(p, key, label, active, kind)
         .on_press_tx(move |a: &mut App, tx| open_folder(a, path.clone(), tx))
         .on_drop_files(move |a: &mut App, files, tx| {
@@ -1817,7 +2050,6 @@ fn place(app: &App, p: &Paint, key: &str, label: &str, path: PathBuf, kind: Plac
         })
 }
 fn places(app: &App, p: &Paint) -> El {
-    let is_pinned = app.funnel.pinned.as_ref() == Some(&session(app).folder);
     let mut bar = row()
         .key("places-bar")
         .w_full()
@@ -1944,6 +2176,7 @@ fn places(app: &App, p: &Paint) -> El {
             );
         }
     }
+    let pinned = app.funnel.pinned.as_ref() == Some(&session(app).folder);
     bar.child(el().grow(1.0))
         .child(
             crate::shell::shell_button(p, "folder-refresh", "↻", false)
@@ -1958,15 +2191,18 @@ fn places(app: &App, p: &Paint) -> El {
             crate::shell::place_button(
                 p,
                 "folder-pin",
-                if is_pinned { "Pinned" } else { "Pin folder" },
+                if pinned { "Pinned" } else { "Pin folder" },
                 false,
                 PlaceKind::Pin,
             )
-            .w(100.0)
-            .disabled(is_pinned)
-            .opacity(if is_pinned { 0.45 } else { 1.0 })
+            .opacity(if pinned { 0.35 } else { 1.0 })
+            .disabled(pinned)
             .help("Pin current folder")
-            .on_press(pin_current),
+            .on_press(|a: &mut App| {
+                if a.funnel.pinned.as_ref() != Some(&session(a).folder) {
+                    pin_current(a);
+                }
+            }),
         )
 }
 fn eject_volume(app: &mut App, path: PathBuf) {
@@ -2010,59 +2246,25 @@ pub fn report(app: &App) -> serde_json::Value {
     report
 }
 
-fn sort_header(app: &App, p: &Paint) -> El {
-    row()
-        .key("folder-columns")
-        .w_full()
-        .h(24.0)
-        .px(10.0)
-        .items_center()
-        .justify_between()
-        .fill(p.look.raised)
-        .border_sides([0.0, 0.0, 1.0, 0.0], p.look.line)
-        .child(
-            text("Name")
-                .font(rune::tok::type_::LABEL)
-                .color(p.look.muted)
-                .grow(1.0)
-                .on_press(|a: &mut App| set_sort(a, SortField::Name)),
-        )
-        .child(
-            crate::shell::shell_button(
-                p,
-                "folder-sort",
-                &format!(
-                    "Sort by {} {}",
-                    session(app).sort.field.title(),
-                    if session(app).sort.descending {
-                        "↓"
-                    } else {
-                        "↑"
-                    }
-                ),
-                false,
-            )
-            .h(22.0)
-            .on_press_tx(|a: &mut App, tx| {
-                let mut menu = rune::PopupMenu::new();
-                for (i, field) in SortField::ALL.into_iter().enumerate() {
-                    menu = menu.item(
-                        rune::PopupItem::new(i.to_string(), field.title())
-                            .checked(session(a).sort.field == field),
-                    );
-                }
-                tx.popup_menu(menu, "folder-sort", |a: &mut App, picked, _| {
-                    if let Some(field) = picked
-                        .and_then(|p| p.parse::<usize>().ok())
-                        .and_then(|i| SortField::ALL.get(i))
-                        .copied()
-                    {
-                        set_sort(a, field);
-                    }
-                });
-            }),
-        )
+fn sort_menu(app: &mut App, tx: &mut Tx) {
+    let mut menu = rune::PopupMenu::new();
+    for (i, field) in SortField::ALL.into_iter().enumerate() {
+        menu = menu.item(
+            rune::PopupItem::new(i.to_string(), format!("Sort by {}", field.title()))
+                .checked(session(app).sort.field == field),
+        );
+    }
+    tx.popup_menu(menu, list_key(app), |a: &mut App, picked, _| {
+        if let Some(field) = picked
+            .and_then(|p| p.parse::<usize>().ok())
+            .and_then(|i| SortField::ALL.get(i))
+            .copied()
+        {
+            set_sort(a, field);
+        }
+    });
 }
+
 fn set_sort(app: &mut App, field: SortField) {
     let s = session_mut(app);
     s.sort = Sort {

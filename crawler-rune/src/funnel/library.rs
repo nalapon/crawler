@@ -36,13 +36,17 @@ pub struct Library {
     events_tx: mpsc::Sender<PathBuf>,
     events: mpsc::Receiver<PathBuf>,
     dirty: HashMap<FolderID, Instant>,
-    sizes: Latest<(FolderID, Vec<(ItemID, Option<u64>)>)>,
+    sizes: Latest<()>,
+    size_send: mpsc::Sender<(u64, FolderID, ItemID, Option<u64>)>,
+    size_results: mpsc::Receiver<(u64, FolderID, ItemID, Option<u64>)>,
     size_cancel: Arc<AtomicBool>,
     size_folder: Option<FolderID>,
+    size_generation: u64,
 }
 impl Default for Library {
     fn default() -> Self {
         let (events_tx, events) = mpsc::channel();
+        let (size_send, size_results) = mpsc::channel();
         Self {
             entries: HashMap::new(),
             tick: 0,
@@ -54,8 +58,11 @@ impl Default for Library {
             events,
             dirty: HashMap::new(),
             sizes: Latest::default(),
+            size_send,
+            size_results,
             size_cancel: Arc::new(AtomicBool::new(false)),
             size_folder: None,
+            size_generation: 0,
         }
     }
 }
@@ -145,6 +152,7 @@ impl Library {
             });
         }
         if self.size_folder != active {
+            self.size_generation += 1;
             self.size_cancel.store(true, Ordering::Relaxed);
             self.sizes.cancel();
             self.size_cancel = Arc::new(AtomicBool::new(false));
@@ -166,22 +174,52 @@ impl Library {
             })
             .map(|i| i.id.clone())
             .collect();
+        self.size_generation += 1;
+        let generation = self.size_generation;
+        self.size_cancel.store(true, Ordering::Relaxed);
+        self.size_cancel = Arc::new(AtomicBool::new(false));
         let cancel = self.size_cancel.clone();
+        let send = self.size_send.clone();
+        let wake = self.waker.clone();
         self.sizes.request((folder, paths), move |(folder, paths)| {
-            let mut totals = Vec::new();
+            let mut qos = libc::qos_class_t::QOS_CLASS_DEFAULT;
+            let mut priority = 0;
+            // SAFETY: these pointers address initialized local values. QoS changes apply only
+            // to this worker, and its previous class is restored before the shared task returns.
+            let restore = unsafe {
+                let known =
+                    libc::pthread_get_qos_class_np(libc::pthread_self(), &mut qos, &mut priority)
+                        == 0;
+                if known {
+                    libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
+                }
+                known
+            };
             for path in paths {
                 if cancel.load(Ordering::Relaxed) {
                     break;
                 }
                 let bytes = total_size(&path.0, &cancel).ok();
-                totals.push((path, bytes));
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                let _ = send.send((generation, folder.clone(), path, bytes));
+                if let Some(wake) = &wake {
+                    wake();
+                }
             }
-            (folder, totals)
+            if restore {
+                // SAFETY: qos and priority came from this same worker before the scan.
+                unsafe {
+                    libc::pthread_set_qos_class_self_np(qos, priority);
+                }
+            }
         });
     }
     pub fn refresh(&mut self, folder: &FolderID) {
         self.ensure(folder, true);
         if self.size_folder.as_ref() == Some(folder) {
+            self.size_generation += 1;
             self.size_cancel.store(true, Ordering::Relaxed);
             self.size_cancel = Arc::new(AtomicBool::new(false));
             self.sizes.cancel();
@@ -230,24 +268,31 @@ impl Library {
         if sizes_needed {
             self.start_sizes();
         }
-        if let Some((folder, totals)) = self.sizes.take() {
+        let _ = self.sizes.take();
+        let mut totals: HashMap<FolderID, HashMap<ItemID, Option<u64>>> = HashMap::new();
+        while let Ok((generation, folder, item, bytes)) = self.size_results.try_recv() {
+            if generation == self.size_generation && self.size_folder.as_ref() == Some(&folder) {
+                totals.entry(folder).or_default().insert(item, bytes);
+            }
+        }
+        for (folder, totals) in totals {
             if let Some(Entry {
                 listing: Listing::Ready(items),
                 ..
             }) = self.entries.get_mut(&folder)
             {
-                let totals: HashMap<_, _> = totals.into_iter().collect();
-                let rows = Arc::make_mut(items);
-                let mut updated = false;
-                for row in rows {
-                    if let Some(size) = totals.get(&row.id) {
-                        if row.size != *size {
+                let updated = items
+                    .iter()
+                    .any(|row| totals.get(&row.id).is_some_and(|size| row.size != *size));
+                if updated {
+                    // Publish a new snapshot; the funnel keeps the old Arc as its revision marker.
+                    for row in Arc::make_mut(items) {
+                        if let Some(size) = totals.get(&row.id) {
                             row.size = *size;
-                            updated = true;
                         }
                     }
+                    changed |= self.visible.contains(&folder);
                 }
-                changed |= updated && self.visible.contains(&folder);
             }
         }
         while self.entries.len() > 32 {
