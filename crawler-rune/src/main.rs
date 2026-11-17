@@ -23,7 +23,8 @@ use rune::{AppSpec, Chrome};
 fn main() {
     let spec = AppSpec::<app::App> {
         min_size: Some((760.0, 480.0)),
-        fonts: theme::FONTS,
+        fonts: preview::fonts(),
+        families: ("System Font", "ui-monospace"),
         setup: Some(app::setup),
         poll: Some(app::poll),
         on_key: Some(app::on_key),
@@ -38,6 +39,7 @@ fn main() {
                 ..Chrome::DEFAULT
             })
             .keep_running()
+            .release_gpu_when_closed()
             .menu_item(
                 rune::MenuItem::new("Quit Crawler", app::request_quit)
                     .id("crawler-quit")
