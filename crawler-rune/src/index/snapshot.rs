@@ -32,13 +32,13 @@ pub fn equal(a: &str, b: &str) -> bool {
 }
 
 struct Entry {
-    start: usize,
+    start: u32,
     length: u16,
-    directory: bool,
+    flags: u8,
 }
 impl Entry {
     fn range(&self) -> Range<usize> {
-        self.start..self.start + usize::from(self.length)
+        self.start as usize..self.start as usize + usize::from(self.length)
     }
 }
 enum Originals {
@@ -55,6 +55,7 @@ enum Prepared {
 }
 pub struct Snapshot {
     original_bytes: usize,
+    original_start: usize,
     originals: Originals,
     entries: Vec<Entry>,
     pub paths: Vec<ChunkedString>,
@@ -74,12 +75,12 @@ impl Snapshot {
             {
                 continue;
             }
-            let start = originals.len();
+            let start = u32::try_from(originals.len()).expect("bounded snapshot offsets");
             originals.extend_from_slice(path.as_bytes());
             entries.push(Entry {
                 start,
                 length: path.len() as u16,
-                directory: *directory,
+                flags: u8::from(*directory) | (u8::from(path.is_ascii()) << 1),
             });
             paths.push(builder.add_file_immediate(
                 &normalized,
@@ -88,6 +89,7 @@ impl Snapshot {
         }
         Self {
             original_bytes: originals.len(),
+            original_start: 0,
             originals: Originals::Owned(originals),
             entries,
             paths,
@@ -102,11 +104,17 @@ impl Snapshot {
             Originals::Owned(v) => v,
             Originals::Mapped(v) => v,
         };
-        // Both construction paths validate UTF-8 and range boundaries.
-        std::str::from_utf8(&bytes[self.entries[row].range()]).expect("validated snapshot UTF-8")
+        let entry = &self.entries[row];
+        let start = self.original_start + entry.start as usize;
+        // SAFETY: build copies a str; decode validates every original once. The private
+        // entry offsets and immutable backing allocation preserve those boundaries.
+        unsafe { std::str::from_utf8_unchecked(&bytes[start..start + usize::from(entry.length)]) }
     }
     pub fn directory(&self, row: usize) -> bool {
-        self.entries[row].directory
+        self.entries[row].flags & 1 != 0
+    }
+    pub fn ascii(&self, row: usize) -> bool {
+        self.entries[row].flags & 2 != 0
     }
     pub fn arena(&self) -> ArenaPtr {
         match &self.prepared {
@@ -186,7 +194,7 @@ impl Snapshot {
         }
         out
     }
-    pub fn decode(map: Arc<Mmap>, range: Range<usize>) -> Option<Self> {
+    pub fn decode(map: Arc<Mmap>, range: Range<usize>, legacy: bool) -> Option<Self> {
         let bytes = map.get(range.clone())?;
         let number = |at: usize| -> Option<usize> {
             Some(u32::from_le_bytes(bytes.get(at..at.checked_add(4)?)?.try_into().ok()?) as usize)
@@ -203,19 +211,20 @@ impl Snapshot {
             at += 3;
             let path = std::str::from_utf8(bytes.get(at..at.checked_add(size)?)?).ok()?;
             if size == 0
-                || path.starts_with('/')
-                || path.contains('\0')
-                || path
-                    .split('/')
-                    .any(|c| c.is_empty() || c == "." || c == "..")
+                || (legacy
+                    && (path.starts_with('/')
+                        || path.contains('\0')
+                        || path
+                            .split('/')
+                            .any(|c| c.is_empty() || c == "." || c == "..")))
                 || directory > 1
             {
                 return None;
             }
             entries.push(Entry {
-                start: range.start + at,
+                start: u32::try_from(at).ok()?,
                 length: size as u16,
-                directory: directory == 1,
+                flags: directory | (u8::from(path.is_ascii()) << 1),
             });
             at += size;
         }
@@ -246,6 +255,7 @@ impl Snapshot {
         }
         let mut paths = Vec::with_capacity(count);
         let mut next = 0;
+        let mut buffer = [0u8; fff_search::constants::PATH_BUF_SIZE];
         for (row, entry) in entries.iter().enumerate() {
             let p = refs + row * 8;
             let offset = number(p)?;
@@ -260,17 +270,19 @@ impl Snapshot {
             {
                 return None;
             }
-            // Validate prepared strings against the original before exposing an arena to FFF.
-            let mut prepared = Vec::with_capacity(usize::from(size));
+            // Validate UTF-8 even for checksummed data: FFF creates unchecked str views.
+            // Only legacy caches need the expensive normalization/equivalence check.
+            let prepared = &mut buffer[..usize::from(size)];
             for n in 0..needed {
                 let chunk = chunks + number(indices + (offset + n) * 4)? * 16;
                 let take = (usize::from(size) - n * 16).min(16);
-                prepared.extend_from_slice(bytes.get(chunk..chunk + take)?);
+                prepared[n * 16..n * 16 + take].copy_from_slice(bytes.get(chunk..chunk + take)?);
             }
             let text = std::str::from_utf8(&prepared).ok()?;
-            let original = std::str::from_utf8(map.get(entry.range())?).ok()?;
-            if folded(original) != text
-                || text.rfind('/').map_or(0, |n| n + 1) != usize::from(filename)
+            if !text.is_char_boundary(usize::from(filename))
+                || (legacy
+                    && (folded(std::str::from_utf8(bytes.get(entry.range())?).ok()?) != text
+                        || text.rfind('/').map_or(0, |n| n + 1) != usize::from(filename)))
             {
                 return None;
             }
@@ -287,6 +299,7 @@ impl Snapshot {
         };
         Some(Self {
             original_bytes: entries.iter().map(|entry| usize::from(entry.length)).sum(),
+            original_start: range.start,
             originals: Originals::Mapped(map),
             entries,
             paths,

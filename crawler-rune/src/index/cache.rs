@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -35,17 +36,38 @@ struct Header {
     #[serde(default)]
     signatures: bool,
 }
+struct Block {
+    bytes: std::ops::Range<usize>,
+    signature: Option<std::ops::Range<usize>>,
+    checksum: Option<std::ops::Range<usize>>,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Identity {
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified: (i64, i64),
+}
 pub struct Reader {
     map: Arc<Mmap>,
-    blocks: std::collections::VecDeque<(std::ops::Range<usize>, Option<std::ops::Range<usize>>)>,
+    blocks: std::collections::VecDeque<Block>,
     pub event: Option<Event>,
+    pub legacy: bool,
+    pub identity: Identity,
 }
 impl Reader {
     pub fn open(file: &Path, root: &Path) -> io::Result<Self> {
         let file = File::open(file)?;
+        let metadata = file.metadata()?;
+        let identity = Identity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            length: metadata.len(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+        };
         // Crawler writes by rename, never by truncating a mapped cache inode.
         let map = Arc::new(unsafe { MmapOptions::new().map(&file)? });
-        if map.get(..8) != Some(b"RUNFFF04") {
+        if !matches!(map.get(..8), Some(b"RUNFFF04" | b"RUNFFF05")) {
             return Err(corrupt());
         }
         let size = u32::from_le_bytes(
@@ -59,7 +81,8 @@ impl Reader {
         }
         let header: Header = serde_json::from_slice(map.get(12..12 + size).ok_or_else(corrupt)?)
             .map_err(|_| corrupt())?;
-        if header.version != 4
+        if !matches!(header.version, 4 | 5)
+            || (header.version == 5) != (map.get(..8) == Some(b"RUNFFF05"))
             || header.engine != REVISION
             || header.root != root
             || header.batches > 1_000_000
@@ -80,6 +103,14 @@ impl Reader {
             );
             let size = usize::try_from(size).map_err(|_| corrupt())?;
             at += 8;
+            let checksum = if header.version == 5 {
+                let digest = at..at.checked_add(32).ok_or_else(corrupt)?;
+                map.get(digest.clone()).ok_or_else(corrupt)?;
+                at += 32;
+                Some(digest)
+            } else {
+                None
+            };
             let signature = if header.signatures {
                 let end = at.checked_add(8192).ok_or_else(corrupt)?;
                 map.get(at..end).ok_or_else(corrupt)?;
@@ -91,7 +122,11 @@ impl Reader {
             };
             let end = at.checked_add(size).ok_or_else(corrupt)?;
             map.get(at..end).ok_or_else(corrupt)?;
-            blocks.push_back((at..end, signature));
+            blocks.push_back(Block {
+                bytes: at..end,
+                signature,
+                checksum,
+            });
             at = end.next_multiple_of(8);
         }
         if at != map.len() {
@@ -101,6 +136,8 @@ impl Reader {
             map,
             blocks,
             event: header.event.filter(|e| e.date.is_finite() && e.id > 0),
+            legacy: header.version == 4,
+            identity,
         })
     }
     pub fn prioritize(&mut self, text: &str) {
@@ -113,23 +150,35 @@ impl Reader {
         bits.dedup();
         // Hints only change arrival order. Every whole snapshot still reaches FFF.
         let map = &self.map;
-        self.blocks
-            .make_contiguous()
-            .sort_by_cached_key(|(_, signature)| {
-                std::cmp::Reverse(signature.as_ref().map_or(0, |range| {
-                    bits.iter()
-                        .filter(|&&bit| map[range.start + bit / 8] & (1 << (bit % 8)) != 0)
-                        .count()
-                }))
-            });
+        self.blocks.make_contiguous().sort_by_cached_key(|block| {
+            std::cmp::Reverse(block.signature.as_ref().map_or(0, |range| {
+                bits.iter()
+                    .filter(|&&bit| map[range.start + bit / 8] & (1 << (bit % 8)) != 0)
+                    .count()
+            }))
+        });
     }
-    pub fn next(&mut self) -> io::Result<Option<Arc<Snapshot>>> {
-        let Some((range, _)) = self.blocks.pop_front() else {
+    pub fn skip_loaded(&mut self, positions: &foldhash::HashSet<usize>) {
+        self.blocks
+            .retain(|block| !positions.contains(&block.bytes.start));
+    }
+    pub fn next(&mut self) -> io::Result<Option<(usize, Arc<Snapshot>)>> {
+        let Some(Block {
+            bytes: range,
+            checksum,
+            ..
+        }) = self.blocks.pop_front()
+        else {
             return Ok(None);
         };
-        Snapshot::decode(Arc::clone(&self.map), range)
-            .map(Arc::new)
-            .map(Some)
+        if let Some(checksum) = checksum
+            && blake3::hash(&self.map[range.clone()]).as_bytes() != &self.map[checksum]
+        {
+            return Err(corrupt());
+        }
+        let position = range.start;
+        Snapshot::decode(Arc::clone(&self.map), range, self.legacy)
+            .map(|batch| Some((position, Arc::new(batch))))
             .ok_or_else(corrupt)
     }
 }
@@ -160,7 +209,7 @@ pub fn save(
     cancelled: impl Fn() -> bool,
 ) -> io::Result<()> {
     let header = serde_json::to_vec(&Header {
-        version: 4,
+        version: 5,
         root: root.to_owned(),
         engine: REVISION.into(),
         event,
@@ -168,7 +217,7 @@ pub fn save(
         signatures: true,
     })?;
     atomic_write(file, |out| {
-        out.write_all(b"RUNFFF04")?;
+        out.write_all(b"RUNFFF05")?;
         out.write_all(&(header.len() as u32).to_le_bytes())?;
         out.write_all(&header)?;
         pad(out, 12 + header.len())?;
@@ -181,6 +230,7 @@ pub fn save(
             }
             let bytes = batch.encode();
             out.write_all(&(bytes.len() as u64).to_le_bytes())?;
+            out.write_all(blake3::hash(&bytes).as_bytes())?;
             out.write_all(&batch.signature())?;
             out.write_all(&bytes)?;
             pad(out, bytes.len())?;

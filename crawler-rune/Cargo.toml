@@ -25,6 +25,8 @@ core-foundation = "0.10"
 fff-search = { git = "https://github.com/dmtrKovalenko/fff", rev = "c188e7a8f90e4ee4aabe18f93d5869dfb4289f12" }
 fff-query-parser = { git = "https://github.com/dmtrKovalenko/fff", rev = "c188e7a8f90e4ee4aabe18f93d5869dfb4289f12" }
 memmap2 = "0.9"
+foldhash = "0.2"
+blake3 = "1.8"
 rayon = "1"
 objc2 = "0.6.3"
 block2 = "0.6"
