@@ -116,7 +116,7 @@ pub fn groups(processes: &[Process], query: &str) -> Vec<Group> {
     grouped.into_values().collect()
 }
 
-/// The Swift process filter's bounded bit-parallel fuzzy subsequence matcher.
+/// The process filter's bounded bit-parallel fuzzy subsequence matcher.
 fn normalized(text: &str) -> String {
     text.nfd()
         .filter(|&c| !is_combining_mark(c))

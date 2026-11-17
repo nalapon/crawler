@@ -15,7 +15,8 @@ pub fn folded(text: &str) -> String {
     if text.is_ascii() {
         return text.to_ascii_lowercase();
     }
-    // Use the same ICU folding and locale as Swift for non-ASCII paths and queries.
+    // Foundation's ICU folding with a fixed locale, for non-ASCII paths and queries. Caches
+    // saved with this folding stay valid.
     objc2::rc::autoreleasepool(|_| {
         let locale = NSLocale::localeWithLocaleIdentifier(&NSString::from_str("en_US_POSIX"));
         NSString::from_str(text)

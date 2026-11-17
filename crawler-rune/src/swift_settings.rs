@@ -1,5 +1,5 @@
-//! One-time import of the Swift app's settings, so replacing it keeps the theme, pinned folder,
-//! recent files and Markdown reader zoom. The Swift preferences are only read.
+//! One-time import of the settings of the Swift app Crawler replaced, so an upgrade keeps the
+//! theme, pinned folder, recent files and Markdown reader zoom. Those preferences are only read.
 
 use std::path::PathBuf;
 

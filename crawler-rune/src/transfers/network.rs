@@ -1,5 +1,5 @@
 //! AirDrop's experimental Everyone-mode HTTPS protocol. TLS uses Security.framework,
-//! basic X.509 policy and only Apple root anchors, like the Swift implementation.
+//! basic X.509 policy and only Apple root anchors.
 use core_foundation::{
     array::{CFArray, CFArrayRef},
     base::{CFType, TCFType},

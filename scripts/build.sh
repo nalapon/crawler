@@ -1,6 +1,5 @@
 #!/bin/zsh
-# Builds, packages and signs build/Crawler.app from the Rust/Rune port in crawler-rune/.
-# The Swift app is still buildable with scripts/build-swift.sh (build/Crawler-Swift.app).
+# Builds, packages and signs build/Crawler.app from the Rust/Rune app in crawler-rune/.
 set -euo pipefail
 cd "${0:A:h:h}"
 SIGNING_IDENTITY="${CRAWLER_SIGNING_IDENTITY-Crawler Local Development}"

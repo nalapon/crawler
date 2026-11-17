@@ -1108,7 +1108,7 @@ pub fn on_key(app: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
         _ => false,
     }
 }
-/// Status text for the status bar: the funnel state, then Swift's spaced key-hint groups.
+/// Status text for the status bar: the funnel state, then the spaced key-hint groups.
 pub fn status_line(app: &App) -> String {
     const GAP: &str = "    ";
     const NAVIGATE: &str =
@@ -2026,7 +2026,7 @@ fn context_pane(app: &App, p: &Paint) -> El {
 
 fn place(app: &App, p: &Paint, key: &str, label: &str, path: PathBuf, kind: PlaceKind) -> El {
     let dest = path.clone();
-    // Swift lights a place only when it is exactly the current folder.
+    // A place lights only when it is exactly the current folder.
     let active = session(app).folder.0 == path;
     crate::shell::place_button(p, key, label, active, kind)
         .on_press_tx(move |a: &mut App, tx| open_folder(a, path.clone(), tx))

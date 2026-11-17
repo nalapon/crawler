@@ -77,7 +77,7 @@ pub const SAVE: Icon = Icon {
     body: r#"<path d="M12 2v13m-5-5 5 5 5-5M5 5H3v17h18V5h-2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
 
-/// Reader controls follow Swift's borderless ActionButton, including in retro themes.
+/// Reader controls are borderless, including in retro themes.
 pub fn button(
     p: &Paint,
     key: &str,

@@ -1,5 +1,5 @@
 //! Crawler's own launch flags, read from what Rune leaves after its tooling flags.
-//! They match the Swift app's diagnostics, so the same checks drive both builds.
+//! They drive the checks described in AGENTS.md.
 
 use std::path::PathBuf;
 

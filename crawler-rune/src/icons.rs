@@ -58,7 +58,7 @@ pub fn poll() -> bool {
         .is_some_and(|cache| cache.changed.swap(false, Ordering::AcqRel))
 }
 
-/// Uses FileIcons.swift's material assets and native type icons, cached at Retina resolution.
+/// Material assets for known types and native type icons for the rest, cached at Retina resolution.
 pub fn file(path: &Path, folder: bool, classic: bool, size: f32) -> El {
     let Some(cache) = CACHE.get() else {
         return el().size(size, size);

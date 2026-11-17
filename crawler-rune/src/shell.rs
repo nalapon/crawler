@@ -334,7 +334,7 @@ pub fn pane_title(p: &Paint, key: &str, title: &str, detail: Option<&str>, activ
         .gap(8.0)
         .items_center()
         .shrink()
-        // The detail elides first; the title keeps up to ~220 pt, like Swift's strip.
+        // The detail elides first; the title keeps up to ~220 pt.
         .child(
             text(title)
                 .font(l.font(12.0, 600.0))
@@ -480,7 +480,7 @@ pub enum PlaceKind {
     Drive,
 }
 
-/// The Swift ShellIcons artwork at 2x, laid out as twelve roles by eleven themes and two states.
+/// The section and place artwork at 2x, laid out as twelve roles by eleven themes and two states.
 /// Keeping its native symbols and pixel artwork avoids substituting a different icon family.
 #[derive(Clone, Copy)]
 pub enum ShellIcon {

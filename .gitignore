@@ -5,9 +5,7 @@ build/
 dist/
 artifacts/
 output/
-.swiftpm/
 .jj/
-*.xcuserstate
 # Local signing material and credentials never belong in the source repository.
 .env
 .env.*

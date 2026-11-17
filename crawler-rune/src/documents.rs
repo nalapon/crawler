@@ -1,6 +1,6 @@
 //! Folders and files sent by `open`, the `crawler` CLI, Finder or the Dock icon: the
 //! open-documents Apple event. winit doesn't forward it, so Crawler installs its own handler and
-//! queues the paths for `app::poll`, which opens them like Swift's `application(_:open:)`:
+//! queues the paths for `app::poll`, which opens them:
 //! folders in Folders, files through the normal Enter policy.
 
 use std::path::PathBuf;
