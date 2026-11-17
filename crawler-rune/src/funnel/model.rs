@@ -168,13 +168,34 @@ pub fn name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 pub fn size_label(size: Option<u64>) -> String {
-    match size {
-        None => "—".into(),
-        Some(n) if n < 1000 => format!("{n} B"),
-        Some(n) if n < 1_000_000 => format!("{:.1} KB", n as f64 / 1000.0),
-        Some(n) if n < 1_000_000_000 => format!("{:.1} MB", n as f64 / 1e6),
-        Some(n) => format!("{:.1} GB", n as f64 / 1e9),
-    }
+    use objc2_foundation::{NSByteCountFormatter, NSByteCountFormatterCountStyle};
+    size.and_then(|n| i64::try_from(n).ok()).map_or_else(
+        || "—".into(),
+        |n| {
+            NSByteCountFormatter::stringFromByteCount_countStyle(
+                n,
+                NSByteCountFormatterCountStyle::File,
+            )
+            .to_string()
+            .replace("KB", "K")
+            .replace("MB", "M")
+            .replace("GB", "G")
+            .replace("TB", "T")
+        },
+    )
+}
+
+pub fn display_path(path: &Path) -> String {
+    path.strip_prefix(crate::app::home()).map_or_else(
+        |_| path.display().to_string(),
+        |relative| {
+            if relative.as_os_str().is_empty() {
+                "~".into()
+            } else {
+                format!("~/{}", relative.display())
+            }
+        },
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]

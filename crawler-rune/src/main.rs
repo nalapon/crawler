@@ -9,6 +9,7 @@ mod app;
 mod args;
 mod funnel;
 mod index;
+mod icons;
 mod opening;
 mod pdf;
 mod preview;

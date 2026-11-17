@@ -10,6 +10,7 @@ pub struct Chrome {
     opacity: Live<f32>,
     position: Cell<ScrollPos>,
     mouse: Cell<bool>,
+    interacted: Cell<bool>,
 }
 impl Default for Chrome {
     fn default() -> Self {
@@ -18,10 +19,21 @@ impl Default for Chrome {
             opacity: Live::new(0.0),
             position: Cell::new(ScrollPos::default()),
             mouse: Cell::new(false),
+            interacted: Cell::new(false),
         }
     }
 }
 impl Chrome {
+    pub fn has_interacted(&self) -> bool {
+        self.interacted.get()
+    }
+    pub fn mark_interacted(&self) {
+        self.interacted.set(true);
+    }
+    pub fn reset_anchor(&self) {
+        self.interacted.set(false);
+    }
+
     pub fn half_page(&self, row_height: f32) -> isize {
         ((self.position.get().viewport[1] / row_height / 2.0) as isize).max(1)
     }
@@ -59,6 +71,7 @@ pub fn wrap(viewport: El, key: String, color: Color, chrome: Rc<Chrome>) -> El {
         .chain_scroll_offset(move |pos| following.follow(pos))
         .on_wheel(move |_: &mut App, _, tx| {
             tx.live_only();
+            wheel.interacted.set(true);
             wheel.mouse.set(true);
             if wheel.position.get().max[1] > 0.0 {
                 wheel.pulse();
@@ -88,6 +101,7 @@ pub fn wrap(viewport: El, key: String, color: Color, chrome: Rc<Chrome>) -> El {
                     let pos = drag.position.get();
                     match gesture.phase {
                         Phase::Down => {
+                            drag.interacted.set(true);
                             gesture.data = pos.offset[1];
                             drag.mouse.set(true);
                             drag.opacity.snap(1.0);
