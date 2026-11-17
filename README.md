@@ -22,9 +22,9 @@ Hell yes, I do not know nothing about swift, have not read a single line of code
 
 ## This is for AI agents
 
-Crawler is a native macOS app for finding and reading files, built with Swift and AppKit, with fuzzy file search, document previews, Markdown and Word reading and a PDF reader with annotations. The app source is in `Sources/Crawler/`. Read [AGENTS.md](AGENTS.md) before making changes.
+Crawler is a native macOS app for finding and reading files, with fuzzy file search, document previews, Markdown and Word reading and a PDF reader with annotations. The app is written in Rust on [Rune](https://github.com/anomalyco/rune), in `crawler-rune/`. The original Swift and AppKit version in `Sources/Crawler/` remains as the reference. Read [AGENTS.md](AGENTS.md) before making changes.
 
-Requires macOS 14+, Xcode with Swift 6.2+, Python 3.11+ and rustup. In Keychain Access, create a self-signed Code Signing certificate named `Crawler Local Development` once. You can also use an existing certificate through `CRAWLER_SIGNING_IDENTITY`.
+Requires macOS 14+, Python 3.11+ and rustup. The Swift reference app (`scripts/build-swift.sh`) also needs Xcode with Swift 6.2+. In Keychain Access, create a self-signed Code Signing certificate named `Crawler Local Development` once. You can also use an existing certificate through `CRAWLER_SIGNING_IDENTITY`.
 
 From the repository root, build and install in Applications:
 

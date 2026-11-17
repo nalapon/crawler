@@ -139,7 +139,9 @@ impl App {
         let prefs = if rune::tooling::headless_run().is_some() && !isolated {
             Prefs::memory()
         } else {
-            Prefs::open(PREFS_ID)
+            let mut prefs = Prefs::open(PREFS_ID);
+            crate::swift_settings::import(&mut prefs);
+            prefs
         };
         let saved: Theme = prefs.get("theme").unwrap_or_default();
         let theme = launch
@@ -221,6 +223,7 @@ impl App {
 pub fn setup(app: &mut App, waker: Waker) {
     app.index.set_waker(waker.clone());
     app.waker = Some(waker.clone());
+    crate::documents::set_waker(waker.clone());
     funnel::setup(app, &waker);
     preview::setup(app, &waker);
     pdf::setup(app, &waker);
@@ -245,6 +248,10 @@ pub fn poll(app: &mut App, clock: f64, tx: &mut Tx) -> bool {
     app.clock = clock;
     let mut changed = false;
     if let Some(path) = app.pending_open.take() {
+        opening::open_path(app, &path, tx);
+        changed = true;
+    }
+    for path in crate::documents::take() {
         opening::open_path(app, &path, tx);
         changed = true;
     }

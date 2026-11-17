@@ -30,7 +30,7 @@ blake3 = "1.8"
 rayon = "1"
 objc2 = "0.6.3"
 block2 = "0.6"
-objc2-foundation = "0.3.2"
+objc2-foundation = { version = "0.3.2", features = ["objc2-core-services"] }
 objc2-app-kit = "0.3.2"
 objc2-pdf-kit = "0.3.2"
 objc2-uniform-type-identifiers = "0.3"

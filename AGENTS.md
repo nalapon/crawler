@@ -2,7 +2,7 @@
 
 ## Product and current scope
 
-Crawler is a native macOS app for finding and reading files, built with Swift and AppKit. The shipping source is `Sources/Crawler/`. The title bar holds five sections: Search, Folders, Activity, Transfers and Settings. Search and Folders share the scope funnel. `prototype/` contains HTML mockups, including the historical Finder mockup and the section shell prototype; changes there do not affect the native app.
+Crawler is a native macOS app for finding and reading files. The shipping app is the Rust port built on Rune in `crawler-rune/`. The Swift/AppKit app in `Sources/Crawler/` is the reference implementation that the rest of this document describes; the port must match it feature for feature. The title bar holds five sections: Search, Folders, Activity, Transfers and Settings. Search and Folders share the scope funnel. `prototype/` contains HTML mockups, including the historical Finder mockup and the section shell prototype; changes there do not affect the native app.
 
 Folders shows places for Home, Downloads, Desktop, at most one user-pinned folder and connected volumes. Search starts at Home, with recent files inside the empty-query view. Activity is the process monitor, Transfers is AirDrop and Settings holds the theme and default text editor. There are no tabs, sidebar, Columns view, System Settings workspace or Trash workspace. Crawler does not move, rename or delete files. Do not restore synthetic data or add destructive disk operations unless the maintainer asks for them.
 
@@ -17,7 +17,7 @@ Folders shows places for Home, Downloads, Desktop, at most one user-pinned folde
 
 ## Build and run
 
-Requirements: macOS 14+, Xcode with Swift 6.2+ and the macOS SDK, Python 3.11+ and rustup. The app uses Swift Package Manager with pinned Tree-sitter/grammar and Swift Markdown dependencies. There is no WebView.
+Requirements: macOS 14+, rustup (the crate pins its toolchain in `crawler-rune/rust-toolchain.toml`) and Python 3.11+. The Swift reference app additionally needs Xcode with Swift 6.2+ and the macOS SDK. There is no WebView.
 
 Build and launch the signed release app from the repository root:
 
@@ -26,9 +26,9 @@ scripts/build.sh
 open "$PWD/build/Crawler.app"
 ```
 
-The script runs both dependency bootstraps, builds release, packages resources and VLCKit, strips the packaged executable and signs `build/Crawler.app`. It retains the original executable and dSYM in `.build/release`. Signing requires a persistent `Crawler Local Development` certificate in the login keychain, or an existing certificate named by `CRAWLER_SIGNING_IDENTITY`. Never replace it with ad-hoc signing or recreate it for each build: changing the certificate breaks remembered privacy grants. Keep the bundle identifier `studio.crawler.native-prototype` unless the maintainer explicitly requests a migration.
+The script builds the Rust port in release, packages the icon, licenses and generated Rust notices (`scripts/rust-notices.py`), strips the packaged executable, signs `build/Crawler.app` and swaps it in place of the previous bundle. It retains the unstripped executable in `crawler-rune/target/release`. `scripts/build-swift.sh` still builds the Swift reference app as `build/Crawler-Swift.app`, with both dependency bootstraps and VLCKit. Signing requires a persistent `Crawler Local Development` certificate in the login keychain, or an existing certificate named by `CRAWLER_SIGNING_IDENTITY`. Never replace it with ad-hoc signing or recreate it for each build: changing the certificate breaks remembered privacy grants. Keep the bundle identifier `studio.crawler.native-prototype` unless the maintainer explicitly requests a migration. Both apps share it, so the port keeps the Swift app's privacy grants and imports its settings once on first launch.
 
-For a direct debug build, prepare the dependencies first:
+For a direct debug build of the Swift reference app, prepare the dependencies first:
 
 ```sh
 scripts/bootstrap-video.sh

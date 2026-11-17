@@ -7,6 +7,7 @@
 mod activity;
 mod app;
 mod args;
+mod documents;
 mod funnel;
 mod icons;
 mod index;
@@ -15,12 +16,14 @@ mod pdf;
 mod preview;
 mod settings;
 mod shell;
+mod swift_settings;
 mod theme;
 mod transfers;
 
 use rune::{AppSpec, Chrome};
 
 fn main() {
+    documents::install();
     let spec = AppSpec::<app::App> {
         min_size: Some((760.0, 480.0)),
         fonts: preview::fonts(),
