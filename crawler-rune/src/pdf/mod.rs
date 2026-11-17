@@ -1,4 +1,5 @@
 //! Shared PDF sources, background Core Graphics rasterization and PDFKit annotation editing.
+mod bitmap;
 mod model;
 mod view;
 mod worker;
@@ -128,26 +129,23 @@ impl State {
         {
             return key.clone();
         }
-        // Keep dirty documents until the user resolves them. Clean previews have a bounded cache.
-        if sources.len() >= 4 {
-            let oldest = sources
-                .iter()
-                .filter(|(p, s)| {
-                    self.active.as_deref() != Some(p.as_path())
-                        && s.pending == 0
-                        && !s.summary.as_ref().is_some_and(|s| s.dirty)
-                })
-                .min_by_key(|(_, s)| s.started)
-                .map(|(p, _)| p.clone());
-            if let Some(old) = oldest {
-                sources.remove(&old);
-                self.send(Command::Release(old));
-            }
+        // Only the selected document needs a clean source. Unresolved edits remain owned.
+        let released: Vec<_> = sources
+            .iter()
+            .filter(|(_, s)| s.pending == 0 && !s.summary.as_ref().is_some_and(|s| s.dirty))
+            .map(|(path, _)| path.clone())
+            .collect();
+        for old in released {
+            sources.remove(&old);
+            self.send(Command::Release(old));
         }
-        let source = Source::default();
+        let mut source = Source::default();
+        let surface = source.surfaces.entry(0).or_default();
+        surface.poster_requested = true;
+        let poster = surface.pixels.clone();
         let started = source.started;
         sources.insert(path.into(), source);
-        self.send(Command::Load(path.into(), started));
+        self.send(Command::Load(path.into(), started, poster));
         path.into()
     }
 
@@ -259,6 +257,9 @@ pub fn poll(app: &mut App, tx: &mut Tx) -> bool {
             } => {
                 if let Some(source) = app.pdf.sources.borrow_mut().get_mut(&path) {
                     source.metrics = metrics;
+                    if !source.visible.contains(&page) {
+                        continue;
+                    }
                     let is_new = !source.pages.contains_key(&page);
                     let metadata_changed = complete
                         && source.pages.get(&page).is_some_and(|p| {
@@ -349,11 +350,11 @@ pub fn poll(app: &mut App, tx: &mut Tx) -> bool {
             let viewport = app.pdf.viewport.get();
             let width = viewport[2];
             let height = viewport[3];
-            let gap = 12.0 + 24.0 * app.pdf.pinch_page as f32;
+            let gap = 16.0 + 16.0 * app.pdf.pinch_page as f32;
             let next_y = (offset[1] * ratio + height * (ratio - 1.0) * 0.5 - pan[1]
                 + gap * (1.0 - ratio))
                 .max(0.0);
-            let base_width = (width - 48.0).clamp(200.0, 900.0);
+            let base_width = (width - 32.0).max(200.0);
             let old_left = (width - base_width * app.pdf.zoom).max(0.0) * 0.5;
             let new_left = (width - base_width * app.pdf.pending_zoom).max(0.0) * 0.5;
             let next_x = (offset[0] * ratio + width * (ratio - 1.0) * 0.5 - pan[0] + new_left
@@ -387,6 +388,34 @@ pub fn pane(app: &App, cx: &mut Cx<App>, p: &Paint, path: &Path, key: &str) -> E
     let source = app.pdf.ensure(path);
     *app.pdf.preview_path.borrow_mut() = Some(source.clone());
     view::preview(app, cx, p, &source, key)
+}
+
+/// Hidden panes drop their view surfaces; the worker retains reusable bitmaps within its budget.
+pub fn suspend_preview(app: &App) {
+    for source in app.pdf.sources.borrow_mut().values_mut() {
+        for surface in source.surfaces.values_mut() {
+            surface.epoch.fetch_add(1, Ordering::Relaxed);
+            surface.pixels.clear();
+            surface.sharp.clear();
+            surface.poster_requested = false;
+            surface.requested = None;
+        }
+    }
+}
+
+pub fn release_previews(app: &mut App) {
+    suspend_preview(app);
+    let mut sources = app.pdf.sources.borrow_mut();
+    let released: Vec<_> = sources
+        .iter()
+        .filter(|(_, s)| s.pending == 0 && !s.summary.as_ref().is_some_and(|s| s.dirty))
+        .map(|(path, _)| path.clone())
+        .collect();
+    for path in released {
+        sources.remove(&path);
+        app.pdf.send(Command::Release(path));
+    }
+    *app.pdf.preview_path.borrow_mut() = None;
 }
 
 pub fn open_reader(app: &mut App, path: &Path, tx: &mut Tx) -> Result<(), String> {
@@ -495,11 +524,11 @@ pub fn reader_key(app: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
                 return true;
             }
             '+' | '=' => {
-                app.pdf.zoom_to(app.pdf.zoom * 1.1, tx);
+                app.pdf.zoom_to(app.pdf.zoom * 1.25, tx);
                 return true;
             }
             '-' => {
-                app.pdf.zoom_to(app.pdf.zoom / 1.1, tx);
+                app.pdf.zoom_to(app.pdf.zoom / 1.25, tx);
                 return true;
             }
             '0' => {
@@ -652,6 +681,9 @@ pub fn report(app: &App) -> serde_json::Value {
         "pdf_reader_load_ms": source.and_then(|s| s.metrics.first_bitmap_ms),
         "pdf_reader_rendering": source.map(|s| &s.metrics),
         "pdf_reader_annotations": source.and_then(|s| s.summary.as_ref()),
+        "pdf_retained_surfaces": source.map(|s| s.surfaces.len()),
+        "pdf_retained_metadata": source.map(|s| s.pages.len()),
+        "pdf_retained_range": source.map(|s| [s.visible.start, s.visible.end]),
         "pdf_peak_scroll_update_ms": app.pdf.max_scroll_ms.get(),
         "pdf_zoom": app.pdf.zoom,
         "pdf_tool": app.pdf.tool,

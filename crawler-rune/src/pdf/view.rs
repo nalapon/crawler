@@ -7,7 +7,8 @@ use rune::{Color, Cx, Drag, El, GrowthSpec, Live, Phase, Tx, col, el, row, text}
 use rune_kit::{Dialog, TextArea};
 
 use crate::app::{App, Paint};
-use crate::shell::{pane_title, shell_button};
+use crate::preview::controls::{self, button};
+use crate::shell::shell_button;
 
 use super::{
     CloseIntent, State,
@@ -78,65 +79,107 @@ pub fn reader(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) -> El
         .unwrap_or_else(|| "Loading PDF…".into());
     let title = format!("{filename}{}", if dirty { " •" } else { "" });
     let copy_name = filename.clone();
+    let header_width = cx.layout_size("pdf-header").map(|s| s[0]).unwrap_or(1180.0);
     let header = row()
         .key("pdf-header")
         .w_full()
         .h(48.0)
-        .pl(cx.titlebar_inset().max(80.0))
-        .pr(12.0)
-        .gap(6.0)
+        .pl(cx.titlebar_inset().max(88.0))
+        .pr(14.0)
+        .gap(4.0)
         .items_center()
-        .fill(p.look.sidebar)
+        .fill(p.look.raised)
         .window_drag()
+        .border_sides([0.0, 0.0, 1.0, 0.0], p.look.line)
         .child(
-            pane_title(p, "pdf-title", &title, None, true)
-                .grow(1.0)
+            text(title)
+                .shrink()
+                .font(p.look.font(12.0, 500.0))
+                .color(p.look.text)
+                .truncate()
+                .max_w((header_width - 376.0).max(0.0))
                 .min_w(0.0),
         )
         .child(
-            shell_button(p, "pdf-copy-name", "Copy name", false)
-                .help("Copy file name with extension")
+            button(p, "pdf-copy-name", "", Some(&controls::COPY), false)
+                .w(30.0)
+                .label("Copy file name with extension")
+                .help("Copy file name")
                 .on_press_tx(move |_: &mut App, tx| tx.copy(copy_name.clone())),
         )
+        .child(el().grow(1.0))
         .child(
-            text("Esc twice to return")
-                .font(type_::LABEL)
-                .color(p.look.muted),
+            text(if app.reader_escape_at.is_some() {
+                "Press Esc again to return"
+            } else {
+                "Esc twice to return"
+            })
+            .font(p.look.font(11.0, 400.0))
+            .color(p.look.muted)
+            .w(176.0),
         )
         .child(
-            shell_button(p, "close-pdf", "Close", false)
+            button(p, "close-pdf", "", Some(&controls::CLOSE), false)
+                .w(32.0)
+                .label("Close PDF")
                 .on_press_tx(|a: &mut App, tx| request_close(a, CloseIntent::Reader, tx)),
         );
     let mut tools = row()
         .key("pdf-tools-row")
-        .min_w(1160.0)
-        .h(38.0)
-        .px(8.0)
-        .gap(3.0)
+        .w(header_width.max(1020.0))
+        .min_w(1020.0)
+        .h(40.0)
+        .px(20.0)
+        .gap(4.0)
         .items_center()
         .fill(p.look.raised)
         .border_sides([0.0, 0.0, 1.0, 0.0], p.look.line);
-    for tool in Tool::ALL {
+    for (tool, title, symbol, width) in [
+        (Tool::Select, "", &controls::SELECT, 32.0),
+        (Tool::Highlight, "Highlight", &controls::HIGHLIGHT, 94.0),
+        (Tool::Underline, "Underline", &controls::UNDERLINE, 94.0),
+        (Tool::Note, "Note", &controls::NOTE, 72.0),
+    ] {
         tools = tools.child(
-            shell_button(
+            button(
                 p,
                 &format!("pdf-tool-{}", tool.label().to_ascii_lowercase()),
-                tool.label(),
+                title,
+                Some(symbol),
                 app.pdf.tool == tool,
             )
+            .w(width)
+            .label(tool.label())
             .disabled(tool != Tool::Select && (!editable || no_text_layer))
             .on_press(move |a: &mut App| a.pdf.choose_tool(tool)),
         );
     }
+    tools = tools.child(el().w(10.0));
     for ink in Ink::ALL {
         tools = tools.child(
-            el().key(format!("pdf-color-{ink:?}"))
-                .role("button")
-                .label(format!("{ink:?} annotation color"))
-                .size(18.0, 18.0)
-                .radius(9.0)
-                .fill(crate::theme::rgb(ink.rgb()))
-                .border(if app.pdf.ink == ink { 2.0 } else { 0.0 }, p.look.text)
+            p.kit
+                .interactive(
+                    el().key(format!("pdf-color-{ink:?}"))
+                        .role("button")
+                        .label(format!("{ink:?} annotation color"))
+                        .size(26.0, 28.0)
+                        .radius(if p.look.era() == crate::theme::Era::Modern {
+                            4.0
+                        } else {
+                            0.0
+                        })
+                        .fill(if app.pdf.ink == ink {
+                            p.look.selection
+                        } else {
+                            Color::TRANSPARENT
+                        })
+                        .center(),
+                )
+                .child(
+                    el().size(13.0, 13.0)
+                        .radius(6.5)
+                        .fill(crate::theme::rgb(ink.rgb())),
+                )
                 .disabled(!editable)
                 .on_press(move |a: &mut App| {
                     a.pdf.ink = ink;
@@ -147,8 +190,11 @@ pub fn reader(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) -> El
         );
     }
     tools = tools
+        .child(el().w(12.0))
         .child(
-            shell_button(p, "pdf-delete", "Delete", false)
+            button(p, "pdf-delete", "", Some(&controls::DELETE), false)
+                .w(32.0)
+                .label("Delete selected annotation")
                 .disabled(!editable || app.pdf.selected.is_none())
                 .on_press(|a: &mut App| {
                     if let Some(id) = a.pdf.selected.take() {
@@ -157,48 +203,54 @@ pub fn reader(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) -> El
                 }),
         )
         .child(
-            shell_button(p, "pdf-undo", "Undo", false)
+            button(p, "pdf-undo", "", Some(&controls::UNDO), false)
+                .w(32.0)
+                .label("Undo")
                 .disabled(!summary.as_ref().is_some_and(|s| s.undo))
                 .on_press(|a: &mut App| a.pdf.edit(Edit::Undo)),
         )
         .child(
-            shell_button(p, "pdf-redo", "Redo", false)
+            button(p, "pdf-redo", "", Some(&controls::REDO), false)
+                .w(32.0)
+                .label("Redo")
                 .disabled(!summary.as_ref().is_some_and(|s| s.redo))
                 .on_press(|a: &mut App| a.pdf.edit(Edit::Redo)),
         )
+        .child(el().w(8.0))
         .child(
-            shell_button(p, "pdf-remove-all", "Remove annotations", false)
-                .disabled(!editable)
-                .on_press(|a: &mut App| {
-                    a.pdf.choose_tool(Tool::Select);
-                    a.pdf.edit(Edit::RemoveAll);
-                }),
-        )
-        .child(el().grow(1.0))
-        .child(
-            shell_button(p, "pdf-zoom-out", "−", false)
-                .on_press_tx(|a: &mut App, tx| a.pdf.zoom_to(a.pdf.zoom / 1.1, tx)),
-        )
-        .child(
-            shell_button(
+            button(
                 p,
-                "pdf-zoom-reset",
-                &format!("{}%", (app.pdf.zoom * 100.0).round()),
+                "pdf-remove-all",
+                "Remove annotations",
+                Some(&controls::ERASE),
                 false,
             )
-            .on_press_tx(|a: &mut App, tx| a.pdf.zoom_to(1.0, tx)),
+            .w(144.0)
+            .disabled(!editable)
+            .on_press(|a: &mut App| {
+                a.pdf.choose_tool(Tool::Select);
+                a.pdf.edit(Edit::RemoveAll);
+            }),
         )
         .child(
-            shell_button(p, "pdf-zoom-in", "+", false)
-                .on_press_tx(|a: &mut App, tx| a.pdf.zoom_to(a.pdf.zoom * 1.1, tx)),
+            text(status)
+                .shrink()
+                .font(p.look.font(11.0, 400.0))
+                .color(p.look.muted)
+                .truncate()
+                .grow(1.0)
+                .min_w(0.0)
+                .px(12.0),
         )
         .child(
-            shell_button(p, "pdf-save-as", "Save as…", false)
+            button(p, "pdf-save-as", "Save as…", None, false)
+                .w(94.0)
                 .disabled(!editable)
                 .on_press_tx(|a: &mut App, tx| save(a, true, tx)),
         )
         .child(
-            shell_button(p, "pdf-save", "Save", false)
+            button(p, "pdf-save", "Save", Some(&controls::SAVE), false)
+                .w(76.0)
                 .disabled(!editable || !dirty)
                 .on_press_tx(|a: &mut App, tx| save(a, false, tx)),
         );
@@ -206,7 +258,7 @@ pub fn reader(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) -> El
         .disabled(app.pdf.closing_save.is_some() || app.pdf.close_after_discard.is_some())
         .key("pdf-tools")
         .w_full()
-        .h(38.0)
+        .h(40.0)
         .scroll_x()
         .child(tools);
     overlays(app, p, layer);
@@ -219,62 +271,63 @@ pub fn reader(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) -> El
         .child(header)
         .child(tools)
         .child(viewport.grow(1.0).min_h(0.0))
+        .child(footer(app, p, path, "pdf-status"))
+}
+
+fn footer(app: &App, p: &Paint, path: &Path, key: &str) -> El {
+    let sources = app.pdf.sources.borrow();
+    let source = sources.get(path);
+    let count = source
+        .and_then(|s| s.summary.as_ref())
+        .map(|s| s.page_count)
+        .unwrap_or(0);
+    let page = source.map(|s| s.current_page + 1).unwrap_or(1);
+    row()
+        .key(key.to_owned())
+        .w_full()
+        .h(30.0)
+        .px(12.0)
+        .items_center()
+        .fill(p.look.raised)
         .child(
-            row()
-                .key("pdf-status")
-                .w_full()
+            text(format!("Page {page} of {count}"))
+                .font(p.look.font(10.0, 400.0))
+                .color(p.look.muted)
+                .grow(1.0)
+                .min_w(0.0),
+        )
+        .child(
+            button(p, "pdf-zoom-out", "−", None, false)
+                .w(30.0)
                 .h(24.0)
-                .px(12.0)
-                .items_center()
-                .fill(p.look.sidebar)
-                .child(
-                    text(status)
-                        .font(type_::LABEL)
-                        .color(p.look.muted)
-                        .truncate(),
-                ),
+                .label("Zoom out")
+                .on_press_tx(|a: &mut App, tx| a.pdf.zoom_to(a.pdf.zoom / 1.25, tx)),
+        )
+        .child(
+            button(p, "pdf-zoom-in", "+", None, false)
+                .w(30.0)
+                .h(24.0)
+                .label("Zoom in")
+                .on_press_tx(|a: &mut App, tx| a.pdf.zoom_to(a.pdf.zoom * 1.25, tx)),
+        )
+        .child(
+            button(p, "pdf-zoom-reset", "Fit", None, false)
+                .w(42.0)
+                .h(24.0)
+                .help(format!("Fit page · {}%", (app.pdf.zoom * 100.0).round()))
+                .on_press_tx(|a: &mut App, tx| a.pdf.zoom_to(1.0, tx)),
         )
 }
 
 pub fn preview(app: &App, cx: &mut Cx<App>, p: &Paint, path: &Path, key: &str) -> El {
-    let size = cx.layout_size(key).unwrap_or([480.0, 600.0]);
-    let summary = app
-        .pdf
-        .sources
-        .borrow()
-        .get(path)
-        .and_then(|s| s.summary.clone());
-    let error = app
-        .pdf
-        .sources
-        .borrow()
-        .get(path)
-        .and_then(|s| s.error.clone());
-    let Some(summary) = summary else {
-        return col()
-            .key(key.to_string())
-            .w_full()
-            .h_full()
-            .center()
-            .child(text(error.unwrap_or_else(|| "Loading PDF…".into())).color(p.look.muted));
-    };
-    let width = (size[0] - 32.0)
-        .max(100.0)
-        .min((size[1] - 32.0).max(100.0) * (summary.first_size[0] / summary.first_size[1]) as f32);
-    let page = page(app, p, path, 0, width, cx.env().scale, true);
-    let path = path.to_path_buf();
     col()
-        .key(key.to_string())
+        .key(key.to_owned())
         .w_full()
         .h_full()
-        .items_center()
-        .pt(16.0)
-        .fill(p.look.sidebar)
-        .child(page.on_double_press_tx(move |a: &mut App, tx| {
-            if let Err(error) = super::open_reader(a, &path, tx) {
-                a.toast(error);
-            }
-        }))
+        .min_w(0.0)
+        .fill(p.look.raised)
+        .child(pages(app, cx, p, path).grow(1.0).min_h(0.0))
+        .child(footer(app, p, path, &format!("{key}-footer")))
 }
 
 fn pages(app: &App, cx: &mut Cx<App>, p: &Paint, path: &Path) -> El {
@@ -300,13 +353,14 @@ fn pages(app: &App, cx: &mut Cx<App>, p: &Paint, path: &Path) -> El {
             .center()
             .child(text(error.unwrap_or_else(|| "Loading PDF…".into())).color(p.look.muted));
     };
-    let page_width = (width - 48.0).clamp(200.0, 900.0) * app.pdf.zoom;
-    let estimate = (summary.first_size[1] / summary.first_size[0]) as f32 * page_width + 24.0;
+    let page_width = (width - 32.0).max(200.0) * app.pdf.zoom;
+    let estimate = (summary.first_size[1] / summary.first_size[0]) as f32 * page_width + 16.0;
     let build_path = path.to_path_buf();
     let visible_path = path.to_path_buf();
     let offset = app.pdf.scroll.clone();
     let last_scroll = app.pdf.last_scroll.clone();
     let scroll_clock = app.pdf.scroll_clock.clone();
+    let preview = app.reader != crate::app::Reader::Pdf;
     let retain_worker = app.pdf.worker.as_ref().map(|w| w.send.clone());
     let rows = col()
         .key("pdf-pages")
@@ -323,17 +377,32 @@ fn pages(app: &App, cx: &mut Cx<App>, p: &Paint, path: &Path) -> El {
                     .key(format!("pdf-page-{i}"))
                     .w_full()
                     .items_center()
-                    .pt(12.0)
-                    .pb(12.0)
-                    .child(page(a, &p, &build_path, i, page_width, device_scale, false))
+                    .pt(16.0)
+                    .pb(0.0)
+                    .child(page(
+                        a,
+                        &p,
+                        &build_path,
+                        i,
+                        page_width,
+                        device_scale,
+                        preview,
+                    ))
             },
         )
-        .virtual_rows_version((path.to_path_buf(), summary.page_count))
+        .virtual_rows_version((
+            path.to_path_buf(),
+            summary.page_count,
+            page_width.to_bits(),
+            device_scale.to_bits(),
+            p.look.theme,
+        ))
         .on_visible_rows(move |a: &mut App, visible| {
             let started = Instant::now();
             if let Some(source) = a.pdf.sources.borrow_mut().get_mut(&visible_path) {
                 let retained =
                     visible.start.saturating_sub(1)..(visible.end + 1).min(summary.page_count);
+                source.current_page = visible.start + visible.len().saturating_sub(1) / 2;
                 source.visible = retained.clone();
                 source.surfaces.retain(|i, surface| {
                     if retained.contains(i) {
@@ -372,7 +441,7 @@ fn pages(app: &App, cx: &mut Cx<App>, p: &Paint, path: &Path) -> El {
         .h_full()
         .min_h(0.0)
         .focusable(true)
-        .fill(p.look.sidebar)
+        .fill(p.look.raised)
         .scroll_xy()
         .scroll_anchor()
         .live_scale(&app.pdf.zoom_live)
@@ -384,8 +453,10 @@ fn pages(app: &App, cx: &mut Cx<App>, p: &Paint, path: &Path) -> El {
             offset.set(position.offset);
         })
         .on_layout_tx(|a: &mut App, rect, tx| {
-            a.pdf.viewport.set(rect);
-            tx.live_only();
+            let old = a.pdf.viewport.replace(rect);
+            if old == rect {
+                tx.live_only();
+            }
         })
         .on_wheel(|_: &mut App, _, tx| {
             tx.live_only();
@@ -457,6 +528,10 @@ fn page(
             .clone();
         (size, content, surface, overlays)
     };
+    if let Some(waker) = &app.waker {
+        surface.pixels.set_waker(waker.clone());
+        surface.sharp.set_waker(waker.clone());
+    }
     let height = (size[1] / size[0]) as f32 * width;
     let render_path = path.to_path_buf();
     let drag_path = path.to_path_buf();
@@ -471,14 +546,14 @@ fn page(
             el().key("bitmap")
                 .w_full()
                 .h_full()
-                .pixels(&surface.pixels)
+                .native_surface(&surface.pixels, rune::SurfaceFit::Fill)
                 .inert(),
         )
         .child(
             el().key("sharp-bitmap")
                 .absolute(0.0, 0.0)
                 .size(0.0, 0.0)
-                .pixels(&surface.sharp)
+                .native_surface(&surface.sharp, rune::SurfaceFit::Fill)
                 .live_rect(&surface.crop)
                 .inert(),
         )
@@ -486,7 +561,7 @@ fn page(
             if let Some(source) = a.pdf.sources.borrow_mut().get_mut(&render_path) {
                 source.drawn.insert(index, rect);
             }
-            request_raster(&a.pdf, &render_path, index, rect, device_scale, preview);
+            request_raster(&a.pdf, &render_path, index, rect, device_scale);
             tx.live_only();
         });
     if let Some(content) = content {
@@ -568,6 +643,14 @@ fn page(
             );
         }
     }
+    if preview {
+        let path = path.to_path_buf();
+        page = page.on_double_press_tx(move |a: &mut App, tx| {
+            if let Err(error) = super::open_reader(a, &path, tx) {
+                a.toast(error);
+            }
+        });
+    }
     if !preview {
         let fill = if app.pdf.tool == Tool::Select {
             p.look.accent.alpha(0.25)
@@ -601,21 +684,14 @@ fn scaled(rect: Rect, scale: f64) -> [f32; 4] {
 
 /// A low-resolution whole page appears first. Sharp rendering covers only the viewport's
 /// intersection with the page, with a margin, and stays below 16 million pixels per request.
-fn request_raster(
-    state: &State,
-    path: &Path,
-    index: usize,
-    drawn: [f32; 4],
-    device_scale: f32,
-    preview: bool,
-) {
+fn request_raster(state: &State, path: &Path, index: usize, drawn: [f32; 4], device_scale: f32) {
     let started = Instant::now();
     let viewport = state.viewport.get();
     let mut sources = state.sources.borrow_mut();
     let Some(source) = sources.get_mut(path) else {
         return;
     };
-    if !preview && !source.visible.contains(&index) {
+    if !source.visible.contains(&index) {
         return;
     }
     let size = source
@@ -626,7 +702,7 @@ fn request_raster(
         .unwrap_or([612.0, 792.0]);
     let surface = source.surfaces.entry(index).or_default();
     let generation = state.epoch.load(Ordering::Relaxed);
-    if surface.pixels.size().0 == 0 && surface.requested.is_none() {
+    if !surface.poster_requested {
         let full_width = 480;
         let height = (full_width as f64 * size[1] / size[0]).ceil().min(8192.0) as u32;
         let key = RasterKey {
@@ -646,43 +722,32 @@ fn request_raster(
             sharp: false,
             crop: None,
         });
-        surface.requested = Some(key);
+        surface.poster_requested = true;
     }
-    if drawn[2] <= 0.0 || drawn[3] <= 0.0 {
+    if drawn[2] <= 0.0 || drawn[3] <= 0.0 || viewport[2] <= 0.0 || viewport[3] <= 0.0 {
         return;
     }
-    let intersects =
-        preview || drawn[1] + drawn[3] >= viewport[1] && drawn[1] <= viewport[1] + viewport[3];
+    let intersects = drawn[1] + drawn[3] >= viewport[1] && drawn[1] <= viewport[1] + viewport[3];
     if !intersects {
+        return;
+    }
+    // The first build may use an estimated viewport width. Wait for its layout commit so
+    // a narrow pane never allocates a reader-sized crop that Rune keeps as an old binding.
+    let fitted_width = (viewport[2] - 32.0).max(200.0) * state.zoom;
+    if (drawn[2] - fitted_width).abs() > 1.0 {
         return;
     }
     let full_width = (drawn[2] * device_scale).ceil().clamp(1.0, 65536.0) as u32;
     let full_height = (full_width as f64 * size[1] / size[0]).ceil() as u32;
     let scale = full_width as f32 / drawn[2];
-    let x = if preview {
-        0
-    } else {
-        (((viewport[0] - drawn[0] - 64.0).max(0.0) * scale) as u32 / 128) * 128
-    };
-    let y = if preview {
-        0
-    } else {
-        (((viewport[1] - drawn[1] - 128.0).max(0.0) * scale) as u32 / 256) * 256
-    };
-    let width = if preview {
-        full_width.min(4096)
-    } else {
-        ((viewport[2] + 128.0) * scale).ceil() as u32
-    }
-    .min(full_width.saturating_sub(x))
-    .min(4096);
-    let height = if preview {
-        full_height.min(4096)
-    } else {
-        ((viewport[3] + 384.0) * scale).ceil() as u32
-    }
-    .min(full_height.saturating_sub(y))
-    .min(4096);
+    let x = (((viewport[0] - drawn[0] - 64.0).max(0.0) * scale) as u32 / 128) * 128;
+    let y = (((viewport[1] - drawn[1] - 128.0).max(0.0) * scale) as u32 / 256) * 256;
+    let width = (((viewport[2] + 128.0) * scale).ceil() as u32)
+        .min(full_width.saturating_sub(x))
+        .min(4096);
+    let height = (((viewport[3] + 384.0) * scale).ceil() as u32)
+        .min(full_height.saturating_sub(y))
+        .min(4096);
     if width == 0 || height == 0 {
         return;
     }

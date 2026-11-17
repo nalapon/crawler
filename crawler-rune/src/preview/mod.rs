@@ -1,5 +1,6 @@
 //! Shared, bounded file previews, the Space window, and the Markdown/Word reader.
 mod content;
+pub(crate) mod controls;
 mod native;
 mod word;
 
@@ -113,6 +114,7 @@ pub struct State {
     pinch: f32,
     history: Vec<(PathBuf, usize)>,
     visible_block: usize,
+    visible_end: usize,
     pending_position: Option<Position>,
     find_open: bool,
     find_edit: TextEdit,
@@ -122,7 +124,7 @@ pub struct State {
     space: Option<(AppHandle<App>, WindowHandle)>,
     space_parent: Option<AppHandle<App>>,
     space_open: Arc<AtomicBool>,
-    space_window: bool,
+    pub(crate) space_window: bool,
     space_path: Option<PathBuf>,
     editor_opener: Option<EditorOpener>,
     reader_displayed: Option<ReaderDisplayed>,
@@ -149,6 +151,7 @@ impl State {
             pinch: 0.0,
             history: Vec::new(),
             visible_block: 0,
+            visible_end: 0,
             pending_position: None,
             find_open: false,
             find_edit: TextEdit::new(""),
@@ -169,6 +172,33 @@ impl State {
 enum Position {
     Block(usize),
     Anchor(String),
+}
+
+/// New York is a hidden UI font. Rune's named-family lookup cannot discover its files.
+pub fn fonts() -> &'static [&'static [u8]] {
+    use std::sync::OnceLock;
+    static MAPPINGS: OnceLock<Vec<memmap2::Mmap>> = OnceLock::new();
+    static FONTS: OnceLock<Vec<&'static [u8]>> = OnceLock::new();
+    FONTS.get_or_init(|| {
+        let mapped = MAPPINGS.get_or_init(|| {
+            [
+                "/System/Library/Fonts/NewYork.ttf",
+                "/System/Library/Fonts/NewYorkItalic.ttf",
+            ]
+            .into_iter()
+            .filter_map(|path| {
+                let file = std::fs::File::open(path).ok()?;
+                // SAFETY: These system font files are read-only on macOS's sealed volume.
+                unsafe { memmap2::Mmap::map(&file) }.ok()
+            })
+            .collect()
+        });
+        crate::theme::FONTS
+            .iter()
+            .copied()
+            .chain(mapped.iter().map(|m| &m[..]))
+            .collect()
+    })
 }
 
 pub fn setup(app: &mut App, waker: &Waker) {
@@ -271,24 +301,17 @@ pub fn poll(app: &mut App, tx: &mut Tx) -> bool {
 
 /// The shared preview panel. Starting a new demand supersedes the old worker immediately.
 pub fn pane(app: &App, cx: &mut Cx<App>, p: &Paint, path: &Path, key: &str) -> El {
-    if Format::of(path) == Format::Pdf {
-        return crate::pdf::pane(app, cx, p, path, key);
-    }
     let suspended = !app.preview.space_window
         && (app.reader != Reader::None || app.preview.space_open.load(Ordering::Relaxed));
+    if Format::of(path) == Format::Pdf && !suspended {
+        return crate::pdf::pane(app, cx, p, path, key);
+    }
     let mut panel = col()
         .key(key.to_owned())
         .w_full()
         .h_full()
         .min_w(0.0)
-        .fill(p.look.background)
-        .child(crate::shell::pane_title(
-            p,
-            &format!("{key}-title"),
-            "Preview",
-            None,
-            false,
-        ));
+        .fill(p.look.raised);
     if suspended {
         return panel.child(message("Preview is open in another window", p));
     }
@@ -311,41 +334,51 @@ pub fn pane(app: &App, cx: &mut Cx<App>, p: &Paint, path: &Path, key: &str) -> E
         .and_then(|v| v.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|v| format!(" · Modified {}", date(v.as_secs())))
         .unwrap_or_default();
-    panel = panel
-        .child(
-            content
-                .key(format!("{key}-content-{}", path.display()))
-                .grow(1.0)
-                .min_h(0.0)
-                .transition(Transition::opacity())
-                .motion(motion::SNAPPY),
-        )
-        .child(
-            col()
+    let status = if doc.truncated {
+        doc.budget.notice().to_owned()
+    } else {
+        match doc.format {
+            Format::Markdown => "Markdown".into(),
+            Format::Text => format!(
+                "{} lines · {}",
+                doc.blocks.len(),
+                content::extension(path).to_uppercase()
+            ),
+            _ => String::new(),
+        }
+    };
+    panel = panel.child(
+        content
+            .key(format!("{key}-content-{}", path.display()))
+            .grow(1.0)
+            .min_h(0.0)
+            .transition(Transition::opacity())
+            .motion(motion::SNAPPY),
+    );
+    if doc.format != Format::Video {
+        panel = panel.child(
+            row()
                 .w_full()
-                .px(16.0)
-                .py(12.0)
-                .gap(5.0)
-                .border_sides([1.0, 0.0, 0.0, 0.0], p.look.line)
+                .h(30.0)
+                .px(12.0)
+                .items_center()
+                .fill(p.look.raised)
+                .help(format!(
+                    "{} · {}{}",
+                    doc.name(),
+                    doc.bytes
+                        .map(byte_size)
+                        .unwrap_or_else(|| "Size unknown".into()),
+                    modified
+                ))
                 .child(
-                    text(doc.name())
-                        .font(type_::BODY)
-                        .color(p.look.text)
+                    text(status)
+                        .font(p.look.font(10.0, 400.0))
+                        .color(p.look.muted)
                         .truncate(),
-                )
-                .child(
-                    text(format!(
-                        "{}{}",
-                        doc.bytes
-                            .map(byte_size)
-                            .unwrap_or_else(|| "Size unknown".into()),
-                        modified
-                    ))
-                    .font(type_::LABEL)
-                    .color(p.look.muted)
-                    .truncate(),
                 ),
         );
+    }
     panel
 }
 fn picture_view(p: &Paint, doc: &Document) -> El {
@@ -538,69 +571,99 @@ fn navigate(app: &mut App, path: &Path, position: Position, tx: &mut Tx) {
     app.preview.found.clear();
     app.preview.pending_position = Some(position);
     app.preview.visible_block = 0;
+    app.preview.visible_end = 0;
     app.preview.did_display = false;
     app.reader = Reader::Markdown;
     app.reader_escape_at = None;
     tx.focus("markdown-reader", false);
 }
 
-pub fn reader_view(app: &App, _cx: &mut Cx<App>, p: &Paint, _layer: &mut Vec<El>) -> El {
+pub fn reader_view(app: &App, cx: &mut Cx<App>, p: &Paint, _layer: &mut Vec<El>) -> El {
     let path = app.preview.reader.path.as_deref().unwrap_or(Path::new(""));
     let name = path
         .file_name()
         .unwrap_or(path.as_os_str())
         .to_string_lossy()
         .into_owned();
-    let copied = name.clone();
     let word = Format::of(path) == Format::Word;
-    let header = row()
+    let mut header = row()
         .key("markdown-reader-header")
         .w_full()
         .h(48.0)
-        .px(12.0)
-        .gap(8.0)
+        .pl(cx.titlebar_inset().max(88.0))
+        .pr(14.0)
+        .gap(4.0)
         .items_center()
         .fill(p.look.raised)
-        .border_sides([0.0, 0.0, 1.0, 0.0], p.look.line)
-        .child(
-            crate::shell::shell_button(p, "markdown-back", "‹", false)
-                .on_press_tx(|a: &mut App, tx: &mut Tx| back(a, tx)),
-        )
+        .window_drag()
+        .border_sides([0.0, 0.0, 1.0, 0.0], p.look.line);
+    if !app.preview.history.is_empty() {
+        header = header.child(
+            controls::button(p, "markdown-back", "", Some(&controls::BACK), false)
+                .w(32.0)
+                .label("Back · ⌘[")
+                .on_press_tx(|a: &mut App, tx| back(a, tx)),
+        );
+    }
+    let blocks = app
+        .preview
+        .reader
+        .document
+        .as_ref()
+        .map(|d| d.blocks.len())
+        .unwrap_or(0);
+    let progress = if blocks == 0 {
+        0
+    } else {
+        (app.preview.visible_end * 100 / blocks).min(100)
+    };
+    let header = header
         .child(
             text(name)
-                .font(type_::BODY)
+                .shrink()
+                .font(p.look.font(12.0, 500.0))
                 .color(p.look.text)
                 .truncate()
                 .grow(1.0)
                 .min_w(0.0),
         )
         .child(
-            crate::shell::shell_button(p, "markdown-copy-name", "Copy name", false)
-                .on_press_tx(move |_: &mut App, tx: &mut Tx| tx.copy(copied.clone())),
+            text(format!("{progress}%"))
+                .font(p.look.font(11.0, 400.0))
+                .color(p.look.muted)
+                .w(44.0)
+                .align(rune::Align::End),
         )
         .child(
-            crate::shell::shell_button(p, "markdown-zoom-out", "−", false)
+            controls::button(p, "markdown-zoom-out", "−", None, false)
+                .w(30.0)
+                .help("Zoom out · ⌘−")
                 .on_press(|a: &mut App| zoom(a, -1)),
         )
         .child(
-            crate::shell::shell_button(
+            controls::button(
                 p,
                 "markdown-zoom-reset",
                 &format!("{}%", app.preview.scale),
+                None,
                 false,
             )
+            .w(52.0)
+            .help("Actual size · ⌘0")
             .on_press(|a: &mut App| zoom(a, 0)),
         )
         .child(
-            crate::shell::shell_button(p, "markdown-zoom-in", "+", false)
+            controls::button(p, "markdown-zoom-in", "+", None, false)
+                .w(30.0)
+                .help("Zoom in · ⌘+")
                 .on_press(|a: &mut App| zoom(a, 1)),
         )
         .child(
-            crate::shell::shell_button(p, "markdown-find", "Find", false)
-                .on_press_tx(|a: &mut App, tx: &mut Tx| show_find(a, tx)),
+            controls::button(p, "markdown-find", "Find", None, false)
+                .on_press_tx(|a: &mut App, tx| show_find(a, tx)),
         )
         .child(
-            crate::shell::shell_button(
+            controls::button(
                 p,
                 "markdown-edit",
                 if word {
@@ -608,24 +671,38 @@ pub fn reader_view(app: &App, _cx: &mut Cx<App>, p: &Paint, _layer: &mut Vec<El>
                 } else {
                     "Open in editor"
                 },
+                None,
                 false,
             )
-            .on_press_tx(|a: &mut App, tx: &mut Tx| open_external(a, tx)),
+            .w(132.0)
+            .on_press_tx(|a: &mut App, tx| open_external(a, tx)),
         )
         .child(
-            crate::shell::shell_button(p, "markdown-close", "×", false).on_press_tx(
-                |a: &mut App, tx| {
+            text(if app.reader_escape_at.is_some() {
+                "Press Esc again to return"
+            } else {
+                "Esc twice to return"
+            })
+            .font(p.look.font(11.0, 400.0))
+            .color(p.look.muted)
+            .w(168.0)
+            .align(rune::Align::End),
+        )
+        .child(
+            controls::button(p, "markdown-close", "", Some(&controls::CLOSE), false)
+                .w(32.0)
+                .label("Close document")
+                .on_press_tx(|a: &mut App, tx| {
                     a.close_reader();
                     crate::funnel::focus_section(a, tx);
-                },
-            ),
+                }),
         );
     let mut view = col()
         .key("markdown-reader")
         .focusable(true)
         .w_full()
         .h_full()
-        .fill(p.look.background)
+        .fill(p.look.raised)
         .child(header);
     if app.preview.find_open {
         view = view.child(
@@ -705,6 +782,12 @@ fn document_view(app: &App, p: &Paint, document: Arc<Document>, key: &str, reade
         .key(format!("{key}-blocks"))
         .w_full()
         .growth(GrowthSpec::default())
+        .pt(if reader {
+            (17.0 * scale).round() * 2.5
+        } else {
+            16.0
+        })
+        .pb(16.0)
         .virtual_rows(
             count,
             if document.format == Format::Text {
@@ -730,11 +813,12 @@ fn document_view(app: &App, p: &Paint, document: Arc<Document>, key: &str, reade
                         } else {
                             block.source.clone()
                         },
-                        SyntaxTheme::from_kit(&paint.kit).spans(&block.highlights, 0),
+                        syntax_theme(&paint).spans(&block.highlights, 0),
                     )
                     .font(
                         TextStyle::new(if reader { 14.0 * scale } else { 12.0 }, 400.0)
-                            .family(Family::SystemMono),
+                            .family(Family::SystemMono)
+                            .lh(if reader { 20.0 * scale } else { 16.0 }),
                     )
                     .color(look.text)
                     .wrap()
@@ -780,12 +864,50 @@ fn document_view(app: &App, p: &Paint, document: Arc<Document>, key: &str, reade
                         .selection_group(false)
                         .w_full()
                 };
-                let max_width = if reader { 70.0 * 8.1 * scale } else { f32::MAX };
+                let content = if block.code && !reader {
+                    row()
+                        .w_full()
+                        .items_start()
+                        .child(
+                            text((i + 1).to_string())
+                                .w(44.0)
+                                .pr(10.0)
+                                .align(rune::Align::End)
+                                .font(
+                                    TextStyle::new(10.0, 400.0)
+                                        .family(Family::SystemMono)
+                                        .lh(16.0),
+                                )
+                                .color(look.muted),
+                        )
+                        .child(content.grow(1.0).min_w(0.0).px(19.0))
+                } else {
+                    content
+                };
+                let max_width = if reader {
+                    (17.0 * scale).round() * 40.0 - 10.0
+                } else {
+                    f32::MAX
+                };
                 col()
                     .w_full()
                     .items_center()
-                    .py(if block.code { 0.0 } else { 8.0 })
-                    .px(if reader { 28.0 } else { 14.0 })
+                    .pt(if block.code {
+                        0.0
+                    } else if block.heading.is_some() {
+                        if reader { 16.0 * scale } else { 8.0 }
+                    } else if reader {
+                        16.0 * scale
+                    } else {
+                        8.0
+                    })
+                    .px(if reader {
+                        (17.0 * scale).round() * 2.0
+                    } else if block.code {
+                        0.0
+                    } else {
+                        19.0
+                    })
                     .child(content.max_w(max_width).motion(motion::SNAPPY))
                     .key(block_key(&build_prefix, i))
             },
@@ -793,8 +915,10 @@ fn document_view(app: &App, p: &Paint, document: Arc<Document>, key: &str, reade
         .virtual_rows_version(revision);
     if reader {
         rows = rows.on_visible_rows(|a: &mut App, range| {
+            let changed = a.preview.visible_end != range.end;
             a.preview.visible_block = range.start;
-            false
+            a.preview.visible_end = range.end;
+            changed
         });
     }
     let mut body = col()
@@ -840,7 +964,7 @@ fn with_notice(body: El, truncated: bool, budget: Budget, p: &Paint) -> El {
 fn reading_font(theme: Theme, size: f32) -> TextStyle {
     TextStyle::new(size, 400.0)
         .family(match theme {
-            Theme::System7 => Family::Named("New York"),
+            Theme::System7 => Family::Named(".New York"),
             Theme::WindowsRetro => Family::Named("Verdana"),
             Theme::LinuxRetro => Family::Named("Charter"),
             Theme::Terminal => Family::Named("IBM Plex Mono"),
@@ -849,19 +973,30 @@ fn reading_font(theme: Theme, size: f32) -> TextStyle {
         .lh(size * 1.6)
 }
 fn markdown_style(p: &Paint, scale: f32, reader: bool) -> MarkdownStyle {
-    let size = if reader { 16.0 * scale } else { 13.0 };
+    let size = if reader { (17.0 * scale).round() } else { 13.0 };
     let mut style = MarkdownStyle::from_kit(&p.kit)
         .text(p.look.text)
         .muted(p.look.muted)
-        .link(p.look.accent)
-        .body_font(reading_font(p.look.theme, size))
+        .link(crate::theme::rgb(if p.look.dark {
+            0x419cff
+        } else {
+            0x0068da
+        }))
+        .syntax_theme(syntax_theme(p))
+        .body_font(reading_font(p.look.theme, size).lh(if reader {
+            size * 1.62
+        } else {
+            size * 1.4
+        }))
         .code_block_font(
             TextStyle::new(size * 0.88, 400.0)
                 .family(Family::SystemMono)
                 .lh(size * 1.45),
         )
-        .code_block(p.look.raised, p.look.line)
-        .text_width(if reader { size * 35.4 } else { 400.0 });
+        .code_block(p.look.line.alpha(0.32), rune::Color::TRANSPARENT)
+        .code_block_padding((size * 0.9).round(), (size * 0.9).round())
+        .inline_code_bg(p.look.line.alpha(0.45))
+        .text_width(if reader { size * 40.0 } else { 400.0 });
     for level in 1..=6 {
         style = style.heading_font(
             level,
@@ -869,17 +1004,47 @@ fn markdown_style(p: &Paint, scale: f32, reader: bool) -> MarkdownStyle {
                 weight: 650.0,
                 ..reading_font(
                     p.look.theme,
-                    size * match level {
+                    (size
+                        * match level {
+                            1 => 1.9,
+                            2 => 1.5,
+                            3 => 1.25,
+                            _ => 1.1,
+                        })
+                    .round(),
+                )
+                .lh((size
+                    * match level {
                         1 => 1.9,
                         2 => 1.5,
                         3 => 1.25,
-                        _ => 1.05,
-                    },
-                )
+                        _ => 1.1,
+                    })
+                .round()
+                    * 1.2)
             },
         );
     }
     style
+}
+
+fn syntax_theme(p: &Paint) -> SyntaxTheme {
+    use rune_kit::syntax::Syntax;
+    let color = |light, dark| crate::theme::rgb(if p.look.dark { dark } else { light });
+    SyntaxTheme::from_kit(&p.kit)
+        .with(Syntax::Comment, color(0x78836b, 0x9ba891))
+        .with(Syntax::String, color(0x9b3434, 0xeda4a4))
+        .with(Syntax::Regex, color(0x9b3434, 0xeda4a4))
+        .with(Syntax::Keyword, color(0x9a328d, 0xe8a4dc))
+        .with(Syntax::Number, color(0x7653b5, 0xbfa5f0))
+        .with(Syntax::Type, color(0x236e80, 0x85c9d7))
+        .with(Syntax::Function, color(0x2462a6, 0x8abaf0))
+        .with(Syntax::Property, color(0x8b6518, 0xdec185))
+        .with(Syntax::Attribute, color(0x8b6518, 0xdec185))
+        .with(Syntax::Punctuation, p.look.muted)
+        .with(Syntax::Operator, p.look.muted)
+        .with(Syntax::Variable, p.look.text)
+        .with(Syntax::Parameter, p.look.text)
 }
 fn block_key(prefix: &str, index: usize) -> String {
     format!("{prefix}-block-{index}")
@@ -1069,20 +1234,31 @@ pub fn with_space_window(mut host: rune::App<App>) -> rune::App<App> {
     let main_handle = host.handle();
     let open = Arc::new(AtomicBool::new(false));
     let spec = AppSpec::<App> {
+        fonts: fonts(),
+        families: ("System Font", "ui-monospace"),
         setup: Some(space_setup),
         poll: Some(space_poll),
         on_key: Some(space_key),
-        ..AppSpec::new("Preview", (780.0, 660.0), App::preview_window, space_view)
+        ..AppSpec::new("Preview", (640.0, 720.0), App::preview_window, space_view)
     };
-    let space_host = rune::App::new(spec).on_close(space_closed).menu_item(
-        rune::MenuItem::new("Quit Crawler", space_quit)
-            .id("crawler-quit")
-            .key_equivalent("cmd+q".parse().expect("valid quit shortcut")),
-    );
+    // A hidden window still owns a renderer. Create Space only when it is opened.
+    let space_host = rune::App::new(spec)
+        .chrome(rune::Chrome {
+            full_size_content: false,
+            ..rune::Chrome::DEFAULT
+        })
+        .windowless()
+        .release_gpu_when_closed()
+        .on_close(space_closed)
+        .menu_item(
+            rune::MenuItem::new("Quit Crawler", space_quit)
+                .id("crawler-quit")
+                .key_equivalent("cmd+q".parse().expect("valid quit shortcut")),
+        );
     let (space_app, space_window) = host.window(
         WindowSpec::from_app("space-preview", space_host).options(WindowOptions {
             visible: false,
-            min_size: Some((420.0, 320.0)),
+            min_size: Some((420.0, 360.0)),
             ..Default::default()
         }),
     );
@@ -1111,6 +1287,9 @@ pub fn toggle_space(app: &mut App, path: &Path, _tx: &mut Tx) {
         return;
     }
     app.preview.pane.borrow().pause();
+    if Format::of(path) == Format::Pdf {
+        crate::pdf::suspend_preview(app);
+    }
     let target = path.to_owned();
     let theme = app.theme_preview.unwrap_or(app.theme);
     let opener = app.preview.editor_opener;
@@ -1121,7 +1300,14 @@ pub fn toggle_space(app: &mut App, path: &Path, _tx: &mut Tx) {
             .filter(|d| d.path == path)
             .map(|d| (d.clone(), pane.player.clone(), pane.muted))
     };
-    handle.update(move |a, _| {
+    handle.update(move |a, tx| {
+        tx.set_title(
+            target
+                .file_name()
+                .unwrap_or(target.as_os_str())
+                .to_string_lossy()
+                .into_owned(),
+        );
         a.preview.space_path = Some(target.clone());
         a.theme = theme;
         a.preview.editor_opener = opener;
@@ -1221,6 +1407,10 @@ fn date(seconds: u64) -> String {
 fn space_closed(app: &mut App, _tx: &mut Tx) {
     app.preview.space_open.store(false, Ordering::Relaxed);
     app.preview.pane.borrow_mut().cancel();
+    app.preview.pane.borrow_mut().document = None;
+    app.preview.pane.borrow_mut().path = None;
+    app.preview.space_path = None;
+    crate::pdf::release_previews(app);
     if let Some(parent) = &app.preview.space_parent {
         parent.update(|a, _| {
             let pane = a.preview.pane.borrow();

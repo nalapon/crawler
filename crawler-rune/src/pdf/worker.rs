@@ -7,7 +7,7 @@ use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicU64, Ordering},
     mpsc,
 };
@@ -19,14 +19,14 @@ use objc2::{
 };
 use objc2_app_kit::{NSColor, NSColorSpace};
 use objc2_core_foundation::{CFRetained, CFURL, CGAffineTransform, CGPoint, CGRect, CGSize};
-use objc2_core_graphics::{
-    CGBitmapContextCreate, CGColorSpace, CGContext, CGPDFBox, CGPDFDocument, CGPDFPage,
-};
+use objc2_core_graphics::{CGContext, CGPDFBox, CGPDFDocument, CGPDFPage};
 use objc2_foundation::{NSArray, NSCopying, NSPoint, NSString, NSURL, NSValue};
 use objc2_pdf_kit::{
     PDFActionGoTo, PDFActionURL, PDFAnnotation, PDFAnnotationKeyName, PDFDocument,
 };
-use rune::{Live, Pixels, Waker};
+use rune::{Live, NativeSurface, Waker};
+
+use super::bitmap::Bitmap;
 
 use super::model::*;
 
@@ -56,7 +56,7 @@ pub enum Edit {
 }
 
 pub enum Command {
-    Load(PathBuf, Instant),
+    Load(PathBuf, Instant, NativeSurface),
     Retain {
         path: PathBuf,
         pages: std::ops::Range<usize>,
@@ -64,7 +64,7 @@ pub enum Command {
     Render {
         path: PathBuf,
         key: RasterKey,
-        pixels: Pixels,
+        pixels: NativeSurface,
         epoch: Arc<AtomicU64>,
         generation: u64,
         sharp: bool,
@@ -119,66 +119,124 @@ pub enum Event {
     },
 }
 
+#[derive(Clone)]
+pub struct WorkerSender {
+    commands: mpsc::Sender<Work>,
+    events: mpsc::Sender<Event>,
+    waker: Waker,
+}
+
+impl WorkerSender {
+    pub fn send(&self, command: Command) -> Result<(), mpsc::SendError<Command>> {
+        self.commands
+            .send(Work {
+                command,
+                events: self.events.clone(),
+                waker: self.waker.clone(),
+            })
+            .map_err(|error| mpsc::SendError(error.0.command))
+    }
+}
+
+struct Work {
+    command: Command,
+    events: mpsc::Sender<Event>,
+    waker: Waker,
+}
+
 pub struct Worker {
-    pub send: mpsc::Sender<Command>,
+    pub send: WorkerSender,
     pub receive: mpsc::Receiver<Event>,
 }
 
 impl Worker {
     pub fn start(waker: Waker) -> Result<Self, String> {
-        let (send, commands) = mpsc::channel();
-        let (events, receive) = mpsc::channel();
-        std::thread::Builder::new()
-            .name("crawler-pdf".into())
-            .spawn(move || {
-                let mut documents = HashMap::<PathBuf, Document>::new();
-                while let Ok(command) = commands.recv() {
-                    autoreleasepool(|_| {
-                        let result = handle(command, &mut documents);
-                        for event in result {
-                            if events.send(event).is_err() {
-                                return;
-                            }
-                            waker();
+        // Both windows use one document owner and one 128 MiB bitmap budget.
+        static COMMANDS: OnceLock<Result<mpsc::Sender<Work>, String>> = OnceLock::new();
+        let commands = COMMANDS
+            .get_or_init(|| {
+                let (send, commands) = mpsc::channel::<Work>();
+                std::thread::Builder::new()
+                    .name("crawler-pdf".into())
+                    .spawn(move || {
+                        let mut documents = HashMap::<PathBuf, Document>::new();
+                        let mut owners = HashMap::<PathBuf, usize>::new();
+                        while let Ok(work) = commands.recv() {
+                            autoreleasepool(|_| {
+                                match &work.command {
+                                    Command::Load(path, _, _) => {
+                                        *owners.entry(path.clone()).or_default() += 1
+                                    }
+                                    Command::Release(path) => {
+                                        if let Some(count) = owners.get_mut(path) {
+                                            *count = count.saturating_sub(1);
+                                            if *count > 0 {
+                                                return;
+                                            }
+                                        }
+                                        owners.remove(path);
+                                    }
+                                    _ => {}
+                                }
+                                let result = handle(work.command, &mut documents);
+                                while documents
+                                    .values()
+                                    .map(|d| d.metrics.cache_bytes)
+                                    .sum::<usize>()
+                                    > CACHE_LIMIT
+                                {
+                                    let Some(doc) = documents
+                                        .values_mut()
+                                        .filter(|d| !d.lru.is_empty())
+                                        .min_by_key(|d| d.started)
+                                    else {
+                                        break;
+                                    };
+                                    if let Some(oldest) = doc.lru.pop_front() {
+                                        if let Some(image) = doc.cache.remove(&oldest) {
+                                            doc.metrics.cache_bytes -= image.bytes;
+                                        }
+                                    }
+                                }
+                                for mut event in result {
+                                    match &mut event {
+                                        Event::Loaded { path, metrics, .. }
+                                        | Event::Page { path, metrics, .. } => {
+                                            if let Some(doc) = documents.get(path) {
+                                                metrics.cache_bytes = doc.metrics.cache_bytes;
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                    if work.events.send(event).is_err() {
+                                        break;
+                                    }
+                                    (work.waker)();
+                                }
+                            });
                         }
-                    });
-                }
+                    })
+                    .map_err(|e| e.to_string())?;
+                Ok(send)
             })
-            .map_err(|e| e.to_string())?;
-        Ok(Self { send, receive })
+            .as_ref()
+            .map_err(Clone::clone)?
+            .clone();
+        let (events, receive) = mpsc::channel();
+        Ok(Self {
+            send: WorkerSender {
+                commands,
+                events,
+                waker,
+            },
+            receive,
+        })
     }
 }
 
 fn handle(command: Command, documents: &mut HashMap<PathBuf, Document>) -> Vec<Event> {
-    if let Command::Render { key, path, .. } = &command {
-        let incoming = key.width as usize * key.height as usize * 4;
-        let hit = documents
-            .get(path)
-            .is_some_and(|d| d.cache.contains_key(key));
-        while !hit
-            && documents
-                .values()
-                .map(|d| d.metrics.cache_bytes)
-                .sum::<usize>()
-                + incoming
-                > CACHE_LIMIT
-        {
-            let Some(doc) = documents
-                .values_mut()
-                .filter(|d| !d.lru.is_empty())
-                .min_by_key(|d| d.started)
-            else {
-                break;
-            };
-            if let Some(oldest) = doc.lru.pop_front() {
-                if let Some(image) = doc.cache.remove(&oldest) {
-                    doc.metrics.cache_bytes -= image.len();
-                }
-            }
-        }
-    }
     let (path, operation) = match &command {
-        Command::Load(path, _) | Command::Release(path) => (path.clone(), false),
+        Command::Load(path, _, _) | Command::Release(path) => (path.clone(), false),
         Command::Render { path, .. } => (path.clone(), false),
         Command::Copy { path, .. } | Command::Retain { path, .. } => (path.clone(), false),
         Command::Edit { path, .. } | Command::Save { path, .. } => (path.clone(), true),
@@ -191,7 +249,7 @@ fn handle(command: Command, documents: &mut HashMap<PathBuf, Document>) -> Vec<E
         }
         if !documents.contains_key(&path) {
             let mut doc = Document::open(&path)?;
-            if let Command::Load(_, requested) = &command {
+            if let Command::Load(_, requested, _) = &command {
                 doc.started = *requested;
             }
             documents.insert(path.clone(), doc);
@@ -200,11 +258,25 @@ fn handle(command: Command, documents: &mut HashMap<PathBuf, Document>) -> Vec<E
             .get_mut(&path)
             .ok_or("PDF worker lost its document")?;
         match command {
-            Command::Load(_, _) => Ok(vec![Event::Loaded {
-                path,
-                summary: doc.summary(),
-                metrics: doc.metrics.clone(),
-            }]),
+            Command::Load(_, _, poster) => {
+                let size = doc.geometry(0)?.size;
+                let key = RasterKey {
+                    page: 0,
+                    full_width: 480,
+                    x: 0,
+                    y: 0,
+                    width: 480,
+                    height: (480.0 * size[1] / size[0]).ceil().min(8192.0) as u32,
+                };
+                let bitmap = doc.render(key)?;
+                poster.push(bitmap.pixels, 0)?;
+                doc.rendered(false);
+                Ok(vec![Event::Loaded {
+                    path,
+                    summary: doc.summary(),
+                    metrics: doc.metrics.clone(),
+                }])
+            }
             Command::Render {
                 key,
                 pixels,
@@ -217,31 +289,20 @@ fn handle(command: Command, documents: &mut HashMap<PathBuf, Document>) -> Vec<E
                 if epoch.load(Ordering::Relaxed) != generation {
                     return Ok(Vec::new());
                 }
+                let cached = doc.cache.contains_key(&key);
                 let bitmap = doc.render(key)?;
                 if epoch.load(Ordering::Relaxed) != generation {
+                    if !cached {
+                        doc.evict(key);
+                    }
                     return Ok(Vec::new());
                 }
                 // The scene buffer is stable, so bitmap replacement requires no view commit.
-                let rgba = bitmap.1;
-                pixels.set(key.width, key.height, rgba);
+                pixels.push(bitmap.pixels, generation)?;
                 if let Some((live, rect)) = crop {
                     live.set(rect);
                 }
-                let elapsed = doc.started.elapsed().as_secs_f64() * 1000.0;
-                if doc.metrics.first_bitmap_ms.is_none() {
-                    doc.metrics.first_bitmap_ms = Some(elapsed);
-                    eprintln!(
-                        "PDF Performance first_bitmap_ms={elapsed:.3} parse_ms={:.3}",
-                        doc.metrics.parse_ms
-                    );
-                }
-                if sharp && doc.metrics.first_sharp_ms.is_none() {
-                    doc.metrics.first_sharp_ms = Some(elapsed);
-                    eprintln!(
-                        "PDF Performance first_sharp_ms={elapsed:.3} max_raster_ms={:.3}",
-                        doc.metrics.max_raster_ms
-                    );
-                }
+                doc.rendered(sharp);
                 let content = if sharp {
                     doc.content(key.page)?
                 } else {
@@ -371,7 +432,7 @@ struct Document {
     saved_cursor: Option<usize>,
     editable: bool,
     copying: bool,
-    cache: HashMap<RasterKey, Arc<Vec<u8>>>,
+    cache: HashMap<RasterKey, Bitmap>,
     lru: VecDeque<RasterKey>,
     metrics: Metrics,
 }
@@ -412,6 +473,24 @@ impl Document {
         doc.geometry(0)?;
         doc.metrics.parse_ms = started.elapsed().as_secs_f64() * 1000.0;
         Ok(doc)
+    }
+
+    fn rendered(&mut self, sharp: bool) {
+        let elapsed = self.started.elapsed().as_secs_f64() * 1000.0;
+        if self.metrics.first_bitmap_ms.is_none() {
+            self.metrics.first_bitmap_ms = Some(elapsed);
+            eprintln!(
+                "PDF Performance first_bitmap_ms={elapsed:.3} parse_ms={:.3}",
+                self.metrics.parse_ms
+            );
+        }
+        if sharp && self.metrics.first_sharp_ms.is_none() {
+            self.metrics.first_sharp_ms = Some(elapsed);
+            eprintln!(
+                "PDF Performance first_sharp_ms={elapsed:.3} max_raster_ms={:.3}",
+                self.metrics.max_raster_ms
+            );
+        }
     }
 
     fn text(&mut self) -> Result<Retained<PDFDocument>, String> {
@@ -476,12 +555,19 @@ impl Document {
             .ok_or_else(|| "Invalid PDF geometry".into())
     }
 
-    fn render(&mut self, key: RasterKey) -> Result<(bool, Vec<u8>), String> {
+    fn evict(&mut self, key: RasterKey) {
+        if let Some(bitmap) = self.cache.remove(&key) {
+            self.metrics.cache_bytes -= bitmap.bytes;
+        }
+        self.lru.retain(|entry| *entry != key);
+    }
+
+    fn render(&mut self, key: RasterKey) -> Result<Bitmap, String> {
         if let Some(image) = self.cache.get(&key) {
             self.metrics.cache_hits += 1;
             self.lru.retain(|k| *k != key);
             self.lru.push_back(key);
-            return Ok((true, image.as_ref().clone()));
+            return Ok(image.clone());
         }
         let started = Instant::now();
         let width = key.width as usize;
@@ -494,53 +580,51 @@ impl Document {
         let transform = geometry.transform;
         let scale = key.full_width as f64 / geometry.size[0];
         let full_height = geometry.size[1] * scale;
-        let mut rgba = vec![255u8; width * height * 4];
-        let space =
-            CGColorSpace::with_name(Some(unsafe { objc2_core_graphics::kCGColorSpaceSRGB }))
-                .ok_or("Unable to create PDF color space")?;
-        // SAFETY: The vector is width*height*4 bytes and stays allocated until the context drops.
-        // Big-endian 32-bit components and premultiplied-last yield RGBA. The opaque white
-        // backdrop means premultiplied and straight alpha are identical in the final image.
-        let context = unsafe {
-            CGBitmapContextCreate(
-                rgba.as_mut_ptr().cast(),
-                width,
-                height,
-                8,
-                width * 4,
-                Some(&space),
-                0x4001,
-            )
-        }
-        .ok_or("Unable to allocate PDF bitmap")?;
-        CGContext::translate_ctm(
-            Some(&context),
-            -(key.x as f64),
-            -(full_height - (key.y + key.height) as f64),
-        );
-        CGContext::scale_ctm(Some(&context), scale, scale);
-        CGContext::concat_ctm(Some(&context), transform);
         let page =
             CGPDFDocument::page(Some(&self.raster), key.page + 1).ok_or("Invalid PDF page")?;
-        CGContext::draw_pdf_page(Some(&context), Some(&page));
-        drop(context);
+        let bitmap = Bitmap::draw(width, height, |context| {
+            CGContext::translate_ctm(
+                Some(context),
+                -(key.x as f64),
+                -(full_height - (key.y + key.height) as f64),
+            );
+            CGContext::scale_ctm(Some(context), scale, scale);
+            CGContext::concat_ctm(Some(context), transform);
+            CGContext::draw_pdf_page(Some(context), Some(&page));
+        })?;
         let cost = started.elapsed().as_secs_f64() * 1000.0;
         self.metrics.max_raster_ms = self.metrics.max_raster_ms.max(cost);
         self.metrics.raster_ms += cost;
         self.metrics.renders += 1;
-        let bytes = rgba.len();
+        let bytes = bitmap.bytes;
         while self.metrics.cache_bytes + bytes > CACHE_LIMIT {
             let Some(oldest) = self.lru.pop_front() else {
                 break;
             };
             if let Some(image) = self.cache.remove(&oldest) {
-                self.metrics.cache_bytes -= image.len();
+                self.metrics.cache_bytes -= image.bytes;
             }
         }
-        self.cache.insert(key, Arc::new(rgba.clone()));
+        // A resized or zoomed page no longer uses sharp crops at its previous resolution.
+        if key.full_width != 480 {
+            let obsolete: Vec<_> = self
+                .cache
+                .keys()
+                .filter(|old| {
+                    old.page == key.page
+                        && old.full_width != 480
+                        && old.full_width != key.full_width
+                })
+                .copied()
+                .collect();
+            for old in obsolete {
+                self.evict(old);
+            }
+        }
+        self.cache.insert(key, bitmap.clone());
         self.lru.push_back(key);
         self.metrics.cache_bytes += bytes;
-        Ok((false, rgba))
+        Ok(bitmap)
     }
 
     fn content(&mut self, index: usize) -> Result<Page, String> {

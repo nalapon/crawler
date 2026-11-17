@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use rune::{Live, Pixels};
+use rune::{Live, NativeSurface};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize)]
 pub struct Rect {
@@ -37,8 +37,6 @@ pub enum Tool {
 }
 
 impl Tool {
-    pub const ALL: [Self; 4] = [Self::Select, Self::Highlight, Self::Underline, Self::Note];
-
     pub fn label(self) -> &'static str {
         match self {
             Self::Select => "Select",
@@ -144,8 +142,9 @@ pub struct RasterKey {
 /// The worker and the scene share these buffers. Replacing a bitmap never commits a view.
 #[derive(Clone)]
 pub struct Surface {
-    pub pixels: Pixels,
-    pub sharp: Pixels,
+    pub pixels: NativeSurface,
+    pub poster_requested: bool,
+    pub sharp: NativeSurface,
     pub crop: Live<[f32; 4]>,
     pub requested: Option<RasterKey>,
     pub epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -154,8 +153,9 @@ pub struct Surface {
 impl Default for Surface {
     fn default() -> Self {
         Self {
-            pixels: Pixels::new(),
-            sharp: Pixels::new(),
+            pixels: NativeSurface::new(),
+            poster_requested: false,
+            sharp: NativeSurface::new(),
             crop: Live::new([0.0; 4]),
             requested: None,
             epoch: Default::default(),
@@ -174,6 +174,7 @@ pub struct Source {
     pub error: Option<String>,
     pub pending: usize,
     pub visible: std::ops::Range<usize>,
+    pub current_page: usize,
     pub started: std::time::Instant,
     pub revision: u64,
 }
@@ -191,6 +192,7 @@ impl Default for Source {
             error: None,
             pending: 0,
             visible: 0..1,
+            current_page: 0,
             started: std::time::Instant::now(),
             revision: 0,
         }
