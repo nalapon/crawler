@@ -7,7 +7,7 @@ use std::{
     hash::{BuildHasher, Hasher},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
@@ -20,6 +20,7 @@ pub struct Scan {
     pub changed: bool,
     pub warning: Option<String>,
     pub excluded: HashSet<String>,
+    pub retry: HashSet<String>,
 }
 pub enum Progress {
     Batch(Arc<Snapshot>),
@@ -43,18 +44,20 @@ impl Paths {
     pub fn new(batches: &[Arc<Snapshot>]) -> Self {
         Self::selected(batches, None)
     }
-    fn selected(batches: &[Arc<Snapshot>], prefixes: Option<&HashSet<String>>) -> Self {
+    fn selected(batches: &[Arc<Snapshot>], affected: Option<&[Vec<u16>]>) -> Self {
         let mut this = Self {
             batches: batches.to_vec(),
             hash: Default::default(),
             locations: HashMap::new(),
             collisions: HashMap::new(),
         };
-        for (batch, value) in batches.iter().enumerate() {
-            for row in 0..value.len() {
-                let path = value.path(row);
-                if prefixes.is_none_or(|prefixes| ancestors_contain(path, prefixes)) {
-                    this.insert(path, (batch as u32, row as u16));
+        for (b, batch) in batches.iter().enumerate() {
+            let mut add = |r: u16| this.insert(batch.path(r as usize), (b as u32, r));
+            if let Some(affected) = affected {
+                affected[b].iter().copied().for_each(add);
+            } else {
+                for r in 0..batch.len() as u16 {
+                    add(r);
                 }
             }
         }
@@ -157,7 +160,7 @@ fn read(
     cancel: &AtomicBool,
     directory_cancel: &AtomicBool,
     emit: impl Fn(Vec<(String, bool)>) -> bool,
-) -> Result<Directory, String> {
+) -> std::io::Result<Directory> {
     let mut out = Directory {
         rows: Vec::new(),
         children: Vec::new(),
@@ -170,7 +173,7 @@ fn read(
         out.excluded.push(relative.into());
         return Ok(out);
     }
-    let entries = fs::read_dir(root.join(relative)).map_err(|e| e.to_string())?;
+    let entries = fs::read_dir(root.join(relative))?;
     for entry in entries {
         if cancel.load(Ordering::Relaxed) || directory_cancel.load(Ordering::Relaxed) {
             break;
@@ -179,7 +182,7 @@ fn read(
             Ok(e) => e,
             Err(e) => {
                 if relative.is_empty() {
-                    return Err(e.to_string());
+                    return Err(e);
                 }
                 out.keep_contents |= e.kind() == std::io::ErrorKind::TimedOut;
                 out.warning = Some(e.to_string());
@@ -215,7 +218,10 @@ fn read(
                 }
             }
             Ok(None) => out.excluded.push(path),
-            Err(e) => out.warning = Some(e.to_string()),
+            Err(e) => {
+                out.keep_contents |= e.kind() == std::io::ErrorKind::TimedOut;
+                out.warning = Some(e.to_string());
+            }
         }
     }
     Ok(out)
@@ -259,96 +265,295 @@ fn closed_ancestor(
     }
     false
 }
+const READERS: usize = 8;
+const READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Filesystem calls can stay blocked after their caller times out. Reserve a
+/// worker until the call returns, across consecutive scans and scope checks.
+#[derive(Default)]
+pub struct ReadPool {
+    pool: OnceLock<Result<rayon::ThreadPool, String>>,
+    in_flight: Arc<AtomicUsize>,
+}
+struct ReadPermit(Arc<AtomicUsize>);
+impl Drop for ReadPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+impl ReadPool {
+    pub fn is_idle(&self) -> bool {
+        self.in_flight.load(Ordering::Relaxed) == 0
+    }
+
+    pub fn submit(&self, read: impl FnOnce() + Send + 'static) -> Result<bool, String> {
+        let pool = self
+            .pool
+            .get_or_init(|| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(READERS)
+                    .thread_name(|i| format!("crawler-read-{i}"))
+                    .build()
+                    .map_err(|e| e.to_string())
+            })
+            .as_ref()
+            .map_err(Clone::clone)?;
+        if self
+            .in_flight
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                (count < READERS).then_some(count + 1)
+            })
+            .is_err()
+        {
+            return Ok(false);
+        }
+        let permit = ReadPermit(Arc::clone(&self.in_flight));
+        pool.spawn(move || {
+            let _permit = permit;
+            read();
+        });
+        Ok(true)
+    }
+}
+
+enum ChangeKind {
+    Ignored,
+    Present { directory: bool, descend: bool },
+    Hidden,
+    Gone,
+    Retry,
+}
+enum ChangeCheck {
+    Path(ChangeKind),
+    Done(HashSet<String>),
+}
+
+fn check_changes(
+    root: &Path,
+    changes: HashSet<String>,
+    cancel: &Arc<AtomicBool>,
+    pool: &ReadPool,
+    mut checked: impl FnMut(&str, ChangeKind),
+) -> Result<HashSet<String>, String> {
+    let paths = Arc::new(
+        changes
+            .iter()
+            .filter(|path| !parent_contains(path, &changes))
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    if paths.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let (tx, rx) = mpsc::sync_channel(16);
+    let wait = Instant::now();
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+        let root = root.to_owned();
+        let job_paths = Arc::clone(&paths);
+        let cancel = Arc::clone(cancel);
+        let tx = tx.clone();
+        if pool.submit(move || {
+            let mut memo = HashMap::new();
+            let mut excluded = HashSet::new();
+            for path in job_paths.iter() {
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                let kind = if closed_ancestor(&root, path, &mut memo, &mut excluded) {
+                    ChangeKind::Ignored
+                } else {
+                    match kind(&root.join(path)) {
+                        Ok(Some((directory, descend))) => {
+                            ChangeKind::Present { directory, descend }
+                        }
+                        Ok(None) => ChangeKind::Hidden,
+                        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                            ChangeKind::Retry
+                        }
+                        Err(_) => ChangeKind::Gone,
+                    }
+                };
+                if tx.send(ChangeCheck::Path(kind)).is_err() {
+                    return;
+                }
+            }
+            let _ = tx.send(ChangeCheck::Done(excluded));
+        })? {
+            break;
+        }
+        if wait.elapsed() >= READ_TIMEOUT {
+            for path in paths.iter() {
+                checked(path, ChangeKind::Retry);
+            }
+            return Ok(HashSet::new());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(tx);
+    let mut at = 0;
+    let mut last = Instant::now();
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+        match rx.recv_timeout(Duration::from_millis(20)) {
+            Ok(ChangeCheck::Path(kind)) => {
+                checked(&paths[at], kind);
+                at += 1;
+                last = Instant::now();
+            }
+            Ok(ChangeCheck::Done(excluded)) => return Ok(excluded),
+            Err(mpsc::RecvTimeoutError::Timeout) if last.elapsed() < READ_TIMEOUT => continue,
+            Err(_) => {
+                for path in &paths[at..] {
+                    checked(path, ChangeKind::Retry);
+                }
+                return Ok(HashSet::new());
+            }
+        }
+    }
+}
+
 pub fn run(
     root: PathBuf,
+    prefix: String,
     previous: Vec<Arc<Snapshot>>,
     changes: Option<HashSet<String>>,
     cancel: Arc<AtomicBool>,
+    pool: Arc<ReadPool>,
     progress: impl Fn(Progress) + Send + Sync,
 ) {
-    let result = scan(&root, &previous, changes, &cancel, &progress);
+    let result = scan(
+        &root, &prefix, &previous, changes, &cancel, &pool, &progress,
+    );
     if !cancel.load(Ordering::Relaxed) {
         progress(Progress::Finished(result));
     }
 }
 fn scan(
     root: &Path,
+    prefix: &str,
     previous: &[Arc<Snapshot>],
     changes: Option<HashSet<String>>,
     cancel: &Arc<AtomicBool>,
+    pool: &ReadPool,
     progress: &(impl Fn(Progress) + Send + Sync),
 ) -> Result<Scan, String> {
-    let mut seen: Vec<Vec<bool>> = previous.iter().map(|b| vec![false; b.len()]).collect();
+    // Reads and watcher paths are relative to this volume; snapshots always use Mac paths.
+    let indexed_path = |path: &str| {
+        if prefix.is_empty() {
+            path.to_owned()
+        } else if path.is_empty() {
+            prefix.to_owned()
+        } else {
+            format!("{prefix}/{path}")
+        }
+    };
+    let mut retry = HashSet::new();
     let mut excluded = HashSet::new();
     let mut pending = VecDeque::new();
     let mut deferred = VecDeque::new();
     let mut prefixes = HashSet::new();
-    let mut memo = HashMap::new();
     let mut seeds = Vec::new();
-    if let Some(changes) = &changes {
-        for path in changes {
-            if cancel.load(Ordering::Relaxed) {
-                return Err("cancelled".into());
-            }
-            if parent_contains(path, changes)
-                || closed_ancestor(root, path, &mut memo, &mut excluded)
-            {
-                continue;
-            }
-            prefixes.insert(path.clone());
-            match kind(&root.join(path)) {
-                Ok(Some((directory, descend))) => {
-                    seeds.push((path.clone(), directory));
+    let incremental = changes.is_some();
+    if let Some(changes) = changes {
+        let ancestor_exclusions = check_changes(root, changes, cancel, pool, |path, kind| {
+            match kind {
+                ChangeKind::Ignored => return,
+                ChangeKind::Retry => {
+                    retry.insert(path.to_owned());
+                    return;
+                }
+                ChangeKind::Present { directory, descend } => {
+                    seeds.push((path.to_owned(), directory));
                     if descend {
-                        pending.push_back(path.clone());
+                        pending.push_back(path.to_owned());
                     }
                 }
-                Ok(None) => {
-                    excluded.insert(path.clone());
+                ChangeKind::Hidden => {
+                    excluded.insert(path.to_owned());
                 }
-                Err(_) => {}
+                ChangeKind::Gone => {}
             }
-        }
+            prefixes.insert(indexed_path(path));
+        })?;
+        excluded.extend(ancestor_exclusions);
         if prefixes.is_empty() {
             return Ok(Scan {
                 batches: previous.to_vec(),
                 changed: false,
-                warning: None,
+                warning: (!retry.is_empty())
+                    .then(|| "Some changed paths are still waiting for macOS".into()),
                 excluded,
+                retry,
             });
         }
     } else {
         pending.push_back(String::new());
     }
-    let old = Paths::selected(previous, changes.as_ref().map(|_| &prefixes));
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(8)
-        .thread_name(|i| format!("crawler-read-{i}"))
-        .build()
-        .map_err(|e| e.to_string())?;
+    let affected = if incremental {
+        let mut blocks = Vec::with_capacity(previous.len());
+        for batch in previous {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("cancelled".into());
+            }
+            blocks.push(batch.affected_rows(&prefixes));
+        }
+        Some(blocks)
+    } else {
+        None
+    };
+    let old = Paths::selected(previous, affected.as_deref());
+    let mut seen: Vec<_> = previous
+        .iter()
+        .enumerate()
+        .map(|(b, block)| match &affected {
+            None => vec![false; block.len()],
+            Some(rows) if rows[b].is_empty() => Vec::new(),
+            Some(rows) => {
+                let mut seen = vec![true; block.len()];
+                for &r in &rows[b] {
+                    seen[r as usize] = false;
+                }
+                seen
+            }
+        })
+        .collect();
     enum ReadEvent {
         Rows(u64, Vec<(String, bool)>),
-        Done(u64, Result<Directory, String>),
+        Done(u64, std::io::Result<Directory>),
     }
     let (tx, rx) = mpsc::sync_channel(16);
-    let outstanding = Arc::new(AtomicUsize::new(0));
     let mut running = HashMap::new();
+    let mut waiting_for_worker = None;
     let mut serial = 0u64;
-    let mut keep = HashSet::new();
-    let mut warning = None;
+    let mut keep: HashSet<_> = retry.iter().map(|p| indexed_path(p)).collect();
+    let mut warning =
+        (!retry.is_empty()).then(|| "Some changed paths are still waiting for macOS".into());
     let mut added = Vec::new();
     let mut buffer = Vec::new();
-    let mut replacement = false;
+    let mut replacements = Vec::new();
     let mut last_flush = Instant::now();
     let mut rows = seeds;
     loop {
         for (path, directory) in rows.drain(..) {
+            let path = if prefix.is_empty() {
+                path
+            } else {
+                indexed_path(&path)
+            };
             if let Some((b, r)) = old.find(&path) {
                 if previous[b].directory(r) == directory {
                     seen[b][r] = true;
                     continue;
                 }
-                replacement = true;
+                // Replace the old kind atomically at completion. Only genuinely new paths
+                // can be appended to the resident index before reconciliation finishes.
+                replacements.push((path, directory));
+                continue;
             }
             buffer.push((path, directory));
             if buffer.len() == BATCH {
@@ -369,39 +574,45 @@ fn scan(
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".into());
         }
-        while running.len() < 8 {
+        while running.len() < READERS {
             let Some(path) = pending.pop_front().or_else(|| deferred.pop_front()) else {
                 break;
             };
-            // Do not accumulate queued reads behind filesystem calls that never return.
-            if outstanding.load(Ordering::Relaxed) >= 32 {
-                keep.insert(path);
-                warning = Some("Some folders are still waiting for macOS to answer".into());
-                continue;
-            }
-            let outstanding = Arc::clone(&outstanding);
-            outstanding.fetch_add(1, Ordering::Relaxed);
             let root = root.to_owned();
             let tx = tx.clone();
             let token = Arc::clone(cancel);
             let id = serial;
-            serial += 1;
             let directory_cancel = Arc::new(AtomicBool::new(false));
-            running.insert(
-                id,
-                (path.clone(), Instant::now(), Arc::clone(&directory_cancel)),
-            );
-            pool.spawn(move || {
-                if !token.load(Ordering::Relaxed) && !directory_cancel.load(Ordering::Relaxed) {
-                    let result = read(&root, &path, &token, &directory_cancel, |rows| {
+            let read_cancel = Arc::clone(&directory_cancel);
+            let read_path = path.clone();
+            if pool.submit(move || {
+                if !token.load(Ordering::Relaxed) && !read_cancel.load(Ordering::Relaxed) {
+                    let result = read(&root, &read_path, &token, &read_cancel, |rows| {
                         tx.send(ReadEvent::Rows(id, rows)).is_ok()
                     });
                     let _ = tx.send(ReadEvent::Done(id, result));
                 }
-                outstanding.fetch_sub(1, Ordering::Relaxed);
-            });
+            })? {
+                waiting_for_worker = None;
+                serial += 1;
+                running.insert(id, (path, Instant::now(), directory_cancel));
+            } else {
+                let waiting = waiting_for_worker.get_or_insert_with(Instant::now);
+                if !running.is_empty() || waiting.elapsed() < READ_TIMEOUT {
+                    pending.push_front(path);
+                    break;
+                }
+                if path.is_empty() {
+                    return Err(
+                        "The search root is waiting for macOS to answer earlier reads".into(),
+                    );
+                }
+                keep.insert(indexed_path(&path));
+                retry.insert(path);
+                warning = Some("Some folders are still waiting for macOS to answer".into());
+            }
         }
-        if running.is_empty() {
+        if running.is_empty() && pending.is_empty() && deferred.is_empty() {
             break;
         }
         match rx.recv_timeout(Duration::from_millis(20)) {
@@ -416,7 +627,8 @@ fn scan(
                     match result {
                         Ok(result) => {
                             if result.keep_contents {
-                                keep.insert(path);
+                                keep.insert(indexed_path(&path));
+                                retry.insert(path);
                             }
                             rows = result.rows;
                             pending.extend(result.children);
@@ -428,9 +640,12 @@ fn scan(
                         }
                         Err(error) => {
                             if path.is_empty() {
-                                return Err(error);
+                                return Err(error.to_string());
                             }
-                            keep.insert(path);
+                            keep.insert(indexed_path(&path));
+                            if error.kind() == std::io::ErrorKind::TimedOut {
+                                retry.insert(path);
+                            }
                             warning = Some(format!("Some folders are unavailable: {error}"));
                         }
                     }
@@ -440,7 +655,7 @@ fn scan(
         }
         let timed_out: Vec<_> = running
             .iter()
-            .filter(|(_, (_, at, _))| at.elapsed() > Duration::from_secs(2))
+            .filter(|(_, (_, at, _))| at.elapsed() > READ_TIMEOUT)
             .map(|(&id, _)| id)
             .collect();
         for id in timed_out {
@@ -449,7 +664,8 @@ fn scan(
                 if path.is_empty() {
                     return Err("The search root did not answer within two seconds".into());
                 }
-                keep.insert(path);
+                keep.insert(indexed_path(&path));
+                retry.insert(path);
                 warning = Some("Some folders did not answer within two seconds".into());
             }
         }
@@ -460,14 +676,21 @@ fn scan(
         added.push(batch);
     }
     let mut batches = Vec::new();
-    let mut changed = replacement || !added.is_empty();
+    added.extend(
+        replacements
+            .chunks(BATCH)
+            .map(|rows| Arc::new(Snapshot::build(rows))),
+    );
+    let mut changed = !added.is_empty();
     for (b, batch) in previous.iter().enumerate() {
+        if seen[b].is_empty() {
+            batches.push(Arc::clone(batch));
+            continue;
+        }
         let retained: Vec<_> = (0..batch.len())
             .filter(|&r| {
                 let path = batch.path(r);
-                seen[b][r]
-                    || ancestors_contain(path, &keep)
-                    || (changes.is_some() && !ancestors_contain(path, &prefixes))
+                seen[b][r] || ancestors_contain(path, &keep)
             })
             .collect();
         if retained.len() == batch.len() {
@@ -490,6 +713,7 @@ fn scan(
         changed,
         warning,
         excluded,
+        retry,
     })
 }
 pub fn ancestors_contain(path: &str, paths: &HashSet<String>) -> bool {

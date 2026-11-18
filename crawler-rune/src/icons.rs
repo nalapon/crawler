@@ -1,230 +1,164 @@
-//! Shared file-type icons. Rune decodes/rasterizes on its image worker; handles stay cached by type.
-use rune::{El, Image, ImageCache, Waker, el};
-use std::{
-    collections::HashMap,
-    path::Path,
-    sync::{
-        Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
+//! File glyphs are drawn by Rune's icon atlas on the first visible frame.
+use crate::{
+    funnel::model::{DocumentKind, FileType},
+    theme::{Era, Look},
 };
+use rune::{El, Icon, icon};
+use std::path::Path;
 
-type Types = Arc<Mutex<HashMap<String, Option<Image>>>>;
-struct Cache {
-    images: Arc<ImageCache>,
-    types: Types,
-    native: mpsc::Sender<String>,
-    changed: Arc<AtomicBool>,
+macro_rules! outline {
+    ($name:literal, $path:literal) => {
+        &Icon { name: concat!("crawler-file-", $name), view: 24.0,
+            body: concat!(r#"<path fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" d=""#, $path, r#""/>"#) }
+    };
 }
-static CACHE: OnceLock<Cache> = OnceLock::new();
 
-pub fn setup(waker: &Waker) {
-    CACHE.get_or_init(|| {
-        let images = Arc::new(ImageCache::new(waker.clone()));
-        let types: Types = Arc::new(Mutex::new(HashMap::new()));
-        let (native, receive) = mpsc::channel::<String>();
-        let worker_images = images.clone();
-        let worker_types = types.clone();
-        let wake = waker.clone();
-        let changed = Arc::new(AtomicBool::new(false));
-        let worker_changed = changed.clone();
-        std::thread::spawn(move || {
-            for key in receive {
-                let image = native_png(&key).map(|bytes| worker_images.load(bytes));
-                if let Some(image) = &image {
-                    let _ = image.wait();
-                }
-                if let Ok(mut types) = worker_types.lock() {
-                    types.insert(key, image);
-                }
-                worker_changed.store(true, Ordering::Release);
-                wake();
+macro_rules! material {
+    ($name:literal, $view:literal) => {
+        &Icon {
+            name: concat!("crawler-lang-", $name),
+            view: $view,
+            body: include_str!(concat!("../../Resources/FileIcons/", $name, ".svg")),
+        }
+    };
+}
+
+pub fn file(path: &Path, kind: DocumentKind, look: Look, selected: bool, size: f32) -> El {
+    use DocumentKind::*;
+    let glyph = match kind {
+        Folder => match look.era() {
+            Era::Classic => outline!("classic-folder", "M2 20V5h7l2 2h11v13z M2 10h20 M5 17h14"),
+            Era::WindowsBevel | Era::UnixBevel => {
+                outline!("open-folder", "M2 19V4h7l3 3h8v3 M2 19l3-9h18l-3 9z")
             }
-        });
-        Cache {
-            images,
-            types,
-            native,
-            changed,
+            Era::Terminal => outline!(
+                "terminal-folder",
+                "M2 20V5h7l2 2h11v13z M6 11l3 3-3 3 M12 17h5"
+            ),
+            Era::Modern => outline!(
+                "folder",
+                "M2 8V6q0-2 2-2h5l3 3h8q2 0 2 2v9q0 2-2 2H4q-2 0-2-2z M3 10h18"
+            ),
+        },
+        Pdf => outline!(
+            "pdf",
+            "M5 2h9l5 5v15H5z M14 2v6h5 M8 17q4-5 4-8 0 5 4 7-5-2-8 1z"
+        ),
+        Word | Other(FileType::Pages) => {
+            outline!("word", "M4 2h10l6 6v14H4z M14 2v6h6 M7 11l2 7 3-5 2 5 3-7")
         }
-    });
-}
-
-/// Publishes completed native type icons without doing any lookup in the view.
-pub fn poll() -> bool {
-    CACHE
-        .get()
-        .is_some_and(|cache| cache.changed.swap(false, Ordering::AcqRel))
-}
-
-/// Material assets for known types and native type icons for the rest, cached at Retina resolution.
-pub fn file(path: &Path, folder: bool, classic: bool, size: f32) -> El {
-    let Some(cache) = CACHE.get() else {
-        return el().size(size, size);
-    };
-    let mut key = key(path, folder, classic);
-    let Ok(mut types) = cache.types.lock() else {
-        return el().size(size, size);
-    };
-    if types.len() >= 256 && !types.contains_key(&key) {
-        key = "native/".into();
-    }
-    let image = types.entry(key.clone()).or_insert_with(|| {
-        if key == "folder/system7" {
-            Some(cache.images.svg(br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path d="M1.5 20.5V5.5h8l2 2h11v13z" fill="white" stroke="black"/><path d="M3 10h18v9H3z" fill="#ccc"/><path d="M2 9.5h20" stroke="black"/></svg>"##.as_slice(), 24.0, 2.0))
-        } else if let Some(bytes) = key.strip_prefix("material/").and_then(material) {
-            Some(cache.images.svg(bytes, 24.0, 2.0))
-        } else {
-            let _ = cache.native.send(key);
-            None
+        Sheet | Other(FileType::Numbers) => {
+            outline!("sheet", "M3 3h18v18H3z M3 9h18 M3 15h18 M9 9v12 M15 9v12")
         }
-    }).clone();
-    let icon = el().key("file-icon").size(size, size).inert();
-    if let Some(image) = image {
-        icon.pixels_fit(image.pixels(), rune::SurfaceFit::Fit)
+        Image => outline!("image", "M2 4h20v16H2z M3 18l6-7 5 5 3-4 4 5 M17 8h.5"),
+        Video => outline!(
+            "video",
+            "M2 5h20v14H2z M2 8h3 M2 12h3 M2 16h3 M19 8h3 M19 12h3 M19 16h3 M10 8l6 4-6 4z"
+        ),
+        Audio => outline!(
+            "audio",
+            "M9 17V6l11-3v12 M9 9l11-3 M9 17c0 4-7 5-7 2s7-5 7-2z M20 15c0 4-7 5-7 2s7-5 7-2z"
+        ),
+        Package => outline!(
+            "package",
+            "M2 7l10-5 10 5v11l-10 5-10-5z M2 7l10 5 10-5 M12 12v11 M7 4.5l10 5V13"
+        ),
+        Other(FileType::Archive) => outline!(
+            "archive",
+            "M4 2h10l6 6v14H4z M14 2v6h6 M8 3h2 M10 6h2 M8 9h2 M10 12h2 M8 15h4v4H8z"
+        ),
+        Other(FileType::DiskImage) => outline!("disk", "M5 4h14l3 11v5H2v-5z M2 15h20 M16 18h2"),
+        Other(FileType::Font) => outline!(
+            "font",
+            "M2 19L8 4l6 15 M5 13h6 M16 12q5-3 5 2v5 M21 15q-7-1-5 3 1 2 5-1"
+        ),
+        PowerPoint | Other(FileType::Presentation) => outline!(
+            "presentation",
+            "M2 3h20v13H2z M12 16v5 M7 22l5-3 5 3 M6 12l4-4 3 2 4-5"
+        ),
+        Other(FileType::Ebook) => outline!(
+            "book",
+            "M2 4q5-2 10 1 5-3 10-1v15q-6-2-10 1-5-3-10-1z M12 5v15"
+        ),
+        Other(FileType::Binary) => outline!(
+            "binary",
+            "M6 6h12v12H6z M9 2v4 M15 2v4 M9 18v4 M15 18v4 M2 9h4 M2 15h4 M18 9h4 M18 15h4 M10 10h4v4h-4z"
+        ),
+        Markdown | Text | Other(FileType::Unknown) => {
+            language_icon(path).unwrap_or_else(|| match kind {
+                Markdown => material!("markdown", 32.0),
+                Text if rune_kit::syntax::lang_for_path(&path.to_string_lossy()).is_some() => {
+                    outline!("code", "M8 6l-6 6 6 6 M16 6l6 6-6 6 M14 3l-4 18")
+                }
+                Text => outline!("text", "M5 2h9l5 5v15H5z M14 2v6h5 M8 11h8 M8 14h8 M8 17h5"),
+                _ => outline!("document", "M5 2h9l5 5v15H5z M14 2v6h5"),
+            })
+        }
+    };
+    let ink = if selected {
+        look.selection_text
+    } else if look.era() == Era::Classic {
+        look.text
     } else {
-        icon
-    }
-}
-
-// AppKit owns every object on this serial worker. Only encoded bytes cross to Rune.
-fn native_png(key: &str) -> Option<Vec<u8>> {
-    use objc2::{AllocAnyThread, rc::autoreleasepool};
-    use objc2_app_kit::{
-        NSBitmapImageFileType, NSBitmapImageRep, NSCompositingOperation, NSDeviceRGBColorSpace,
-        NSGraphicsContext, NSWorkspace,
+        look.accent
     };
-    use objc2_foundation::{NSDictionary, NSPoint, NSRect, NSSize, NSString};
-    use objc2_uniform_type_identifiers::UTType;
-    autoreleasepool(|_| {
-        let kind = if key == "folder" {
-            UTType::typeWithIdentifier(&NSString::from_str("public.folder"))
-        } else {
-            UTType::typeWithFilenameExtension(&NSString::from_str(
-                key.trim_start_matches("native/"),
-            ))
-        }
-        .or_else(|| UTType::typeWithIdentifier(&NSString::from_str("public.data")))?;
-        // SAFETY: this is NSWorkspace's public macOS 11+ selector and its declared NSImage
-        // result. The generated binding is behind an optional cross-crate feature.
-        let image: objc2::rc::Retained<objc2_app_kit::NSImage> = unsafe {
-            objc2::msg_send![&*NSWorkspace::sharedWorkspace(), iconForContentType: &*kind]
-        };
-        // SAFETY: null planes ask AppKit to allocate a 48×48 RGBA buffer. The empty
-        // properties dictionary has no values with an incompatible Objective-C type.
-        unsafe {
-            let bitmap = NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
-                NSBitmapImageRep::alloc(), std::ptr::null_mut(), 48, 48, 8, 4, true, false, NSDeviceRGBColorSpace, 0, 0)?;
-            let context = NSGraphicsContext::graphicsContextWithBitmapImageRep(&bitmap)?;
-            NSGraphicsContext::saveGraphicsState_class();
-            NSGraphicsContext::setCurrentContext(Some(&context));
-            image.drawInRect_fromRect_operation_fraction(
-                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(48.0, 48.0)),
-                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0)),
-                NSCompositingOperation::SourceOver,
-                1.0,
-            );
-            NSGraphicsContext::restoreGraphicsState_class();
-            bitmap
-                .representationUsingType_properties(
-                    NSBitmapImageFileType::PNG,
-                    &NSDictionary::new(),
-                )
-                .map(|data| data.to_vec())
-        }
-    })
+    icon(glyph, size)
+        .key("file-icon")
+        .icon_one_color()
+        .color(ink)
+        .inert()
 }
 
-fn key(path: &Path, folder: bool, classic: bool) -> String {
-    if folder {
-        return if classic { "folder/system7" } else { "folder" }.into();
-    }
-    let name = path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_lowercase();
-    let ext = path
-        .extension()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_lowercase();
-    let material = if matches!(
-        name.as_str(),
-        "go.mod" | "go.sum" | "go.work" | "go.work.sum"
-    ) {
-        Some("go-mod")
-    } else if name == "dockerfile" || name.starts_with("dockerfile.") {
-        Some("docker")
-    } else if matches!(
-        name.as_str(),
-        ".gitignore" | ".gitattributes" | ".gitmodules" | ".gitconfig"
-    ) {
-        Some("git")
+fn language_icon(path: &Path) -> Option<&'static Icon> {
+    let name = path.file_name()?.to_str()?;
+    let lower;
+    let name = if name.bytes().any(|b| b.is_ascii_uppercase()) {
+        lower = name.to_ascii_lowercase();
+        lower.as_str()
     } else {
-        match ext.as_str() {
-            "ts" | "mts" | "cts" => Some("typescript"),
-            "tsx" => Some("react_ts"),
-            "js" | "mjs" | "cjs" => Some("javascript"),
-            "jsx" => Some("react"),
-            "py" | "pyi" | "pyw" => Some("python"),
-            "rs" => Some("rust"),
-            "md" | "markdown" | "mdx" => Some("markdown"),
-            "json" | "jsonc" | "json5" | "jsonl" => Some("json"),
-            "yml" | "yaml" => Some("yaml"),
-            "xml" | "plist" => Some("xml"),
-            "html" | "htm" => Some("html"),
-            "scss" | "sass" => Some("sass"),
-            "sh" | "bash" | "zsh" | "fish" => Some("console"),
-            "c" | "h" => Some("c"),
-            "cpp" | "cc" | "cxx" | "hpp" | "hxx" => Some("cpp"),
-            "cs" => Some("csharp"),
-            "kt" | "kts" => Some("kotlin"),
-            "rb" => Some("ruby"),
-            "sql" => Some("database"),
-            "go" | "swift" | "css" | "less" | "java" | "php" | "lua" | "toml" | "vue"
-            | "svelte" | "astro" => Some(ext.as_str()),
-            _ => None,
-        }
+        name
     };
-    material.map_or_else(|| format!("native/{ext}"), |m| format!("material/{m}"))
-}
-fn material(name: &str) -> Option<&'static [u8]> {
+    let ext = name.rsplit_once('.').map_or("", |(_, ext)| ext);
     Some(match name {
-        "astro" => include_bytes!("../../Resources/FileIcons/astro.svg"),
-        "c" => include_bytes!("../../Resources/FileIcons/c.svg"),
-        "console" => include_bytes!("../../Resources/FileIcons/console.svg"),
-        "cpp" => include_bytes!("../../Resources/FileIcons/cpp.svg"),
-        "csharp" => include_bytes!("../../Resources/FileIcons/csharp.svg"),
-        "css" => include_bytes!("../../Resources/FileIcons/css.svg"),
-        "database" => include_bytes!("../../Resources/FileIcons/database.svg"),
-        "docker" => include_bytes!("../../Resources/FileIcons/docker.svg"),
-        "git" => include_bytes!("../../Resources/FileIcons/git.svg"),
-        "go" => include_bytes!("../../Resources/FileIcons/go.svg"),
-        "go-mod" => include_bytes!("../../Resources/FileIcons/go-mod.svg"),
-        "html" => include_bytes!("../../Resources/FileIcons/html.svg"),
-        "java" => include_bytes!("../../Resources/FileIcons/java.svg"),
-        "javascript" => include_bytes!("../../Resources/FileIcons/javascript.svg"),
-        "json" => include_bytes!("../../Resources/FileIcons/json.svg"),
-        "kotlin" => include_bytes!("../../Resources/FileIcons/kotlin.svg"),
-        "less" => include_bytes!("../../Resources/FileIcons/less.svg"),
-        "lua" => include_bytes!("../../Resources/FileIcons/lua.svg"),
-        "markdown" => include_bytes!("../../Resources/FileIcons/markdown.svg"),
-        "php" => include_bytes!("../../Resources/FileIcons/php.svg"),
-        "python" => include_bytes!("../../Resources/FileIcons/python.svg"),
-        "react" => include_bytes!("../../Resources/FileIcons/react.svg"),
-        "react_ts" => include_bytes!("../../Resources/FileIcons/react_ts.svg"),
-        "ruby" => include_bytes!("../../Resources/FileIcons/ruby.svg"),
-        "rust" => include_bytes!("../../Resources/FileIcons/rust.svg"),
-        "sass" => include_bytes!("../../Resources/FileIcons/sass.svg"),
-        "svelte" => include_bytes!("../../Resources/FileIcons/svelte.svg"),
-        "swift" => include_bytes!("../../Resources/FileIcons/swift.svg"),
-        "toml" => include_bytes!("../../Resources/FileIcons/toml.svg"),
-        "typescript" => include_bytes!("../../Resources/FileIcons/typescript.svg"),
-        "vue" => include_bytes!("../../Resources/FileIcons/vue.svg"),
-        "xml" => include_bytes!("../../Resources/FileIcons/xml.svg"),
-        "yaml" => include_bytes!("../../Resources/FileIcons/yaml.svg"),
-        _ => return None,
+        "go.mod" | "go.sum" | "go.work" | "go.work.sum" => material!("go-mod", 32.0),
+        "dockerfile" => material!("docker", 24.0),
+        _ if name.starts_with("dockerfile.") => material!("docker", 24.0),
+        ".gitignore" | ".gitattributes" | ".gitmodules" | ".gitconfig" => material!("git", 32.0),
+        _ => match ext {
+            "ts" | "mts" | "cts" => material!("typescript", 16.0),
+            "tsx" => material!("react_ts", 32.0),
+            "js" | "mjs" | "cjs" => material!("javascript", 16.0),
+            "jsx" => material!("react", 32.0),
+            "py" | "pyi" | "pyw" => material!("python", 24.0),
+            "rs" => material!("rust", 32.0),
+            "md" | "markdown" | "mdx" => material!("markdown", 32.0),
+            "json" | "jsonc" | "json5" | "jsonl" => outline!(
+                "json",
+                "M9 3H7q-2 0-2 2v4q0 3-3 3 3 0 3 3v4q0 2 2 2h2 M15 3h2q2 0 2 2v4q0 3 3 3-3 0-3 3v4q0 2-2 2h-2"
+            ),
+            "yml" | "yaml" => material!("yaml", 24.0),
+            "xml" | "plist" => material!("xml", 24.0),
+            "html" | "htm" => material!("html", 32.0),
+            "scss" | "sass" => material!("sass", 32.0),
+            "sh" | "bash" | "zsh" | "fish" => material!("console", 16.0),
+            "c" | "h" => material!("c", 32.0),
+            "cpp" | "cc" | "cxx" | "hpp" | "hxx" => material!("cpp", 32.0),
+            "cs" => material!("csharp", 32.0),
+            "kt" | "kts" => material!("kotlin", 24.0),
+            "rb" => material!("ruby", 24.0),
+            "sql" => material!("database", 32.0),
+            "go" => material!("go", 32.0),
+            "swift" => material!("swift", 24.0),
+            "css" => material!("css", 32.0),
+            "less" => material!("less", 24.0),
+            "java" => material!("java", 32.0),
+            "php" => material!("php", 24.0),
+            "lua" => material!("lua", 32.0),
+            "toml" => material!("toml", 16.0),
+            "vue" => material!("vue", 24.0),
+            "svelte" => material!("svelte", 300.0),
+            "astro" => material!("astro", 32.0),
+            _ => return None,
+        },
     })
 }

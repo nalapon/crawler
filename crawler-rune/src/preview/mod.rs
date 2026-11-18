@@ -1,19 +1,21 @@
 //! Shared, bounded file previews, the Space window and the document reader: Markdown, Word,
-//! spreadsheets, code, plain text, images and video. PDFs have their own reader in `crate::pdf`.
+//! spreadsheets, PowerPoint, code, plain text, images and video. PDFs have their own reader.
 mod content;
 pub(crate) mod controls;
 mod native;
+mod presentation;
 mod sheet;
 mod word;
 
 use crate::app::{App, Paint, Reader, Section};
+use crate::foreground_io::Foreground;
 use crate::theme::Theme;
 use content::{Body, Budget, Document, Format, Request};
 use rune::prefs::Prefs;
-use rune::tok::{Family, TextStyle, motion, type_};
+use rune::tok::{Family, TextStyle, type_};
 use rune::{
-    AppHandle, AppSpec, Cx, El, GrowthSpec, ImageCache, Key, KeyEvent, Latest, Player, ScrollSpec,
-    SurfaceFit, TextEdit, Transition, Tx, Waker, WindowHandle, WindowOptions, WindowSpec, col, el,
+    AppHandle, AppSpec, Cx, El, GrowthSpec, Image, ImageCache, Key, KeyEvent, Latest, Player,
+    ScrollSpec, SurfaceFit, TextEdit, Tx, Waker, WindowHandle, WindowOptions, WindowSpec, col, el,
     rich, row, text,
 };
 use rune_kit::{
@@ -23,21 +25,83 @@ use rune_kit::{
 };
 use std::{
     cell::{Cell, RefCell},
+    collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
+    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::SystemTime,
 };
 
 type ReaderDisplayed = fn(&mut App, &Path);
+type FileVersion = (u64, SystemTime);
+
+#[derive(Default)]
+struct PaneCache {
+    entries: VecDeque<Arc<Document>>,
+    bytes: usize,
+    hits: u64,
+}
+
+impl PaneCache {
+    const LIMIT: usize = 16 * 1024 * 1024;
+
+    fn take(&mut self, path: &Path) -> Option<Arc<Document>> {
+        let at = self.entries.iter().position(|doc| doc.path == path)?;
+        let doc = self.entries.remove(at)?;
+        self.bytes -= doc.retained_bytes;
+        Some(doc)
+    }
+
+    fn remember(&mut self, doc: &Arc<Document>) {
+        self.take(&doc.path);
+        if doc.retained_bytes > Self::LIMIT || doc.modified.is_none() || doc.bytes.is_none() {
+            return;
+        }
+        while self.entries.len() >= 8 || self.bytes + doc.retained_bytes > Self::LIMIT {
+            let Some(old) = self.entries.pop_front() else {
+                break;
+            };
+            self.bytes -= old.retained_bytes;
+        }
+        self.bytes += doc.retained_bytes;
+        self.entries.push_back(doc.clone());
+    }
+}
+
+#[derive(Default)]
+struct EmbeddedImage {
+    task: Latest<Option<Image>>,
+    image: Option<Image>,
+    size: u32,
+}
+
+#[derive(Default)]
+struct SheetWindow {
+    columns: Cell<Option<(usize, usize)>>,
+    dirty: Cell<bool>,
+}
+
+struct ReaderLoad {
+    task: Foreground<Result<Arc<Document>, String>>,
+    waker: Option<Waker>,
+    mounted: bool,
+}
 
 #[derive(Default)]
 struct Slot {
     path: Option<PathBuf>,
-    /// The workbook sheet requested with `path`.
-    sheet: usize,
+    /// The sheet or slide requested with `path`.
+    part: usize,
+    version: Option<FileVersion>,
+    embedded: HashMap<String, EmbeddedImage>,
+    image_rows: std::ops::Range<usize>,
+    resume_images: bool,
+    sheet_window: Rc<SheetWindow>,
     task: Latest<Result<Arc<Document>, String>>,
+    reader_load: Option<ReaderLoad>,
     generation: Arc<AtomicU64>,
     document: Option<Arc<Document>>,
     error: Option<String>,
@@ -50,22 +114,63 @@ struct Slot {
     load_ms: Option<f64>,
 }
 impl Slot {
+    fn reader() -> Self {
+        Self {
+            reader_load: Some(ReaderLoad {
+                task: Foreground::new("crawler-reader-load"),
+                waker: None,
+                mounted: false,
+            }),
+            ..Self::default()
+        }
+    }
+
+    fn reset(&mut self) {
+        self.cancel();
+        *self = Self {
+            task: std::mem::take(&mut self.task),
+            reader_load: self.reader_load.take(),
+            ..Self::default()
+        };
+    }
+
+    fn is_pending(&self) -> bool {
+        self.task.is_pending()
+            || self
+                .reader_load
+                .as_ref()
+                .is_some_and(|load| load.task.is_pending())
+    }
+
     fn request(
         &mut self,
         path: &Path,
-        sheet: usize,
+        part: usize,
         budget: Budget,
         cache: &Option<Arc<ImageCache>>,
+        version: Option<FileVersion>,
+        candidate: Option<Arc<Document>>,
     ) {
-        if self.path.as_deref() == Some(path) && self.sheet == sheet {
+        let same_path = self.path.as_deref() == Some(path);
+        if same_path && self.part == part && self.version == version {
             return;
         }
         self.cancel();
         self.requested_at = Some(std::time::Instant::now());
         self.load_ms = None;
         self.path = Some(path.to_owned());
-        self.sheet = sheet;
-        self.document = None;
+        self.part = part;
+        self.version = version;
+        self.sheet_window = Rc::default();
+        // Keep the current slide on screen while its replacement renders.
+        if !same_path
+            || !self
+                .document
+                .as_ref()
+                .is_some_and(|doc| matches!(doc.body, Body::Slide { .. }))
+        {
+            self.document = None;
+        }
         self.error = None;
         self.started = false;
         self.muted = false;
@@ -74,28 +179,109 @@ impl Slot {
             self.path = None;
             return;
         };
+        if let Some(doc) = &candidate
+            && version.is_some()
+            && doc.bytes.zip(doc.modified) == version
+        {
+            self.adopt(doc.clone());
+            self.load_ms = Some(0.0);
+            return;
+        }
         let revision = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
-        self.task.request(
-            Request {
-                path: path.to_owned(),
-                budget,
-                sheet,
-                revision,
-                generation: self.generation.clone(),
-                cache: cache.clone(),
-            },
-            content::load,
-        );
+        let request = Request {
+            path: path.to_owned(),
+            budget,
+            part,
+            revision,
+            candidate,
+            generation: self.generation.clone(),
+            cache: cache.clone(),
+        };
+        if let Some(load) = self.reader_load.as_mut().filter(|load| !load.mounted) {
+            if let Err(error) = load
+                .task
+                .request(load.waker.clone(), move |_| content::load(request))
+            {
+                self.error = Some(error.to_string());
+            }
+        } else {
+            self.task.request(request, content::load);
+        }
     }
     fn cancel(&mut self) {
         self.generation.fetch_add(1, Ordering::Relaxed);
         self.task.cancel();
+        if let Some(load) = &self.reader_load {
+            load.task.cancel();
+        }
+        self.embedded.clear();
+        self.image_rows = 0..0;
+        self.resume_images = false;
+        self.playing_requested.set(false);
         if let Some(player) = self.player.take() {
             player.pause();
         }
     }
+    fn load_visible_images(
+        &mut self,
+        doc: &Document,
+        range: std::ops::Range<usize>,
+        cache: &Arc<ImageCache>,
+        waker: &Waker,
+    ) {
+        if self.path.as_deref() != Some(&doc.path) {
+            return;
+        }
+        self.image_rows = range.clone();
+        let wanted: HashMap<_, _> = doc
+            .images
+            .iter()
+            .filter(|(row, _, _)| range.contains(row))
+            .map(|(_, src, path)| (src.as_str(), path))
+            .collect();
+        self.embedded
+            .retain(|src, _| wanted.contains_key(src.as_str()));
+        // Budget decoded pixels and mipmaps together; a single image can still fill a Retina pane.
+        let size = ((32 * 1024 * 1024 / (8 * wanted.len().max(1))) as f64)
+            .sqrt()
+            .min(1600.0) as u32;
+        for (src, path) in wanted {
+            if self
+                .embedded
+                .get(src)
+                .is_some_and(|entry| entry.size <= size)
+            {
+                continue;
+            }
+            let entry = self.embedded.entry(src.to_owned()).or_default();
+            entry.size = size;
+            entry.image = None;
+            entry.task.set_waker(waker.clone());
+            let cache = cache.clone();
+            entry.task.request(path.clone(), move |path| {
+                native::image(&path, size)
+                    .ok()
+                    .map(|bitmap| content::decoded_image(&cache, bitmap))
+            });
+        }
+    }
+    fn poll_viewport(&mut self) -> bool {
+        let mut changed = self.sheet_window.dirty.replace(false);
+        for entry in self.embedded.values_mut() {
+            if let Some(image) = entry.task.take() {
+                changed |= image.is_some();
+                entry.image = image;
+            }
+        }
+        changed
+    }
     fn take(&mut self) -> bool {
-        let Some(result) = self.task.take() else {
+        let Some(result) = self
+            .reader_load
+            .as_ref()
+            .and_then(|load| load.task.take())
+            .or_else(|| self.task.take())
+        else {
             return false;
         };
         self.load_ms = self
@@ -144,6 +330,8 @@ pub struct State {
     pane: RefCell<Slot>,
     reader: Slot,
     cache: Option<Arc<ImageCache>>,
+    recent: RefCell<PaneCache>,
+    pdf_stamp: RefCell<Option<(PathBuf, Option<FileVersion>)>>,
     scale: u16,
     pinch: f32,
     history: Vec<(PathBuf, usize)>,
@@ -155,6 +343,7 @@ pub struct State {
     find_task: Latest<Vec<content::Found>>,
     found: Vec<content::Found>,
     current_match: usize,
+    main_window: Option<WindowHandle>,
     space: Option<(AppHandle<App>, WindowHandle)>,
     space_parent: Option<AppHandle<App>>,
     space_open: Arc<AtomicBool>,
@@ -167,6 +356,8 @@ pub struct State {
     goto_open: bool,
     goto_edit: TextEdit,
     image_zoom: StageZoom,
+    slide_scroll: Option<f32>,
+    slide_scrolled_at: f64,
     reader_displayed: Option<ReaderDisplayed>,
     did_display: bool,
 }
@@ -185,8 +376,10 @@ impl State {
         };
         Self {
             pane: RefCell::new(Slot::default()),
-            reader: Slot::default(),
+            reader: Slot::reader(),
             cache: None,
+            recent: RefCell::default(),
+            pdf_stamp: RefCell::default(),
             scale,
             pinch: 0.0,
             history: Vec::new(),
@@ -198,6 +391,7 @@ impl State {
             find_task: Latest::default(),
             found: Vec::new(),
             current_match: 0,
+            main_window: None,
             space: None,
             space_parent: None,
             space_open: Arc::default(),
@@ -208,6 +402,8 @@ impl State {
             goto_open: false,
             goto_edit: TextEdit::new(""),
             image_zoom: StageZoom::default(),
+            slide_scroll: Some(0.0),
+            slide_scrolled_at: 0.0,
             reader_displayed: None,
             did_display: false,
         }
@@ -249,6 +445,9 @@ pub fn setup(app: &mut App, waker: &Waker) {
     app.preview.cache = Some(Arc::new(ImageCache::new(waker.clone())));
     app.preview.pane.borrow().task.set_waker(waker.clone());
     app.preview.reader.task.set_waker(waker.clone());
+    if let Some(load) = &mut app.preview.reader.reader_load {
+        load.waker = Some(waker.clone());
+    }
     app.preview.find_task.set_waker(waker.clone());
 }
 
@@ -257,27 +456,96 @@ pub fn set_reader_display_observer(app: &mut App, observer: ReaderDisplayed) {
     app.preview.reader_displayed = Some(observer);
 }
 
+pub(crate) fn pane_selection(app: &App) -> Option<(&Path, Option<FileVersion>)> {
+    if app.preview.space_window {
+        return app.preview.space_path.as_deref().map(|path| (path, None));
+    }
+    if app.sheet_shown() || app.preview.space_open.load(Ordering::Relaxed) {
+        return None;
+    }
+    match app.section {
+        Section::Search | Section::Folders => {
+            let item = crate::funnel::selected_item(app)?;
+            if item.kind == crate::funnel::model::DocumentKind::Folder {
+                return None;
+            }
+            Some((&item.id.0, item.size.zip(item.modified)))
+        }
+        Section::Transfers => app.transfers.picker_preview(),
+        _ => None,
+    }
+}
+
+pub fn invalidate_pane(app: &mut App) {
+    let mut slot = app.preview.pane.borrow_mut();
+    if let Some(path) = slot.path.take() {
+        app.preview.recent.borrow_mut().take(&path);
+    }
+    slot.cancel();
+    slot.document = None;
+    drop(slot);
+    if !app.sheet_shown() && app.preview.pdf_stamp.borrow_mut().take().is_some() {
+        crate::pdf::release_previews(app);
+    }
+}
+
 pub fn poll(app: &mut App, tx: &mut Tx) -> bool {
-    let preview_visible = app.preview.space_window
-        || (app.reader == Reader::None
-            && matches!(app.section, Section::Search | Section::Folders)
-            && !app.preview.space_open.load(Ordering::Relaxed));
+    let selected = pane_selection(app);
     let mut changed = false;
-    if preview_visible {
-        let mut pane = app.preview.pane.borrow_mut();
+    let pdf_visible = selected.is_some_and(|(p, _)| Format::of(p) == Format::Pdf);
+    let pdf_changed = pdf_visible
+        && selected.is_some_and(|(path, version)| {
+            app.preview
+                .pdf_stamp
+                .borrow()
+                .as_ref()
+                .is_some_and(|(old_path, old_version)| {
+                    old_path == path && version.is_some() && version != *old_version
+                })
+        });
+    let mut pane = app.preview.pane.borrow_mut();
+    if selected.is_some_and(|(p, _)| Some(p) == pane.path.as_deref()) && !pdf_visible {
+        if pane.resume_images {
+            pane.resume_images = false;
+            if let (Some(doc), Some(cache), Some(waker)) =
+                (pane.document.clone(), &app.preview.cache, &app.waker)
+            {
+                let range = pane.image_rows.clone();
+                pane.load_visible_images(&doc, range, cache, waker);
+            }
+        }
         let landed = pane.take();
-        changed |= landed | pane.tick(landed, &app.waker, tx);
+        if landed && let Some(doc) = &pane.document {
+            app.preview.recent.borrow_mut().remember(doc);
+        }
+        changed |= landed | pane.tick(landed, &app.waker, tx) | pane.poll_viewport();
     } else {
-        let mut pane = app.preview.pane.borrow_mut();
         pane.pause();
-        if pane.task.is_pending() {
+        if !pane.embedded.is_empty() {
+            pane.embedded.clear();
+            pane.resume_images = true;
+        }
+        let hidden_by_reader = app.sheet_shown() || app.preview.space_open.load(Ordering::Relaxed);
+        if pane.is_pending() || (!hidden_by_reader && pane.path.is_some()) {
             pane.cancel();
             pane.path = None;
+            pane.document = None;
         }
+    }
+    drop(pane);
+    if !app.sheet_shown()
+        && !app.preview.space_open.load(Ordering::Relaxed)
+        && (!pdf_visible || pdf_changed)
+        && app.preview.pdf_stamp.borrow_mut().take().is_some()
+    {
+        crate::pdf::release_previews(app);
+        changed |= pdf_changed;
     }
     if app.reader == Reader::Document {
         let loaded = app.preview.reader.take();
-        changed |= loaded | app.preview.reader.tick(loaded, &app.waker, tx);
+        changed |= loaded
+            | app.preview.reader.tick(loaded, &app.waker, tx)
+            | app.preview.reader.poll_viewport();
         if loaded {
             app.preview.found.clear();
             app.preview.find_task.cancel();
@@ -307,9 +575,9 @@ pub fn poll(app: &mut App, tx: &mut Tx) -> bool {
                     Position::Block(i) => Some(i),
                     Position::Anchor(anchor) => {
                         app.preview.reader.document.as_ref().and_then(|d| {
-                            d.blocks().iter().position(|b| {
-                                b.heading.as_ref().is_some_and(|h| h.slug == anchor)
-                            })
+                            d.blocks()
+                                .iter()
+                                .position(|b| b.heading.as_ref().is_some_and(|h| h.slug == anchor))
                         })
                     }
                 };
@@ -318,16 +586,29 @@ pub fn poll(app: &mut App, tx: &mut Tx) -> bool {
                 }
             }
         }
+    } else {
+        app.preview.reader.pause();
     }
     changed
 }
 
 /// The shared preview panel. Starting a new demand supersedes the old worker immediately.
 pub fn pane(app: &App, cx: &mut Cx<App>, p: &Paint, path: &Path, key: &str) -> El {
-    let suspended = !app.preview.space_window
-        && (app.reader != Reader::None || app.preview.space_open.load(Ordering::Relaxed));
+    // The workspace stays mounted under an open reader, so its pane keeps what it shows
+    // while the sheet slides over it, but starts no work there.
+    let covered = !app.preview.space_window && app.sheet_shown();
+    let suspended = !app.preview.space_window && app.preview.space_open.load(Ordering::Relaxed);
     if Format::of(path) == Format::Pdf && !suspended {
-        return crate::pdf::pane(app, cx, p, path, key);
+        return if covered {
+            crate::pdf::still(p, key)
+        } else {
+            let mut stamp = app.preview.pdf_stamp.borrow_mut();
+            if stamp.as_ref().is_none_or(|(previous, _)| previous != path) {
+                *stamp = Some((path.to_owned(), pane_selection(app).and_then(|(_, v)| v)));
+            }
+            drop(stamp);
+            crate::pdf::pane(app, cx, p, path, key)
+        };
     }
     let mut panel = col()
         .key(key.to_owned())
@@ -339,19 +620,51 @@ pub fn pane(app: &App, cx: &mut Cx<App>, p: &Paint, path: &Path, key: &str) -> E
         return panel.child(message("Preview is open in another window", p));
     }
     let mut slot = app.preview.pane.borrow_mut();
-    slot.request(path, 0, Budget::Preview, &app.preview.cache);
+    if covered {
+        if slot.path.as_deref() != Some(path) {
+            return panel;
+        }
+    } else {
+        let version = pane_selection(app)
+            .filter(|(selected, _)| *selected == path)
+            .and_then(|(_, v)| v);
+        if slot.path.as_deref() != Some(path) || slot.version != version {
+            let mut recent = app.preview.recent.borrow_mut();
+            let candidate = recent.take(path);
+            slot.request(
+                path,
+                0,
+                Budget::Preview,
+                &app.preview.cache,
+                version,
+                candidate,
+            );
+            if let Some(doc) = &slot.document {
+                recent.hits += 1;
+                recent.remember(doc);
+                if let (Some(player), Some(waker)) = (&slot.player, &app.waker) {
+                    player.set_waker(waker.clone());
+                }
+            }
+        }
+    }
     if let Some(error) = &slot.error {
         return panel.child(message(error, p));
     }
     let Some(doc) = slot.document.clone() else {
-        return panel.child(message("Loading preview…", p));
+        return if covered {
+            panel
+        } else {
+            panel.child(message("Loading preview…", p))
+        };
     };
+    drop(slot);
     let content = match (&doc.body, doc.format) {
         (Body::Blocks(_) | Body::Text(_), _) => document_view(app, p, doc.clone(), key, false),
         (Body::Sheet(_), _) => sheet_view(app, p, doc.clone(), key, false),
-        (Body::None, Format::Video) => video_view(p, &slot, key, false),
+        (Body::None, Format::Video) => video_view(p, &app.preview.pane.borrow(), key, false),
         (Body::None, Format::Pdf) => el(),
-        (Body::None, _) => picture_view(p, &doc),
+        (Body::None | Body::Slide { .. }, _) => picture_view(p, &doc),
     };
     let modified = doc
         .modified
@@ -367,9 +680,7 @@ pub fn pane(app: &App, cx: &mut Cx<App>, p: &Paint, path: &Path, key: &str) -> E
         content
             .key(format!("{key}-content-{}", path.display()))
             .grow(1.0)
-            .min_h(0.0)
-            .transition(Transition::opacity())
-            .motion(motion::SNAPPY),
+            .min_h(0.0),
     );
     if doc.format != Format::Video {
         panel = panel.child(
@@ -404,35 +715,21 @@ fn picture_view(p: &Paint, doc: &Document) -> El {
                 .h_full()
                 .pixels_fit(image.pixels(), SurfaceFit::Fit),
         ),
-        _ => {
-            let icon = doc
-                .icon
-                .as_ref()
-                .map(|i| {
-                    el().size(64.0, 64.0)
-                        .pixels_fit(i.pixels(), SurfaceFit::Fit)
-                })
-                .unwrap_or_else(|| {
-                    text("▤")
-                        .font(TextStyle::new(56.0, 400.0))
-                        .color(p.look.muted)
-                });
-            col()
-                .w_full()
-                .h_full()
-                .center()
-                .gap(12.0)
-                .child(icon)
-                .child(
-                    text("No thumbnail available")
-                        .font(type_::BODY)
-                        .color(p.look.muted),
-                )
-        }
+        _ => col()
+            .w_full()
+            .h_full()
+            .center()
+            .gap(12.0)
+            .child(crate::icons::file(&doc.path, doc.kind, p.look, false, 64.0))
+            .child(
+                text("No thumbnail available")
+                    .font(type_::BODY)
+                    .color(p.look.muted),
+            ),
     }
 }
 /// The pane's or the reader's video slot, for handlers that only know which one drew them.
-fn video_slot<R>(app: &mut App, reader: bool, f: impl FnOnce(&mut Slot) -> R) -> R {
+fn with_slot<R>(app: &mut App, reader: bool, f: impl FnOnce(&mut Slot) -> R) -> R {
     if reader {
         f(&mut app.preview.reader)
     } else {
@@ -463,7 +760,7 @@ fn video_view(p: &Paint, slot: &Slot, key: &str, reader: bool) -> El {
                 if playing { "Pause" } else { "Play" },
                 false,
             )
-            .on_press(move |a: &mut App| video_slot(a, reader, toggle_play)),
+            .on_press(move |a: &mut App| with_slot(a, reader, toggle_play)),
         )
         .child(
             el().key(format!("{key}-seek"))
@@ -484,7 +781,7 @@ fn video_view(p: &Paint, slot: &Slot, key: &str, reader: bool) -> El {
                 .on_drag(move |a: &mut App, drag, _| {
                     if drag.phase == rune::Phase::Up && !drag.cancelled() {
                         let at = f64::from((drag.x / drag.w.max(1.0)).clamp(0.0, 1.0));
-                        video_slot(a, reader, |slot| {
+                        with_slot(a, reader, |slot| {
                             if let Some(player) = &slot.player
                                 && let Some(duration) = player.duration()
                             {
@@ -494,7 +791,7 @@ fn video_view(p: &Paint, slot: &Slot, key: &str, reader: bool) -> El {
                     }
                 })
                 .on_key(move |a: &mut App, event, _| {
-                    video_slot(a, reader, |slot| {
+                    with_slot(a, reader, |slot| {
                         let Some(player) = &slot.player else {
                             return false;
                         };
@@ -522,7 +819,7 @@ fn video_view(p: &Paint, slot: &Slot, key: &str, reader: bool) -> El {
                 false,
             )
             .on_press(move |a: &mut App| {
-                video_slot(a, reader, |slot| {
+                with_slot(a, reader, |slot| {
                     slot.muted = !slot.muted;
                     if let Some(player) = &slot.player {
                         player.set_muted(slot.muted || !slot.started);
@@ -576,15 +873,18 @@ pub fn open_reader(app: &mut App, path: &Path, tx: &mut Tx) -> Result<(), String
     Ok(())
 }
 fn navigate(app: &mut App, path: &Path, position: Position, tx: &mut Tx) {
+    let mounted = crate::opening::mounted_path(app, path);
+    if let Some(load) = &mut app.preview.reader.reader_load {
+        load.mounted = mounted;
+    }
     app.preview.pane.borrow().pause();
+    if Format::of(path) == Format::PowerPoint {
+        app.preview.find_open = false;
+    }
     app.preview.reader.cancel();
     app.preview.reader.path = None;
-    app.preview
-        .reader
-        .request(path, 0, Budget::Reader, &app.preview.cache);
-    // A complete pane read already holds the whole document and can be shared at once.
-    // Pictures are decoded smaller for the pane, so the reader reads those again.
-    let shared = app
+    // Validate a complete pane read against fresh metadata on the worker before reuse.
+    let candidate = app
         .preview
         .pane
         .borrow()
@@ -592,10 +892,9 @@ fn navigate(app: &mut App, path: &Path, position: Position, tx: &mut Tx) {
         .as_ref()
         .filter(|d| d.path == path && !d.truncated && !matches!(d.body, Body::None))
         .cloned();
-    if let Some(document) = shared {
-        app.preview.reader.cancel();
-        app.preview.reader.adopt(document);
-    }
+    app.preview
+        .reader
+        .request(path, 0, Budget::Reader, &app.preview.cache, None, candidate);
     app.preview.find_task.cancel();
     app.preview.found.clear();
     app.preview.pending_position = Some(position);
@@ -604,6 +903,7 @@ fn navigate(app: &mut App, path: &Path, position: Position, tx: &mut Tx) {
     app.preview.did_display = false;
     app.preview.goto_open = false;
     app.preview.image_zoom = StageZoom::default();
+    app.preview.slide_scroll = Some(0.0);
     app.reader = Reader::Document;
     app.reader_escape_at = None;
     tx.focus(READER, false);
@@ -627,50 +927,110 @@ pub fn typing(app: &App) -> bool {
 
 const READER: &str = "document-reader";
 
+pub(crate) fn set_main_window(app: &mut App, window: WindowHandle) {
+    app.preview.main_window = Some(window);
+}
+
+fn is_presentation(reader: &Slot) -> bool {
+    reader
+        .path
+        .as_deref()
+        .is_some_and(|path| Format::of(path) == Format::PowerPoint)
+}
+
+fn slide_full_screen(app: &App) -> bool {
+    app.preview
+        .main_window
+        .as_ref()
+        .and_then(WindowHandle::placement)
+        .is_some_and(|placement| placement.full_screen)
+}
+
+fn toggle_slide_full_screen(app: &mut App, tx: &mut Tx) {
+    app.reader_escape_at = None;
+    app.preview.image_zoom = StageZoom::default();
+    app.preview.slide_scroll = Some(0.0);
+    tx.toggle_full_screen();
+    focus_reader(tx);
+}
+
 pub fn reader_view(app: &App, cx: &mut Cx<App>, p: &Paint, _layer: &mut Vec<El>) -> El {
     let reader = &app.preview.reader;
+    // This read also asks Rune to refresh the view when the native titlebar changes.
+    let titlebar_inset = cx.titlebar_inset();
+    let full_screen = is_presentation(reader) && slide_full_screen(app);
     let mut view = col()
         .key(READER)
+        .motion(rune::Spring::NONE)
         .focusable(true)
         .w_full()
         .h_full()
-        .fill(p.look.raised)
-        .child(reader_header(app, cx, p));
+        .fill(p.look.raised);
+    if !full_screen {
+        view = view.child(reader_header(app, p, titlebar_inset));
+    }
     if app.preview.find_open {
         view = view.child(find_bar(app, p));
     }
     if app.preview.goto_open {
         view = view.child(goto_bar(app, p));
     }
-    let body = match &reader.document {
-        None => message(
-            reader.error.as_deref().unwrap_or("Loading document…"),
-            p,
-        ),
-        Some(doc) => match (&doc.body, doc.format) {
-            (Body::Blocks(_), _) if app.preview.outline_open => row()
-                .w_full()
-                .h_full()
-                .child(outline(app, p, doc))
-                .child(
+    let body = match (&reader.document, &reader.error) {
+        (_, Some(error)) => message(error, p),
+        (None, None) => message("Loading document…", p),
+        (Some(doc), None) => match (&doc.body, doc.format) {
+            (Body::Blocks(_), _) if app.preview.outline_open => {
+                row().w_full().h_full().child(outline(app, p, doc)).child(
                     document_view(app, p, doc.clone(), "reader", true)
                         .grow(1.0)
                         .min_w(0.0),
-                ),
+                )
+            }
             (Body::Blocks(_) | Body::Text(_), _) => {
                 document_view(app, p, doc.clone(), "reader", true)
             }
             (Body::Sheet(_), _) => sheet_view(app, p, doc.clone(), "reader", true),
             (Body::None, Format::Video) => video_view(p, reader, "reader-video", true),
+            (Body::Slide { image, .. }, _) if full_screen => el()
+                .key("presentation-screen")
+                .w_full()
+                .h_full()
+                .fill(rune::Color::BLACK)
+                .pixels_fit(image.pixels(), SurfaceFit::Fit)
+                .on_wheel(slide_wheel),
+            (Body::Slide { image, .. }, _) => {
+                image_stage(app, cx, p, image, true).on_wheel(|a: &mut App, event, tx| {
+                    !a.preview.image_zoom.zoomed() && slide_wheel(a, event, tx)
+                })
+            }
             (Body::None, _) => image_view(app, cx, p, doc),
         },
     };
-    view.child(body.grow(1.0).min_h(0.0))
+    view = view.child(body.grow(1.0).min_h(0.0));
+    if full_screen {
+        view = view.child(
+            controls::button(
+                p,
+                "exit-slide-full-screen",
+                "",
+                Some(&controls::EXIT_FULL_SCREEN),
+                false,
+            )
+            .w(32.0)
+            .fill(p.look.raised)
+            .border(1.0, p.look.line)
+            .label("Exit full screen")
+            .help("Esc or F")
+            .pin(None, None, Some(12.0), Some(12.0))
+            .on_press_tx(toggle_slide_full_screen),
+        );
+    }
+    view
 }
 
 /// One header for every format: back, the name, where you are, then only the controls the
 /// open document can use.
-fn reader_header(app: &App, cx: &mut Cx<App>, p: &Paint) -> El {
+fn reader_header(app: &App, p: &Paint, titlebar_inset: f32) -> El {
     let reader = &app.preview.reader;
     let path = reader.path.as_deref().unwrap_or(Path::new(""));
     let name = path
@@ -683,8 +1043,8 @@ fn reader_header(app: &App, cx: &mut Cx<App>, p: &Paint) -> El {
     let mut header = row()
         .key("reader-header")
         .w_full()
-        .h(48.0)
-        .pl(cx.titlebar_inset().max(88.0))
+        .h(if is_presentation(reader) { 38.0 } else { 48.0 })
+        .pl(titlebar_inset.max(88.0))
         .pr(14.0)
         .gap(4.0)
         .items_center()
@@ -700,6 +1060,13 @@ fn reader_header(app: &App, cx: &mut Cx<App>, p: &Paint) -> El {
         );
     }
     let place = match (doc, body) {
+        (_, Some(Body::Slide { index, count, .. })) => {
+            if *index != reader.part && reader.is_pending() {
+                format!("Loading slide {} of {count}…", reader.part + 1)
+            } else {
+                format!("Slide {} of {count}", reader.part + 1)
+            }
+        }
         (Some(doc), Some(Body::Blocks(_) | Body::Text(_) | Body::Sheet(_))) => {
             let rows = doc.rows().max(1);
             format!("{}%", (app.preview.visible_end * 100 / rows).min(100))
@@ -732,6 +1099,38 @@ fn reader_header(app: &App, cx: &mut Cx<App>, p: &Paint) -> El {
             .color(p.look.muted)
             .align(rune::Align::End),
         );
+    if let Some(Body::Slide { count, .. }) = body {
+        header = header
+            .child(
+                controls::button(p, "previous-slide", "", Some(&controls::BACK), false)
+                    .w(32.0)
+                    .label("Previous slide")
+                    .help("Page Up · Left Arrow")
+                    .disabled(reader.part == 0)
+                    .on_press(|a: &mut App| show_slide(a, a.preview.reader.part.saturating_sub(1))),
+            )
+            .child(
+                controls::button(p, "next-slide", "", Some(&controls::NEXT), false)
+                    .w(32.0)
+                    .label("Next slide")
+                    .help("Page Down · Right Arrow")
+                    .disabled(reader.part + 1 >= *count)
+                    .on_press(|a: &mut App| show_slide(a, a.preview.reader.part + 1)),
+            )
+            .child(
+                controls::button(
+                    p,
+                    "slide-full-screen",
+                    "",
+                    Some(&controls::FULL_SCREEN),
+                    false,
+                )
+                .w(32.0)
+                .label("Full screen")
+                .help("F")
+                .on_press_tx(toggle_slide_full_screen),
+            );
+    }
     if matches!(body, Some(Body::Blocks(_))) {
         header = header.child(
             controls::button(
@@ -793,10 +1192,7 @@ fn reader_header(app: &App, cx: &mut Cx<App>, p: &Paint) -> El {
                     .on_press(|a: &mut App| zoom(a, 1)),
             );
     }
-    if matches!(
-        body,
-        Some(Body::Blocks(_) | Body::Text(_) | Body::Sheet(_))
-    ) {
+    if matches!(body, Some(Body::Blocks(_) | Body::Text(_) | Body::Sheet(_))) {
         header = header.child(
             controls::button(p, "reader-find", "Find", None, app.preview.find_open)
                 .help("⌘F")
@@ -859,12 +1255,7 @@ fn find_bar(app: &App, p: &Paint) -> El {
         )
 }
 fn goto_bar(app: &App, p: &Paint) -> El {
-    let rows = app
-        .preview
-        .reader
-        .document
-        .as_ref()
-        .map_or(0, |d| d.rows());
+    let rows = app.preview.reader.document.as_ref().map_or(0, |d| d.rows());
     row()
         .key("reader-goto-bar")
         .w_full()
@@ -937,7 +1328,10 @@ fn outline(app: &App, p: &Paint, doc: &Document) -> El {
                 )
                 .child(
                     text(heading.title.clone())
-                        .font(p.look.font(12.0, if heading.level <= 1 { 600.0 } else { 400.0 }))
+                        .font(
+                            p.look
+                                .font(12.0, if heading.level <= 1 { 600.0 } else { 400.0 }),
+                        )
                         .color(if current {
                             p.look.selection_text
                         } else if heading.level <= 2 {
@@ -975,6 +1369,10 @@ fn image_view(app: &App, cx: &mut Cx<App>, p: &Paint, doc: &Document) -> El {
     let Some(image) = doc.thumbnail.as_ref().filter(|i| i.error().is_none()) else {
         return picture_view(p, doc);
     };
+    image_stage(app, cx, p, image, false)
+}
+
+fn image_stage(app: &App, cx: &mut Cx<App>, p: &Paint, image: &Image, allow_upscale: bool) -> El {
     let size = cx.layout_size("reader-stage").unwrap_or([900.0, 640.0]);
     // Decoded pixels are shown at two per point, the density of the displays Crawler runs on.
     let natural = image
@@ -986,6 +1384,7 @@ fn image_view(app: &App, cx: &mut Cx<App>, p: &Paint, doc: &Document) -> El {
             natural,
             el().pixels(image.pixels()),
         )
+        .grows(allow_upscale)
         .icons(&controls::ZOOM_IN, &controls::ZOOM_OUT, &controls::FIT)
         .build(&app.preview.image_zoom, &p.kit, size),
     )
@@ -1015,13 +1414,7 @@ fn document_view(app: &App, p: &Paint, document: Arc<Document>, key: &str, reade
     } else {
         1.0
     };
-    let revision = (
-        document.path.clone(),
-        document.revision,
-        p.look.theme,
-        app.preview.scale,
-        wrap,
-    );
+    let revision = (document.path.clone(), document.revision);
     // The theme's styles are built once per view, not once per row.
     let look = p.look;
     let style = markdown_style(p, scale, reader);
@@ -1029,6 +1422,7 @@ fn document_view(app: &App, p: &Paint, document: Arc<Document>, key: &str, reade
     let digits = count.max(1).ilog10() as f32 + 1.0;
     let row_prefix = key.to_owned();
     let build_prefix = key.to_owned();
+    let image_doc = (!document.images.is_empty()).then(|| document.clone());
     let mut rows = col()
         .selection_group(true)
         .key(format!("{key}-blocks"))
@@ -1061,14 +1455,26 @@ fn document_view(app: &App, p: &Paint, document: Arc<Document>, key: &str, reade
                         Some(block) => block_row(a, &document, block, i, &style, scale, reader),
                         None => el(),
                     },
-                    Body::Sheet(_) | Body::None => el(),
+                    Body::Sheet(_) | Body::Slide { .. } | Body::None => el(),
                 };
                 row.key(block_key(&build_prefix, i))
             },
         )
         .virtual_rows_version(revision);
-    if reader {
-        rows = rows.on_visible_rows(|a: &mut App, range| {
+    if reader || image_doc.is_some() {
+        rows = rows.on_visible_rows(move |a: &mut App, range| {
+            if let Some(doc) = &image_doc
+                && (reader && a.reader == Reader::Document
+                    || !reader && pane_selection(a).is_some_and(|(p, _)| p == doc.path))
+                && let (Some(cache), Some(waker)) = (a.preview.cache.clone(), a.waker.clone())
+            {
+                with_slot(a, reader, |slot| {
+                    slot.load_visible_images(doc, range.clone(), &cache, &waker)
+                });
+            }
+            if !reader {
+                return false;
+            }
             let changed = a.preview.visible_end != range.end
                 || (a.preview.outline_open && a.preview.visible_block != range.start);
             a.preview.visible_block = range.start;
@@ -1181,7 +1587,19 @@ fn block_row(
     scale: f32,
     reader: bool,
 ) -> El {
-    let images = document.images.clone();
+    let ready = |slot: &Slot| {
+        document
+            .images
+            .iter()
+            .filter(|(row, _, _)| *row == index)
+            .filter_map(|(_, src, _)| Some((src.clone(), slot.embedded.get(src)?.image.clone()?)))
+            .collect::<HashMap<_, _>>()
+    };
+    let images = if reader {
+        ready(&app.preview.reader)
+    } else {
+        ready(&app.preview.pane.borrow())
+    };
     let fenced = document.fenced.clone();
     let source_path = document.path.clone();
     let highlights: Vec<_> = if reader && app.preview.find_open {
@@ -1198,7 +1616,7 @@ fn block_row(
     } else {
         Vec::new()
     };
-    let content = Markdown::new(block.source.clone())
+    let content = Markdown::new(block.markdown())
         .selectable(true)
         .tasks_read_only()
         .highlights(highlights)
@@ -1229,7 +1647,7 @@ fn block_row(
         } else {
             19.0
         })
-        .child(content.max_w(max_width).motion(motion::SNAPPY))
+        .child(content.max_w(max_width))
 }
 
 const SHEET_ROW: f32 = 24.0;
@@ -1242,20 +1660,29 @@ fn sheet_view(app: &App, p: &Paint, document: Arc<Document>, key: &str, reader: 
         return el();
     };
     let sheet = &book.sheet;
-    if sheet.rows() == 0 {
-        return message("This sheet is empty", p);
-    }
     let look = p.look;
-    let width = SHEET_GUTTER + sheet.widths.iter().sum::<f32>();
+    let width = SHEET_GUTTER + sheet.offsets.last().copied().unwrap_or(0.0);
+    let window = if reader {
+        app.preview.reader.sheet_window.clone()
+    } else {
+        app.preview.pane.borrow().sheet_window.clone()
+    };
+    let columns = window
+        .columns
+        .get()
+        .unwrap_or_else(|| visible_columns(sheet, 0.0, 1200.0));
+    let columns = columns.0.min(sheet.columns)..columns.1.min(sheet.columns);
     let mut letters = row().w(width).h(SHEET_ROW).child(
         el().w(SHEET_GUTTER)
             .h_full()
             .sticky_left(0.0)
             .fill(look.raised),
     );
-    for (column, column_width) in sheet.widths.iter().enumerate() {
+    letters = letters.child(el().w(sheet.offsets[columns.start]));
+    for column in columns.clone() {
+        let column_width = sheet.widths[column];
         letters = letters.child(
-            row().w(*column_width).h_full().center().child(
+            row().w(column_width).h_full().center().child(
                 text(column_name(column))
                     .font(look.font(10.0, 500.0))
                     .color(look.muted),
@@ -1269,13 +1696,12 @@ fn sheet_view(app: &App, p: &Paint, document: Arc<Document>, key: &str, reader: 
         .fill(look.raised)
         .border_sides([0.0, 0.0, 1.0, 0.0], look.line)
         .child(letters)
-        .child(sheet_row(app, &document, 0, look, key, reader));
-    let revision = (
-        document.path.clone(),
-        document.revision,
-        look.theme,
-        book.active,
-    );
+        .child(if sheet.rows() > 0 {
+            sheet_row(app, &document, 0, look, key, reader, columns.clone())
+        } else {
+            el()
+        });
+    let revision = (document.path.clone(), document.revision, book.active);
     let rows_document = document.clone();
     let row_prefix = key.to_owned();
     let build_prefix = key.to_owned();
@@ -1284,10 +1710,20 @@ fn sheet_view(app: &App, p: &Paint, document: Arc<Document>, key: &str, reader: 
         .w(width)
         .growth(GrowthSpec::default())
         .virtual_rows(
-            sheet.rows() - 1,
+            sheet.rows().saturating_sub(1),
             SHEET_ROW,
             move |_: &App, i| block_key(&row_prefix, i + 1).into(),
-            move |a: &App, i| sheet_row(a, &rows_document, i + 1, look, &build_prefix, reader),
+            move |a: &App, i| {
+                sheet_row(
+                    a,
+                    &rows_document,
+                    i + 1,
+                    look,
+                    &build_prefix,
+                    reader,
+                    columns.clone(),
+                )
+            },
         )
         .virtual_rows_version(revision);
     if reader {
@@ -1298,13 +1734,35 @@ fn sheet_view(app: &App, p: &Paint, document: Arc<Document>, key: &str, reader: 
             changed
         });
     }
-    let grid = col()
-        .key(format!("{key}-scroll"))
-        .w_full()
-        .grow(1.0)
-        .min_h(0.0)
-        .scroll_xy()
-        .child(col().w(width).child(header).child(rows));
+    let waker = app.waker.clone();
+    let scroll_doc = document.clone();
+    let grid = if sheet.rows() == 0 {
+        col().w_full().grow(1.0).min_h(0.0).center().child(
+            text("This sheet is empty")
+                .font(type_::BODY)
+                .color(p.look.muted),
+        )
+    } else {
+        col()
+            .key(format!("{key}-scroll"))
+            .w_full()
+            .grow(1.0)
+            .min_h(0.0)
+            .scroll_xy()
+            .on_scroll_offset(move |at| {
+                let Body::Sheet(book) = &scroll_doc.body else {
+                    return;
+                };
+                let visible = visible_columns(&book.sheet, at.offset[0], at.viewport[0]);
+                if window.columns.replace(Some(visible)) != Some(visible) {
+                    window.dirty.set(true);
+                    if let Some(waker) = &waker {
+                        waker();
+                    }
+                }
+            })
+            .child(col().w(width).child(header).child(rows))
+    };
     let mut view = col().w_full().h_full().child(grid);
     if reader && book.names.len() > 1 {
         let mut tabs = row().gap(2.0).items_center();
@@ -1340,6 +1798,18 @@ fn sheet_view(app: &App, p: &Paint, document: Arc<Document>, key: &str, reader: 
         p,
     )
 }
+// Keep a neighboring column on either side so short horizontal scrolls need no rebuild.
+fn visible_columns(sheet: &sheet::Sheet, offset: f32, viewport: f32) -> (usize, usize) {
+    let first = sheet
+        .offsets
+        .partition_point(|x| *x <= (offset - SHEET_GUTTER).max(0.0));
+    let end = sheet.offsets.partition_point(|x| *x < offset + viewport);
+    (
+        first.saturating_sub(2).min(sheet.columns),
+        (end + 1).min(sheet.columns),
+    )
+}
+
 fn sheet_row(
     app: &App,
     document: &Document,
@@ -1347,6 +1817,7 @@ fn sheet_row(
     look: crate::theme::Look,
     prefix: &str,
     reader: bool,
+    columns: std::ops::Range<usize>,
 ) -> El {
     let Body::Sheet(book) = &document.body else {
         return el();
@@ -1385,10 +1856,12 @@ fn sheet_row(
         );
     // The first row is usually the column titles.
     let font = look.font(12.0, if index == 0 { 600.0 } else { 400.0 });
-    for (column, width) in sheet.widths.iter().enumerate() {
+    line = line.child(el().w(sheet.offsets[columns.start]));
+    for column in columns {
+        let width = sheet.widths[column];
         let value = sheet.cell(index, column);
         let mut cell = row()
-            .w(*width)
+            .w(width)
             .h_full()
             .px(8.0)
             .items_center()
@@ -1432,12 +1905,64 @@ fn show_sheet(app: &mut App, sheet: usize, tx: &mut Tx) {
     };
     app.preview
         .reader
-        .request(&path, sheet, Budget::Reader, &app.preview.cache);
+        .request(&path, sheet, Budget::Reader, &app.preview.cache, None, None);
     app.preview.find_task.cancel();
     app.preview.found.clear();
     app.preview.visible_block = 0;
     app.preview.visible_end = 0;
     tx.scroll_to_instant("reader-scroll", 0.0, 0.0);
+}
+
+fn show_slide(app: &mut App, index: usize) {
+    let reader = &mut app.preview.reader;
+    let Some(Body::Slide { count, .. }) = reader.document.as_deref().map(|doc| &doc.body) else {
+        return;
+    };
+    if index >= *count || index == reader.part {
+        return;
+    }
+    if let Some(path) = reader.path.clone() {
+        reader.request(&path, index, Budget::Reader, &app.preview.cache, None, None);
+        app.preview.image_zoom = StageZoom::default();
+    }
+}
+
+fn slide_wheel(app: &mut App, event: rune::WheelEvent, tx: &mut Tx) -> bool {
+    use rune::GesturePhase;
+    if event.momentum || event.mods.ctrl || event.mods.cmd {
+        return false;
+    }
+    let delta = if event.precise {
+        let now = tx.clock();
+        if matches!(event.phase, GesturePhase::Began | GesturePhase::Ended)
+            || now - app.preview.slide_scrolled_at > 0.2
+        {
+            app.preview.slide_scroll = Some(0.0);
+        }
+        app.preview.slide_scrolled_at = now;
+        let Some(total) = &mut app.preview.slide_scroll else {
+            tx.live_only();
+            return true;
+        };
+        *total += event.dy;
+        if total.abs() < 36.0 {
+            tx.live_only();
+            return true;
+        }
+        let delta = *total;
+        // The rest of this gesture pans nothing once it has turned a slide.
+        app.preview.slide_scroll = None;
+        delta
+    } else {
+        event.dy
+    };
+    let current = app.preview.reader.part;
+    if delta < 0.0 {
+        show_slide(app, current + 1);
+    } else if delta > 0.0 {
+        show_slide(app, current.saturating_sub(1));
+    }
+    true
 }
 
 fn summary(doc: &Document) -> String {
@@ -1454,7 +1979,7 @@ fn summary(doc: &Document) -> String {
             book.sheet.rows(),
             book.sheet.columns
         ),
-        Body::None => String::new(),
+        Body::None | Body::Slide { .. } => String::new(),
     }
 }
 fn with_notice(body: El, truncated: bool, budget: Budget, format: Format, p: &Paint) -> El {
@@ -1643,9 +2168,7 @@ fn zoom(app: &mut App, steps: i16) {
         {
             app.preview.pending_position = Some(Position::Block(found.block));
         }
-        let _ = app
-            .prefs
-            .set("markdownReaderScale", &(scale as f64 / 100.0));
+        let _ = app.set_preference("markdownReaderScale", &(scale as f64 / 100.0));
     }
 }
 fn show_find(app: &mut App, tx: &mut Tx) {
@@ -1676,12 +2199,7 @@ fn goto_key(app: &mut App, event: &KeyEvent, tx: &mut Tx) -> bool {
     match event.key {
         Key::Escape => hide_goto(app, tx),
         Key::Enter => {
-            let rows = app
-                .preview
-                .reader
-                .document
-                .as_ref()
-                .map_or(0, |d| d.rows());
+            let rows = app.preview.reader.document.as_ref().map_or(0, |d| d.rows());
             if let Ok(number) = app.preview.goto_edit.text.trim().parse::<usize>()
                 && rows > 0
             {
@@ -1695,16 +2213,24 @@ fn goto_key(app: &mut App, event: &KeyEvent, tx: &mut Tx) -> bool {
 }
 fn toggle_outline(app: &mut App) {
     app.preview.outline_open = !app.preview.outline_open;
-    let _ = app.prefs.set("readerOutline", &app.preview.outline_open);
+    let open = app.preview.outline_open;
+    let _ = app.set_preference("readerOutline", &open);
 }
 fn toggle_wrap(app: &mut App) {
     app.preview.wrap = !app.preview.wrap;
-    let _ = app.prefs.set("readerWrapLines", &app.preview.wrap);
+    let wrap = app.preview.wrap;
+    let _ = app.set_preference("readerWrapLines", &wrap);
 }
 fn reveal_match(app: &App, tx: &mut Tx) {
     if let Some(found) = app.preview.found.get(app.preview.current_match) {
-        tx.scroll_into_view(block_key("reader", found.block));
-        tx.scroll_into_view(format!("reader-match-{}", app.preview.current_match));
+        let row = block_key("reader", found.block);
+        let key = match app.preview.reader.document.as_deref().map(|doc| &doc.body) {
+            Some(Body::Text(_) | Body::Blocks(_)) => {
+                format!("{row}/reader-match-{}", app.preview.current_match)
+            }
+            _ => row,
+        };
+        tx.scroll_into_view(key);
     }
 }
 fn next_match(app: &mut App, previous: bool, tx: &mut Tx) {
@@ -1731,12 +2257,38 @@ pub fn reader_key(app: &mut App, event: &KeyEvent, tx: &mut Tx) -> bool {
     if matches!(event.key, Key::Escape) && tx.key_repeat() {
         return true;
     }
+    if is_presentation(&app.preview.reader) {
+        let full_screen_key = matches!(&event.key, Key::Text(t) if t.eq_ignore_ascii_case("f"))
+            && !event.mods.cmd
+            && !event.mods.ctrl
+            && !event.mods.alt;
+        if full_screen_key || matches!(event.key, Key::Escape) && slide_full_screen(app) {
+            if !tx.key_repeat() {
+                toggle_slide_full_screen(app, tx);
+            }
+            return true;
+        }
+    }
     let body = app.preview.reader.document.as_ref().map(|d| &d.body);
+    if let Some(Body::Slide { count, .. }) = body {
+        let current = app.preview.reader.part;
+        let target = match event.key {
+            Key::PageDown | Key::Right => Some(current + 1),
+            Key::PageUp | Key::Left => Some(current.saturating_sub(1)),
+            Key::Home => Some(0),
+            Key::End => Some(count - 1),
+            _ => None,
+        };
+        if let Some(index) = target {
+            show_slide(app, index);
+            return true;
+        }
+    }
     let (blocks, plain, sheet, picture) = (
         matches!(body, Some(Body::Blocks(_))),
         matches!(body, Some(Body::Text(_))),
         matches!(body, Some(Body::Sheet(_))),
-        matches!(body, Some(Body::None)),
+        matches!(body, Some(Body::None | Body::Slide { .. })),
     );
     let step = match &event.key {
         Key::Command('+') | Key::Command('=') => Some(1),
@@ -1772,11 +2324,7 @@ pub fn reader_key(app: &mut App, event: &KeyEvent, tx: &mut Tx) -> bool {
     true
 }
 pub fn reader_closed(app: &mut App) {
-    app.preview.reader.cancel();
-    app.preview.reader = Slot::default();
-    if let Some(w) = &app.waker {
-        app.preview.reader.task.set_waker(w.clone());
-    }
+    app.preview.reader.reset();
     app.preview.find_task.cancel();
     app.preview.found.clear();
     app.preview.find_open = false;
@@ -1990,6 +2538,11 @@ pub fn main_closed(app: &mut App, tx: &mut Tx) {
     crate::app::on_close(app, tx);
 }
 
+pub(crate) fn frame_reader(app: &App) -> Option<&Path> {
+    let doc = app.preview.reader.document.as_ref()?;
+    Some(&doc.path)
+}
+
 /// Readiness reflects completed background reads, not compositor presentation.
 pub fn report(app: &App) -> serde_json::Value {
     fn state(slot: &Slot) -> &'static str {
@@ -1997,7 +2550,7 @@ pub fn report(app: &App) -> serde_json::Value {
             "failed"
         } else if slot.document.is_some() {
             "ready"
-        } else if slot.task.is_pending() {
+        } else if slot.is_pending() {
             "loading"
         } else {
             "closed"
@@ -2014,6 +2567,7 @@ pub fn report(app: &App) -> serde_json::Value {
     } else {
         None
     };
+    let recent = app.preview.recent.borrow();
     let preview_state = if let Some(path) = path.as_deref().filter(|p| Format::of(p) == Format::Pdf)
     {
         if crate::pdf::is_ready(app, path) {
@@ -2028,10 +2582,18 @@ pub fn report(app: &App) -> serde_json::Value {
     };
     serde_json::json!({
         "file_search_preview_state":preview_state, "file_search_preview_path":path,
+        "pane_images_ready":pane.embedded.values().filter(|e| e.image.is_some()).count(),
+        "reader_images_ready":reader.embedded.values().filter(|e| e.image.is_some()).count(),
+        "reader_sheet_columns":reader.sheet_window.columns.get(),
+        "preview_cache_bytes":recent.bytes,"preview_cache_entries":recent.entries.len(),"preview_cache_hits":recent.hits,
         "preview_load_ms":pane.load_ms, "preview_error":pane.error,
         "video_seconds":pane.player.as_ref().map(|p| p.time()),
         "markdown_reader_visible":app.reader == Reader::Document,
         "reader_format":reader.document.as_ref().map(|d| format!("{:?}", d.format)),
+        "reader_slide":reader.document.as_ref().and_then(|doc| match doc.body {
+            Body::Slide { index, .. } => Some(index + 1),
+            _ => None,
+        }),
         "reader_rows":reader.document.as_ref().map(|d| d.rows()),
         "reader_truncated":reader.document.as_ref().map(|d| d.truncated),
         "markdown_reader_path":reader.path, "markdown_reader_state":state(reader),

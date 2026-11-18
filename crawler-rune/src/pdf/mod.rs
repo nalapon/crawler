@@ -16,12 +16,14 @@ use std::time::Duration;
 use rune::{Cx, El, Key, KeyEvent, Live, TextEdit, Tx, Waker};
 
 use crate::app::{App, Paint, Reader};
+use crate::funnel::model::DocumentKind;
 use model::*;
 use worker::{Command, Edit, Event, Worker};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 enum CloseIntent {
     Reader,
+    Open(PathBuf, DocumentKind),
     Window,
     Quit,
 }
@@ -31,7 +33,6 @@ pub struct State {
     sources: RefCell<HashMap<PathBuf, Source>>,
     preview_path: RefCell<Option<PathBuf>>,
     active: Option<PathBuf>,
-    destination: Option<PathBuf>,
     tool: Tool,
     ink: Ink,
     selected: Option<u64>,
@@ -41,10 +42,7 @@ pub struct State {
     note_open: bool,
     new_note: Option<TextRange>,
     close_prompt: Option<CloseIntent>,
-    close_after_save: Option<CloseIntent>,
-    close_after_discard: Option<CloseIntent>,
-    save_serial: u64,
-    closing_save: Option<u64>,
+    after_pending: Option<CloseIntent>,
     zoom: f32,
     pending_zoom: f32,
     zoom_live: Live<f32>,
@@ -70,7 +68,6 @@ impl Default for State {
             sources: RefCell::new(HashMap::new()),
             preview_path: RefCell::new(None),
             active: None,
-            destination: None,
             tool: Tool::Select,
             ink: Ink::Yellow,
             selected: None,
@@ -80,10 +77,7 @@ impl Default for State {
             note_open: false,
             new_note: None,
             close_prompt: None,
-            close_after_save: None,
-            close_after_discard: None,
-            save_serial: 0,
-            closing_save: None,
+            after_pending: None,
             zoom: 1.0,
             pending_zoom: 1.0,
             zoom_live: Live::new(1.0),
@@ -120,7 +114,13 @@ impl State {
 
     fn ensure(&self, path: &Path) -> PathBuf {
         let mut sources = self.sources.borrow_mut();
-        if sources.contains_key(path) {
+        if sources.get(path).is_some_and(|source| {
+            source
+                .saved_path
+                .as_deref()
+                .is_none_or(|saved| saved == path)
+                || source.has_edits()
+        }) {
             return path.into();
         }
         if let Some((key, _)) = sources
@@ -132,7 +132,7 @@ impl State {
         // Only the selected document needs a clean source. Unresolved edits remain owned.
         let released: Vec<_> = sources
             .iter()
-            .filter(|(_, s)| s.pending == 0 && !s.summary.as_ref().is_some_and(|s| s.dirty))
+            .filter(|(_, s)| !s.has_edits())
             .map(|(path, _)| path.clone())
             .collect();
         for old in released {
@@ -144,27 +144,30 @@ impl State {
         surface.poster_requested = true;
         let poster = surface.pixels.clone();
         let started = source.started;
+        let owner = Arc::downgrade(&source.owner);
         sources.insert(path.into(), source);
-        self.send(Command::Load(path.into(), started, poster));
+        self.send(Command::Load(path.into(), started, poster, owner));
         path.into()
     }
 
     fn dirty(&self) -> bool {
         self.active
             .as_ref()
-            .and_then(|path| {
-                self.sources
-                    .borrow()
-                    .get(path)
-                    .map(|s| s.pending > 0 || s.summary.as_ref().is_some_and(|s| s.dirty))
-            })
+            .and_then(|path| self.sources.borrow().get(path).map(Source::has_edits))
             .unwrap_or(false)
     }
 
+    fn operation_pending(&self) -> bool {
+        self.active.as_ref().is_some_and(|path| {
+            self.sources
+                .borrow()
+                .get(path)
+                .is_some_and(|source| source.pending > 0)
+        })
+    }
+
     fn edit(&mut self, edit: Edit) {
-        if self.closing_save.is_some()
-            || self.close_after_discard.is_some() && !matches!(&edit, Edit::Discard)
-        {
+        if self.after_pending.is_some() {
             return;
         }
         let Some(path) = self.active.clone() else {
@@ -224,12 +227,7 @@ pub fn poll(app: &mut App, tx: &mut Tx) -> bool {
         let visible = |path: &Path| {
             if app.reader == Reader::Pdf {
                 app.pdf.active.as_deref() == Some(path)
-            } else if app.reader == Reader::None
-                && matches!(
-                    app.section,
-                    crate::app::Section::Search | crate::app::Section::Folders
-                )
-            {
+            } else if app.reader == Reader::None {
                 app.pdf.preview_path.borrow().as_deref() == Some(path)
             } else {
                 false
@@ -237,11 +235,14 @@ pub fn poll(app: &mut App, tx: &mut Tx) -> bool {
         };
         match event {
             Event::Loaded {
+                owner,
                 path,
                 summary,
                 metrics,
             } => {
-                if let Some(source) = app.pdf.sources.borrow_mut().get_mut(&path) {
+                if owner.strong_count() > 0
+                    && let Some(source) = app.pdf.sources.borrow_mut().get_mut(&path)
+                {
                     source.summary = Some(summary);
                     source.metrics = metrics;
                     changed |= visible(&path);
@@ -294,7 +295,6 @@ pub fn poll(app: &mut App, tx: &mut Tx) -> bool {
                 }
             }
             Event::Saved {
-                serial,
                 path,
                 destination,
                 summary,
@@ -302,16 +302,9 @@ pub fn poll(app: &mut App, tx: &mut Tx) -> bool {
                 if let Some(source) = app.pdf.sources.borrow_mut().get_mut(&path) {
                     source.pending = source.pending.saturating_sub(1);
                     source.summary = Some(summary);
-                    source.saved_path = Some(destination.clone());
+                    source.saved_path = Some(destination);
                 }
-                app.pdf.destination = Some(destination);
                 app.toast("PDF saved");
-                if app.pdf.closing_save == Some(serial) {
-                    app.pdf.closing_save = None;
-                    if let Some(intent) = app.pdf.close_after_save.take() {
-                        finish_close(app, intent, tx);
-                    }
-                }
                 changed = true;
             }
             Event::Copied(text) => {
@@ -328,19 +321,19 @@ pub fn poll(app: &mut App, tx: &mut Tx) -> bool {
                     }
                     source.error = Some(message);
                 }
-                app.pdf.close_after_save = None;
-                app.pdf.closing_save = None;
-                app.pdf.close_after_discard = None;
+                if operation && app.pdf.active.as_ref() == Some(&path) {
+                    app.pdf.after_pending = None;
+                }
                 changed = true;
             }
         }
     }
-    if let Some(intent) = app.pdf.close_after_discard {
-        if !app.pdf.dirty() {
-            app.pdf.close_after_discard = None;
-            finish_close(app, intent, tx);
-            changed = true;
-        }
+    if app.pdf.after_pending.is_some()
+        && !app.pdf.operation_pending()
+        && let Some(intent) = app.pdf.after_pending.take()
+    {
+        request_close(app, intent, tx);
+        changed = true;
     }
     if let Some(at) = app.pdf.pinch_at {
         if app.clock - at >= 0.12 {
@@ -391,6 +384,17 @@ pub fn pane(app: &App, cx: &mut Cx<App>, p: &Paint, path: &Path, key: &str) -> E
 }
 
 /// Hidden panes drop their view surfaces; the worker retains reusable bitmaps within its budget.
+/// What the pane shows under an open reader: an empty panel. The reader owns the source's
+/// surfaces meanwhile, and a surface drawn in two places takes only one of them, so the pane
+/// neither requests nor draws a page until the reader's sheet is gone.
+pub fn still(p: &Paint, key: &str) -> El {
+    rune::col()
+        .key(key.to_owned())
+        .w_full()
+        .h_full()
+        .min_w(0.0)
+        .fill(p.look.raised)
+}
 pub fn suspend_preview(app: &App) {
     for source in app.pdf.sources.borrow_mut().values_mut() {
         for surface in source.surfaces.values_mut() {
@@ -408,7 +412,7 @@ pub fn release_previews(app: &mut App) {
     let mut sources = app.pdf.sources.borrow_mut();
     let released: Vec<_> = sources
         .iter()
-        .filter(|(_, s)| s.pending == 0 && !s.summary.as_ref().is_some_and(|s| s.dirty))
+        .filter(|(_, s)| !s.has_edits())
         .map(|(path, _)| path.clone())
         .collect();
     for path in released {
@@ -427,12 +431,13 @@ pub fn open_reader(app: &mut App, path: &Path, tx: &mut Tx) -> Result<(), String
             .unwrap_or_else(|| "The PDF worker is unavailable".into()));
     }
     let source = app.pdf.ensure(path);
-    app.pdf.destination = app
-        .pdf
-        .sources
-        .borrow()
-        .get(&source)
-        .and_then(|s| s.saved_path.clone());
+    // The pane's sharp crops are sized for the pane. Hide them, so the reader opens on the
+    // whole-page poster and not on a crop drawn where the pane had it.
+    if let Some(opened) = app.pdf.sources.borrow().get(&source) {
+        for surface in opened.surfaces.values() {
+            surface.crop.set([0.0; 4]);
+        }
+    }
     app.pdf.active = Some(source);
     app.pdf.zoom_to(1.0, tx);
     app.pdf.selected = None;
@@ -452,7 +457,7 @@ pub fn reader_view(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) 
 }
 
 pub fn reader_key(app: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
-    if app.pdf.closing_save.is_some() || app.pdf.close_after_discard.is_some() {
+    if app.pdf.after_pending.is_some() {
         return true;
     }
     if ev.key == Key::Escape && tx.key_repeat() {
@@ -576,6 +581,12 @@ pub fn reader_closed(app: &mut App) {
     }
     app.pdf.clear_stroke();
     app.pdf.note_open = false;
+    let closed = app.pdf.active.take();
+    // Hand the surfaces back to the visible pane only when it still shows this PDF.
+    if !crate::preview::pane_selection(app).is_some_and(|(path, _)| Some(path) == closed.as_deref())
+    {
+        release_previews(app);
+    }
 }
 
 /// Rune's current close callback cannot veto a native window close. The app's host should call
@@ -593,15 +604,57 @@ pub fn request_quit(app: &mut App, tx: &mut Tx) {
 }
 
 pub fn can_close(app: &mut App, tx: &mut Tx) -> bool {
-    if !app.pdf.dirty() && !app.pdf.note_open {
+    if !has_pending_changes(app) {
         return true;
     }
     request_close(app, CloseIntent::Window, tx);
     false
 }
 
+fn has_pending_changes(app: &App) -> bool {
+    app.pdf.note_open || app.pdf.sources.borrow().values().any(Source::has_edits)
+}
+
+/// A Finder open may arrive even while the current reader has a save dialog.
+pub(crate) fn defer_open(app: &mut App, path: &Path, kind: DocumentKind, tx: &mut Tx) -> bool {
+    if !has_pending_changes(app) {
+        return false;
+    }
+    request_close(app, CloseIntent::Open(path.to_owned(), kind), tx);
+    true
+}
+
 fn request_close(app: &mut App, intent: CloseIntent, tx: &mut Tx) {
-    if app.pdf.note_open || app.pdf.dirty() {
+    let current = app
+        .pdf
+        .after_pending
+        .as_ref()
+        .or(app.pdf.close_prompt.as_ref());
+    if matches!(current, Some(CloseIntent::Quit)) && intent != CloseIntent::Quit
+        || matches!(current, Some(CloseIntent::Window))
+            && matches!(intent, CloseIntent::Open(_, _) | CloseIntent::Reader)
+    {
+        return;
+    }
+    if !app.pdf.note_open && !app.pdf.dirty() && intent != CloseIntent::Reader {
+        let next = app
+            .pdf
+            .sources
+            .borrow()
+            .iter()
+            .find(|(_, source)| source.has_edits())
+            .map(|(path, _)| path.clone());
+        if let Some(path) = next
+            && let Err(error) = open_reader(app, &path, tx)
+        {
+            app.toast(error);
+            return;
+        }
+    }
+    if app.pdf.operation_pending() {
+        app.pdf.close_prompt = None;
+        app.pdf.after_pending = Some(intent);
+    } else if app.pdf.note_open || app.pdf.dirty() {
         app.pdf.close_prompt = Some(intent);
     } else {
         finish_close(app, intent, tx);
@@ -619,6 +672,9 @@ fn finish_close(app: &mut App, intent: CloseIntent, tx: &mut Tx) {
                 crate::funnel::focus_section(app, tx);
             }
         }
+        CloseIntent::Open(path, kind) => {
+            crate::opening::dispatch(app, path, kind, tx);
+        }
         CloseIntent::Window => tx.close_window(),
         CloseIntent::Quit => tx.quit(),
     }
@@ -631,8 +687,14 @@ fn save(app: &mut App, as_copy: bool, tx: &mut Tx) {
     let Some(path) = app.pdf.active.clone() else {
         return;
     };
+    let current = app
+        .pdf
+        .sources
+        .borrow()
+        .get(&path)
+        .and_then(|source| source.saved_path.clone())
+        .unwrap_or_else(|| path.clone());
     if as_copy {
-        let current = app.pdf.destination.as_deref().unwrap_or(&path);
         let options = rune::FileDialogOptions {
             title: "Save PDF as".into(),
             directory: current.parent().map(Path::to_path_buf),
@@ -642,40 +704,30 @@ fn save(app: &mut App, as_copy: bool, tx: &mut Tx) {
             ..Default::default()
         }
         .filter("PDF", &["pdf"]);
-        tx.save_file(options, |app: &mut App, result, _tx| match result {
-            Ok(Some(destination)) => save_to(app, destination),
-            Ok(None) => {
-                app.pdf.close_after_save = None;
+        if let Some(source) = app.pdf.sources.borrow_mut().get_mut(&path) {
+            source.pending += 1;
+        }
+        tx.save_file(options, move |app: &mut App, result, _tx| {
+            if let Some(source) = app.pdf.sources.borrow_mut().get_mut(&path) {
+                source.pending = source.pending.saturating_sub(1);
             }
-            Err(error) => {
-                app.pdf.error = Some(error.to_string());
-                app.pdf.close_after_save = None;
+            match result {
+                Ok(Some(destination)) => save_to(app, path.clone(), destination),
+                Ok(None) => {}
+                Err(error) => app.toast(error.to_string()),
             }
         });
     } else {
-        let destination = app.pdf.destination.clone().unwrap_or(path);
-        save_to(app, destination);
+        save_to(app, path, current);
     }
 }
 
-fn save_to(app: &mut App, destination: PathBuf) {
-    let Some(path) = app.pdf.active.clone() else {
-        return;
-    };
+fn save_to(app: &mut App, path: PathBuf, destination: PathBuf) {
     if let Some(source) = app.pdf.sources.borrow_mut().get_mut(&path) {
         source.pending += 1;
         source.error = None;
     }
-    app.pdf.save_serial += 1;
-    let serial = app.pdf.save_serial;
-    if app.pdf.close_after_save.is_some() {
-        app.pdf.closing_save = Some(serial);
-    }
-    app.pdf.send(Command::Save {
-        path,
-        destination,
-        serial,
-    });
+    app.pdf.send(Command::Save { path, destination });
 }
 
 pub fn report(app: &App) -> serde_json::Value {

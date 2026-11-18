@@ -5,6 +5,8 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
 
+pub const LIST_PADDING: f32 = 4.0;
+
 pub struct Chrome {
     rect: Live<[f32; 4]>,
     opacity: Live<f32>,
@@ -34,6 +36,29 @@ impl Chrome {
         self.interacted.set(false);
     }
 
+    /// File rows have a fixed height and no gap, so a jump needs no keyed layout lookup.
+    pub fn reveal_row(
+        &self,
+        index: usize,
+        height: f32,
+        scope: String,
+        id: &super::model::ItemID,
+        tx: &mut rune::Tx,
+    ) {
+        let pos = self.position.get();
+        if pos.viewport[1] <= 0.0 {
+            tx.scroll_into_view_in(scope, id.key());
+            return;
+        }
+        let top = LIST_PADDING + index as f32 * height;
+        let offset = pos.offset[1];
+        let bottom = top + height;
+        if top < offset {
+            tx.scroll_to_instant(scope, 0.0, top);
+        } else if bottom > offset + pos.viewport[1] {
+            tx.scroll_to_instant(scope, 0.0, bottom - pos.viewport[1]);
+        }
+    }
     pub fn half_page(&self, row_height: f32) -> isize {
         ((self.position.get().viewport[1] / row_height / 2.0) as isize).max(1)
     }
@@ -79,44 +104,46 @@ pub fn wrap(viewport: El, key: String, color: Color, chrome: Rc<Chrome>) -> El {
             false
         });
     let target = key.clone();
+    area(viewport, &key).child(
+        el().key(format!("{key}-thumb"))
+            .role("scrollbar")
+            .label("Scroll files")
+            .focusable(false)
+            .pin(Some(0.0), Some(0.0), None, None)
+            .size(5.0, 28.0)
+            .radius(3.0)
+            .fill(color)
+            .live_rect(&chrome.rect)
+            .live_opacity(chrome.opacity.smooth(rune::tok::motion::SNAPPY))
+            .on_drag_any(move |gesture, tx| {
+                tx.live_only();
+                let pos = drag.position.get();
+                match gesture.phase {
+                    Phase::Down => {
+                        drag.interacted.set(true);
+                        gesture.data = pos.offset[1];
+                        drag.mouse.set(true);
+                        drag.opacity.snap(1.0);
+                    }
+                    Phase::Move => {
+                        let track = (pos.drawn[1] - 8.0 - drag.rect.get()[3]).max(1.0);
+                        tx.scroll_to_instant(
+                            target.clone(),
+                            0.0,
+                            (gesture.data + gesture.dy * pos.max[1] / track).clamp(0.0, pos.max[1]),
+                        );
+                    }
+                    Phase::Up => drag.pulse(),
+                }
+            }),
+    )
+}
+
+pub(super) fn area(viewport: El, key: &str) -> El {
     col()
         .key(format!("{key}-scroll-area"))
         .w_full()
         .grow(1.0)
         .min_h(0.0)
         .child(viewport)
-        .child(
-            el().key(format!("{key}-thumb"))
-                .role("scrollbar")
-                .label("Scroll files")
-                .focusable(false)
-                .pin(Some(0.0), Some(0.0), None, None)
-                .size(5.0, 28.0)
-                .radius(3.0)
-                .fill(color)
-                .live_rect(&chrome.rect)
-                .live_opacity(chrome.opacity.smooth(rune::tok::motion::SNAPPY))
-                .on_drag_any(move |gesture, tx| {
-                    tx.live_only();
-                    let pos = drag.position.get();
-                    match gesture.phase {
-                        Phase::Down => {
-                            drag.interacted.set(true);
-                            gesture.data = pos.offset[1];
-                            drag.mouse.set(true);
-                            drag.opacity.snap(1.0);
-                        }
-                        Phase::Move => {
-                            let track = (pos.drawn[1] - 8.0 - drag.rect.get()[3]).max(1.0);
-                            tx.scroll_to_instant(
-                                target.clone(),
-                                0.0,
-                                (gesture.data + gesture.dy * pos.max[1] / track)
-                                    .clamp(0.0, pos.max[1]),
-                            );
-                        }
-                        Phase::Up => drag.pulse(),
-                    }
-                }),
-        )
 }

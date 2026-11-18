@@ -6,8 +6,8 @@ license = "MIT"
 build = "src/index/build.rs"
 
 [dependencies]
-rune = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90", features = ["tooling", "native-file-dialog"] }
-rune-kit = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90", features = ["markdown"] }
+rune = { git = "https://github.com/anomalyco/rune", rev = "044c5aafae62964c99ddface59cb733f834b61d2", features = ["tooling", "native-file-dialog"] }
+rune-kit = { git = "https://github.com/anomalyco/rune", rev = "044c5aafae62964c99ddface59cb733f834b61d2", features = ["markdown"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libc = "0.2"
@@ -47,9 +47,10 @@ cc = "1"
 
 # Rune patches these crates; an app that builds Rune must patch them too.
 [patch.crates-io]
-wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90" }
-winit = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90" }
-parley_engine = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90" }
+wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "044c5aafae62964c99ddface59cb733f834b61d2" }
+winit = { git = "https://github.com/anomalyco/rune", rev = "044c5aafae62964c99ddface59cb733f834b61d2" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "044c5aafae62964c99ddface59cb733f834b61d2" }
+accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "044c5aafae62964c99ddface59cb733f834b61d2" }
 
 # Pinned source copy exposes the snapshot API hidden by upstream's public SDK.
 [patch."https://github.com/dmtrKovalenko/fff"]

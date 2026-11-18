@@ -164,6 +164,7 @@ impl Default for Surface {
 }
 
 pub struct Source {
+    pub owner: std::sync::Arc<()>,
     pub summary: Option<Summary>,
     pub saved_path: Option<std::path::PathBuf>,
     pub pages: BTreeMap<usize, std::sync::Arc<Page>>,
@@ -179,10 +180,27 @@ pub struct Source {
     pub revision: u64,
 }
 
+impl Source {
+    pub fn has_edits(&self) -> bool {
+        self.pending > 0 || self.summary.as_ref().is_some_and(|s| s.dirty)
+    }
+}
+
+impl Drop for Source {
+    fn drop(&mut self) {
+        for surface in self.surfaces.values() {
+            surface
+                .epoch
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 impl Default for Source {
     fn default() -> Self {
         Self {
             summary: None,
+            owner: Default::default(),
             saved_path: None,
             pages: BTreeMap::new(),
             surfaces: BTreeMap::new(),

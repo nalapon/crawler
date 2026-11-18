@@ -1,5 +1,6 @@
 use super::sampling::Process;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -58,12 +59,7 @@ impl Metric {
 pub struct Group {
     pub id: String,
     pub name: String,
-    pub processes: Vec<Process>,
-}
-impl Group {
-    pub fn value(&self, metric: Metric) -> Option<f64> {
-        sum(self.processes.iter().map(|p| metric.value(p)))
-    }
+    pub processes: Vec<Arc<Process>>,
 }
 pub fn sum(values: impl Iterator<Item = Option<f64>>) -> Option<f64> {
     values.flatten().reduce(|a, b| a + b)
@@ -73,7 +69,7 @@ fn application(p: &Process) -> Option<String> {
         .find(".app/")
         .map(|i| p.executable[..i + 4].to_string())
 }
-pub fn groups(processes: &[Process], query: &str) -> Vec<Group> {
+pub fn groups(processes: &[Arc<Process>], query: &str) -> Vec<Group> {
     let by_pid: HashMap<_, _> = processes.iter().map(|p| (p.id.pid, p)).collect();
     let root = |p: &Process| {
         let mut current = p;
@@ -100,7 +96,7 @@ pub fn groups(processes: &[Process], query: &str) -> Vec<Group> {
         } else {
             root(p)
         };
-        if !matches(query, &format!("{name} {} {}", p.name, p.id.pid)) {
+        if !query.is_empty() && !matches(query, &format!("{name} {} {}", p.name, p.id.pid)) {
             continue;
         }
         grouped
@@ -179,7 +175,7 @@ pub struct ListRow {
     pub group: String,
     pub name: String,
     pub subtitle: String,
-    pub processes: Vec<Process>,
+    pub processes: Vec<Arc<Process>>,
     pub child: bool,
 }
 impl ListRow {
@@ -188,87 +184,133 @@ impl ListRow {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub struct Node {
     pub id: String,
     pub name: String,
     pub value: f64,
-    pub processes: Vec<Process>,
-    pub children: Vec<Node>,
+    // Every sampled process occurs at one leaf, including processes with no measured usage.
+    pub process: Option<Arc<Process>>,
+    children: Vec<Node>,
 }
-pub fn forest(processes: &[Process], metric: Metric) -> Vec<Node> {
-    let ids: HashSet<_> = processes.iter().map(|p| p.id.pid).collect();
-    fn node(p: &Process, all: &[Process], m: Metric, seen: &mut HashSet<i32>) -> Node {
-        seen.insert(p.id.pid);
-        let mut children = Vec::new();
-        let mut members = vec![p.clone()];
-        for child in all
-            .iter()
-            .filter(|c| c.parent == p.id.pid && c.id.pid != p.id.pid)
-        {
-            if seen.contains(&child.id.pid) {
-                continue;
-            }
-            let n = node(child, all, m, seen);
-            members.extend(n.processes.iter().cloned());
-            children.push(n);
-        }
-        let own = m.value(p).unwrap_or(0.0);
-        let value = own + children.iter().map(|n| n.value).sum::<f64>();
-        if !children.is_empty() {
-            children.insert(
-                0,
-                Node {
-                    id: format!("own:{}", p.id.key()),
-                    name: p.name.clone(),
-                    value: own,
-                    processes: vec![p.clone()],
-                    children: vec![],
-                },
-            );
-        }
-        Node {
-            id: p.id.key(),
-            name: p.name.clone(),
+
+impl Node {
+    pub fn group(id: String, name: String, children: Vec<Node>) -> Self {
+        let value = children.iter().map(|n| n.value).sum();
+        let children = limited(children, &id);
+        Self {
+            id,
+            name,
             value,
-            processes: members,
+            process: None,
             children,
         }
     }
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for p in processes
-        .iter()
-        .filter(|p| !ids.contains(&p.parent) || p.parent == p.id.pid)
-    {
-        out.push(node(p, processes, metric, &mut seen));
+
+    pub fn visible(&self) -> &[Node] {
+        &self.children[..self.children.partition_point(|n| n.value > 0.0)]
     }
-    for p in processes {
-        if !seen.contains(&p.id.pid) {
-            out.push(node(p, processes, metric, &mut seen));
+
+    pub fn members(&self, into: &mut Vec<Arc<Process>>) {
+        if let Some(process) = &self.process {
+            into.push(process.clone());
+        }
+        for node in &self.children {
+            node.members(into);
         }
     }
-    out
 }
-pub fn limited(mut nodes: Vec<Node>, parent: &str) -> Vec<Node> {
-    nodes.retain(|n| n.value > 0.0);
-    nodes.sort_by(|a, b| {
-        b.value
-            .total_cmp(&a.value)
-            .then_with(|| a.name.cmp(&b.name))
-    });
-    if nodes.len() > 8 {
-        let tail = nodes.split_off(8);
-        nodes.push(Node {
-            id: format!("remainder:{parent}"),
-            name: format!("{} more processes", tail.len()),
-            value: tail.iter().map(|n| n.value).sum(),
-            processes: tail
-                .iter()
-                .flat_map(|n| n.processes.iter().cloned())
-                .collect(),
-            children: tail,
-        });
+
+pub fn forest(processes: &[Arc<Process>], metric: Metric) -> Vec<Node> {
+    let mut by_parent: HashMap<i32, Vec<&Arc<Process>>> = HashMap::new();
+    let ids: HashSet<_> = processes.iter().map(|p| p.id.pid).collect();
+    for process in processes {
+        if process.id.pid != process.parent {
+            by_parent.entry(process.parent).or_default().push(process);
+        }
     }
-    nodes
+    fn node(
+        p: &Arc<Process>,
+        by_parent: &HashMap<i32, Vec<&Arc<Process>>>,
+        metric: Metric,
+        seen: &mut HashSet<i32>,
+    ) -> Option<Node> {
+        if !seen.insert(p.id.pid) {
+            return None;
+        }
+        let mut children: Vec<_> = by_parent
+            .get(&p.id.pid)
+            .into_iter()
+            .flatten()
+            .filter_map(|child| node(child, by_parent, metric, seen))
+            .collect();
+        let id = p.id.key();
+        let mut own = Node {
+            id: id.clone(),
+            name: p.name.clone(),
+            value: metric.value(p).unwrap_or(0.0),
+            process: Some(p.clone()),
+            children: vec![],
+        };
+        if children.is_empty() {
+            return Some(own);
+        }
+        own.id = format!("own:{id}");
+        children.push(own);
+        Some(Node::group(id, p.name.clone(), children))
+    }
+    let mut seen = HashSet::new();
+    // Visit disconnected cycles too, once every ordinary root is accounted for.
+    processes
+        .iter()
+        .filter(|p| !ids.contains(&p.parent) || p.parent == p.id.pid)
+        .chain(processes)
+        .filter_map(|p| node(p, &by_parent, metric, &mut seen))
+        .collect()
+}
+
+fn order(a: &Node, b: &Node) -> std::cmp::Ordering {
+    b.value
+        .total_cmp(&a.value)
+        .then_with(|| a.name.cmp(&b.name))
+}
+
+/// Sort siblings once per sample; keep zero-valued leaves for process inspection.
+fn limited(mut nodes: Vec<Node>, parent: &str) -> Vec<Node> {
+    nodes.sort_by(order);
+    let count = nodes.partition_point(|n| n.value > 0.0);
+    if count <= 8 {
+        return nodes;
+    }
+    let hidden = nodes.split_off(count);
+    let mut visible = nodes.into_iter();
+    fn chunk(nodes: &mut std::vec::IntoIter<Node>, parent: &str) -> Vec<Node> {
+        let mut head: Vec<_> = nodes.by_ref().take(8).collect();
+        let remaining = nodes.len();
+        if remaining > 0 {
+            let id = format!("remainder:{parent}");
+            let children = chunk(nodes, &id);
+            head.push(Node {
+                id,
+                name: format!("{remaining} more processes"),
+                value: children.iter().map(|n| n.value).sum(),
+                process: None,
+                children,
+            });
+        }
+        head
+    }
+    let mut result = chunk(&mut visible, parent);
+    result.extend(hidden);
+    result
+}
+
+pub fn roots(mut groups: Vec<Node>) -> Vec<Node> {
+    groups.retain(|n| n.value > 0.0);
+    groups.sort_by(order);
+    if groups.len() > 14 {
+        let rest = groups.split_off(14);
+        groups.push(Node::group("other".into(), "Other processes".into(), rest));
+    }
+    groups
 }

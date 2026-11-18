@@ -182,6 +182,29 @@ pub fn fuzzy_match_and_score_files<'a>(
     sort_and_paginate(results, context, |score| score.total)
 }
 
+/// Visit every scored match in a single arena without sorting or building a page.
+/// Crawler needs all matches for scope counts and applies its own top-K order.
+pub fn visit_match_scores<'a>(
+    files: &'a [FileItem],
+    context: &ScoringContext,
+    arena: ArenaPtr,
+    mut visit: impl FnMut(&'a FileItem, i32),
+) {
+    if fuzzy_parts(context.query).is_none() {
+        if let Some(working_files) = filter_by_constraints(files, context, arena) {
+            let mut totals = Vec::new();
+            frecency_totals(&working_files, context, arena, &mut totals);
+            for (file, total) in totals {
+                visit(file, total);
+            }
+        }
+    } else {
+        for (file, score) in match_and_score_in_arena(files, context, arena) {
+            visit(file, score.total);
+        }
+    }
+}
+
 // Ranks on a 16-byte (file, total) pair and builds the full Score only for the page.
 fn rank_by_frecency<'a>(
     files: &'a [FileItem],

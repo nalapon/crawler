@@ -17,22 +17,16 @@ use super::{
     worker::{Command, Edit},
 };
 
-fn paint(app: &App) -> Paint {
-    let look = app.look();
-    Paint {
-        kit: look.kit(),
-        look,
-    }
-}
-
 pub fn reader(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) -> El {
     let Some(path) = app.pdf.active.as_ref() else {
         return col().key("pdf-reader");
     };
     let filename = app
         .pdf
-        .destination
-        .as_deref()
+        .sources
+        .borrow()
+        .get(path)
+        .and_then(|s| s.saved_path.as_deref())
         .unwrap_or(path)
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -255,7 +249,7 @@ pub fn reader(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) -> El
                 .on_press_tx(|a: &mut App, tx| save(a, false, tx)),
         );
     let tools = col()
-        .disabled(app.pdf.closing_save.is_some() || app.pdf.close_after_discard.is_some())
+        .disabled(app.pdf.after_pending.is_some())
         .key("pdf-tools")
         .w_full()
         .h(40.0)
@@ -331,7 +325,16 @@ pub fn preview(app: &App, cx: &mut Cx<App>, p: &Paint, path: &Path, key: &str) -
 }
 
 fn pages(app: &App, cx: &mut Cx<App>, p: &Paint, path: &Path) -> El {
-    let width = cx.layout_size("pdf-scroll").map(|s| s[0]).unwrap_or(1180.0);
+    // The reader's sheet spans the window. Its own viewport isn't laid out on the frame it
+    // opens, and the pane's viewport shares the key, so the reader takes the window's width:
+    // otherwise the page sits at the pane's width until the sheet has slid in.
+    let window = cx.layout_size("workspace");
+    let width = if app.pdf_sheet_shown() {
+        window
+    } else {
+        cx.layout_size("pdf-scroll")
+    }
+    .map_or(1180.0, |size| size[0]);
     let device_scale = cx.env().scale;
     let summary = app
         .pdf
@@ -354,13 +357,33 @@ fn pages(app: &App, cx: &mut Cx<App>, p: &Paint, path: &Path) -> El {
             .child(text(error.unwrap_or_else(|| "Loading PDF…".into())).color(p.look.muted));
     };
     let page_width = (width - 32.0).max(200.0) * app.pdf.zoom;
+    // Rune reports a page's drawn rectangle only once the sheet has stopped sliding, which
+    // left the reader on the soft poster for the whole slide. The reader opens at the top
+    // of the first page with no zoom, so that page's place is known: ask for it now.
+    if app.reader == crate::app::Reader::Pdf
+        && app.pdf.zoom == 1.0
+        && app.pdf.scroll.get() == [0.0; 2]
+    {
+        if let Some(window) = window {
+            let height = (summary.first_size[1] / summary.first_size[0]) as f32 * page_width;
+            request_raster(
+                &app.pdf,
+                path,
+                0,
+                [16.0, 16.0, page_width, height],
+                [0.0, 0.0, window[0], window[1]],
+                device_scale,
+            );
+        }
+    }
     let estimate = (summary.first_size[1] / summary.first_size[0]) as f32 * page_width + 16.0;
+    let paint = p.clone();
     let build_path = path.to_path_buf();
     let visible_path = path.to_path_buf();
     let offset = app.pdf.scroll.clone();
     let last_scroll = app.pdf.last_scroll.clone();
     let scroll_clock = app.pdf.scroll_clock.clone();
-    let preview = app.reader != crate::app::Reader::Pdf;
+    let preview = !app.pdf_sheet_shown();
     let retain_worker = app.pdf.worker.as_ref().map(|w| w.send.clone());
     let rows = col()
         .key("pdf-pages")
@@ -372,7 +395,6 @@ fn pages(app: &App, cx: &mut Cx<App>, p: &Paint, path: &Path) -> El {
             estimate,
             |_: &App, i| format!("pdf-page-{i}").into(),
             move |a: &App, i| {
-                let p = paint(a);
                 col()
                     .key(format!("pdf-page-{i}"))
                     .w_full()
@@ -381,7 +403,7 @@ fn pages(app: &App, cx: &mut Cx<App>, p: &Paint, path: &Path) -> El {
                     .pb(0.0)
                     .child(page(
                         a,
-                        &p,
+                        &paint,
                         &build_path,
                         i,
                         page_width,
@@ -561,7 +583,14 @@ fn page(
             if let Some(source) = a.pdf.sources.borrow_mut().get_mut(&render_path) {
                 source.drawn.insert(index, rect);
             }
-            request_raster(&a.pdf, &render_path, index, rect, device_scale);
+            request_raster(
+                &a.pdf,
+                &render_path,
+                index,
+                rect,
+                a.pdf.viewport.get(),
+                device_scale,
+            );
             tx.live_only();
         });
     if let Some(content) = content {
@@ -684,9 +713,15 @@ fn scaled(rect: Rect, scale: f64) -> [f32; 4] {
 
 /// A low-resolution whole page appears first. Sharp rendering covers only the viewport's
 /// intersection with the page, with a margin, and stays below 16 million pixels per request.
-fn request_raster(state: &State, path: &Path, index: usize, drawn: [f32; 4], device_scale: f32) {
+fn request_raster(
+    state: &State,
+    path: &Path,
+    index: usize,
+    drawn: [f32; 4],
+    viewport: [f32; 4],
+    device_scale: f32,
+) {
     let started = Instant::now();
-    let viewport = state.viewport.get();
     let mut sources = state.sources.borrow_mut();
     let Some(source) = sources.get_mut(path) else {
         return;
@@ -1044,7 +1079,7 @@ fn overlays(app: &App, p: &Paint, layer: &mut Vec<El>) {
             8.0,
         ));
     }
-    if let Some(intent) = app.pdf.close_prompt {
+    if app.pdf.close_prompt.is_some() {
         Dialog::new("pdf-unsaved", "Save changes to this PDF?")
             .description("Your annotations have not been saved.")
             .open(true)
@@ -1059,9 +1094,8 @@ fn overlays(app: &App, p: &Paint, layer: &mut Vec<El>) {
                     .child(
                         shell_button(p, "pdf-close-discard", "Discard changes", false).on_press_tx(
                             move |a: &mut App, tx| {
-                                a.pdf.close_after_discard = Some(intent);
-                                a.pdf.close_prompt = None;
                                 a.pdf.edit(Edit::Discard);
+                                a.pdf.after_pending = a.pdf.close_prompt.take();
                                 a.pdf.note_open = false;
                                 a.pdf.clear_stroke();
                                 tx.wake_after(std::time::Duration::from_millis(1));
@@ -1074,9 +1108,8 @@ fn overlays(app: &App, p: &Paint, layer: &mut Vec<El>) {
                     )
                     .child(shell_button(p, "pdf-close-save", "Save", true).on_press_tx(
                         move |a: &mut App, tx| {
-                            a.pdf.close_after_save = Some(intent);
-                            a.pdf.close_prompt = None;
                             save(a, false, tx);
+                            a.pdf.after_pending = a.pdf.close_prompt.take();
                         },
                     )),
             )

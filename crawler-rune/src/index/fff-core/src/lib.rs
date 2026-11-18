@@ -181,6 +181,8 @@ pub use fff_query_parser::*;
 // Crawler's snapshot adapter. Production scoring and storage above remain upstream.
 pub mod crawler {
     pub use crate::simd_path::{ArenaPtr, ChunkedPathStore, ChunkedPathStoreBuilder, ChunkedString, MAX_PATH_CHUNKS};
-    pub use crate::score::{fuzzy_match_and_score_files, fuzzy_match_byte_offsets_for_page};
+    pub use crate::score::{
+        fuzzy_match_and_score_files, fuzzy_match_byte_offsets_for_page, visit_match_scores,
+    };
     pub fn set_path(file: &mut crate::FileItem, path: ChunkedString) { file.set_path(path); }
 }

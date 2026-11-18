@@ -56,7 +56,7 @@ pub enum Edit {
 }
 
 pub enum Command {
-    Load(PathBuf, Instant, NativeSurface),
+    Load(PathBuf, Instant, NativeSurface, std::sync::Weak<()>),
     Retain {
         path: PathBuf,
         pages: std::ops::Range<usize>,
@@ -75,7 +75,6 @@ pub enum Command {
         edit: Edit,
     },
     Save {
-        serial: u64,
         path: PathBuf,
         destination: PathBuf,
     },
@@ -88,6 +87,7 @@ pub enum Command {
 
 pub enum Event {
     Loaded {
+        owner: std::sync::Weak<()>,
         path: PathBuf,
         summary: Summary,
         metrics: Metrics,
@@ -106,7 +106,6 @@ pub enum Event {
         pages: BTreeMap<usize, Page>,
     },
     Saved {
-        serial: u64,
         path: PathBuf,
         destination: PathBuf,
         summary: Summary,
@@ -164,7 +163,7 @@ impl Worker {
                         while let Ok(work) = commands.recv() {
                             autoreleasepool(|_| {
                                 match &work.command {
-                                    Command::Load(path, _, _) => {
+                                    Command::Load(path, ..) => {
                                         *owners.entry(path.clone()).or_default() += 1
                                     }
                                     Command::Release(path) => {
@@ -236,7 +235,7 @@ impl Worker {
 
 fn handle(command: Command, documents: &mut HashMap<PathBuf, Document>) -> Vec<Event> {
     let (path, operation) = match &command {
-        Command::Load(path, _, _) | Command::Release(path) => (path.clone(), false),
+        Command::Load(path, ..) | Command::Release(path) => (path.clone(), false),
         Command::Render { path, .. } => (path.clone(), false),
         Command::Copy { path, .. } | Command::Retain { path, .. } => (path.clone(), false),
         Command::Edit { path, .. } | Command::Save { path, .. } => (path.clone(), true),
@@ -247,9 +246,16 @@ fn handle(command: Command, documents: &mut HashMap<PathBuf, Document>) -> Vec<E
             documents.remove(&path);
             return Ok(Vec::new());
         }
+        match &command {
+            Command::Load(_, _, _, owner) if owner.strong_count() == 0 => return Ok(Vec::new()),
+            Command::Render {
+                epoch, generation, ..
+            } if epoch.load(Ordering::Relaxed) != *generation => return Ok(Vec::new()),
+            _ => {}
+        }
         if !documents.contains_key(&path) {
             let mut doc = Document::open(&path)?;
-            if let Command::Load(_, requested, _) = &command {
+            if let Command::Load(_, requested, ..) = &command {
                 doc.started = *requested;
             }
             documents.insert(path.clone(), doc);
@@ -258,7 +264,7 @@ fn handle(command: Command, documents: &mut HashMap<PathBuf, Document>) -> Vec<E
             .get_mut(&path)
             .ok_or("PDF worker lost its document")?;
         match command {
-            Command::Load(_, _, poster) => {
+            Command::Load(_, _, poster, owner) => {
                 let size = doc.geometry(0)?.size;
                 let key = RasterKey {
                     page: 0,
@@ -269,9 +275,13 @@ fn handle(command: Command, documents: &mut HashMap<PathBuf, Document>) -> Vec<E
                     height: (480.0 * size[1] / size[0]).ceil().min(8192.0) as u32,
                 };
                 let bitmap = doc.render(key)?;
+                if owner.strong_count() == 0 {
+                    return Ok(Vec::new());
+                }
                 poster.push(bitmap.pixels, 0)?;
                 doc.rendered(false);
                 Ok(vec![Event::Loaded {
+                    owner,
                     path,
                     summary: doc.summary(),
                     metrics: doc.metrics.clone(),
@@ -329,14 +339,9 @@ fn handle(command: Command, documents: &mut HashMap<PathBuf, Document>) -> Vec<E
                     pages,
                 }])
             }
-            Command::Save {
-                destination,
-                serial,
-                ..
-            } => {
+            Command::Save { destination, .. } => {
                 doc.save(&destination)?;
                 Ok(vec![Event::Saved {
-                    serial,
                     path,
                     destination,
                     summary: doc.summary(),
@@ -1121,7 +1126,9 @@ impl Document {
                 .create_new(true)
                 .open(&temporary)
                 .map_err(|e| e.to_string())?;
-            file.write_all(&data.to_vec()).map_err(|e| e.to_string())?;
+            // PDFKit returned immutable NSData owned on this thread for the entire write.
+            file.write_all(unsafe { data.as_bytes_unchecked() })
+                .map_err(|e| e.to_string())?;
             if let Ok(metadata) = fs::metadata(destination) {
                 file.set_permissions(metadata.permissions())
                     .map_err(|e| e.to_string())?;

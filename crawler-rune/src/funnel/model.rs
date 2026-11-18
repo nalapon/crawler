@@ -50,23 +50,40 @@ pub enum DocumentKind {
     Word,
     /// Workbooks and delimited text shown as a grid.
     Sheet,
+    PowerPoint,
     Text,
     Image,
     Video,
     Audio,
     Package,
-    Other,
+    Other(FileType),
+}
+/// File types that appear in lists and Quick Look but have no full-window reader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileType {
+    Archive,
+    DiskImage,
+    Font,
+    Presentation,
+    Ebook,
+    Binary,
+    Pages,
+    Numbers,
+    Unknown,
 }
 impl DocumentKind {
     pub fn for_path(path: &Path, directory: bool) -> Self {
-        let ext = path
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+        let lower;
+        let ext = if ext.bytes().any(|b| b.is_ascii_uppercase()) {
+            lower = ext.to_ascii_lowercase();
+            lower.as_str()
+        } else {
+            ext
+        };
         if directory {
             return if matches!(
-                ext.as_str(),
+                ext,
                 "app" | "bundle" | "framework" | "plugin" | "rtfd" | "pages" | "numbers" | "key"
             ) {
                 Self::Package
@@ -74,17 +91,32 @@ impl DocumentKind {
                 Self::Folder
             };
         }
-        match ext.as_str() {
+        match ext {
             "pdf" => Self::Pdf,
             "md" | "markdown" | "mdown" | "mkd" => Self::Markdown,
             "docx" | "docm" | "dotx" | "doc" | "rtf" | "odt" => Self::Word,
             "xlsx" | "xlsm" | "xlsb" | "xls" | "ods" | "csv" | "tsv" => Self::Sheet,
+            "pptx" => Self::PowerPoint,
             "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "heif" | "tif" | "tiff" | "bmp"
             | "ico" | "svg" | "avif" => Self::Image,
             "mp4" | "m4v" | "mov" | "mkv" | "webm" | "avi" | "mpg" | "mpeg" | "mts" | "m2ts"
             | "ogv" | "wmv" | "flv" => Self::Video,
             "mp3" | "m4a" | "wav" | "flac" | "ogg" | "aiff" => Self::Audio,
             "txt" | "text" | "log" | "ini" | "conf" | "cfg" | "env" | "mod" | "sum" => Self::Text,
+            "zip" | "tar" | "gz" | "bz2" | "xz" | "zst" | "7z" | "rar" | "tgz" | "pkg" => {
+                Self::Other(FileType::Archive)
+            }
+            "dmg" | "iso" | "img" | "sparseimage" | "sparsebundle" => {
+                Self::Other(FileType::DiskImage)
+            }
+            "otf" | "ttf" | "ttc" | "woff" | "woff2" => Self::Other(FileType::Font),
+            "ppt" | "pps" | "ppsx" | "odp" | "key" => Self::Other(FileType::Presentation),
+            "epub" | "mobi" | "azw" | "azw3" => Self::Other(FileType::Ebook),
+            "o" | "a" | "so" | "dylib" | "dll" | "exe" | "rlib" | "rmeta" => {
+                Self::Other(FileType::Binary)
+            }
+            "pages" => Self::Other(FileType::Pages),
+            "numbers" => Self::Other(FileType::Numbers),
             _ if rune_kit::syntax::lang_for_path(&path.to_string_lossy()).is_some() => Self::Text,
             _ if matches!(
                 path.file_name()
@@ -106,7 +138,7 @@ impl DocumentKind {
             {
                 Self::Text
             }
-            _ => Self::Other,
+            _ => Self::Other(FileType::Unknown),
         }
     }
     pub fn label(self) -> &'static str {
@@ -116,10 +148,18 @@ impl DocumentKind {
             Self::Markdown => "Markdown",
             Self::Word => "Word document",
             Self::Sheet => "Spreadsheet",
-            Self::Text | Self::Other => "File",
+            Self::Text | Self::Other(FileType::Unknown) => "File",
             Self::Image => "Image",
             Self::Video => "Video",
             Self::Audio => "Audio",
+            Self::Other(FileType::Archive) => "Archive",
+            Self::Other(FileType::DiskImage) => "Disk image",
+            Self::Other(FileType::Font) => "Font",
+            Self::PowerPoint | Self::Other(FileType::Presentation) => "Presentation",
+            Self::Other(FileType::Ebook) => "E-book",
+            Self::Other(FileType::Binary) => "Binary",
+            Self::Other(FileType::Pages) => "Pages document",
+            Self::Other(FileType::Numbers) => "Spreadsheet",
             Self::Package => "Application or package",
         }
     }
@@ -128,7 +168,6 @@ impl DocumentKind {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Item {
     pub id: ItemID,
-    pub name: String,
     pub kind: DocumentKind,
     pub size: Option<u64>,
     pub modified: Option<SystemTime>,
@@ -140,7 +179,18 @@ pub struct Item {
 }
 impl Item {
     pub fn read(path: &Path) -> Result<Self, String> {
-        let path = standardized(path);
+        Self::read_entry(standardized(path))
+    }
+
+    pub fn name(&self) -> std::borrow::Cow<'_, str> {
+        self.id
+            .0
+            .file_name()
+            .unwrap_or(self.id.0.as_os_str())
+            .to_string_lossy()
+    }
+
+    pub(super) fn read_entry(path: PathBuf) -> Result<Self, String> {
         use std::os::macos::fs::MetadataExt;
         let link = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
         let symlink = link.is_symlink();
@@ -160,8 +210,7 @@ impl Item {
             kind = DocumentKind::Package;
         }
         Ok(Self {
-            name: name(&path),
-            id: ItemID::new(&path),
+            id: ItemID(path),
             kind,
             size: meta.as_ref().filter(|m| m.is_file()).map(|m| m.len()),
             modified: meta.as_ref().and_then(|m| m.modified().ok()),
@@ -175,7 +224,6 @@ impl Item {
     pub fn from_hit(hit: &crate::index::Hit) -> Self {
         Self {
             id: ItemID::new(&hit.path),
-            name: name(&hit.path),
             kind: DocumentKind::for_path(&hit.path, hit.is_dir),
             size: None,
             modified: None,
@@ -256,7 +304,11 @@ pub struct Sort {
     pub descending: bool,
 }
 impl Sort {
-    pub fn apply(self, items: &mut [Item]) {
+    pub fn order(
+        self,
+        items: &[Item],
+        sizes: Option<&std::collections::HashMap<ItemID, u64>>,
+    ) -> Vec<usize> {
         use std::cmp::Ordering;
         fn optional<T: Ord>(a: Option<T>, b: Option<T>, desc: bool) -> Ordering {
             match (a, b) {
@@ -272,14 +324,19 @@ impl Sort {
                 (None, None) => Ordering::Equal,
             }
         }
-        items.sort_by(|a, b| {
+        let size = |i: &Item| i.size.or_else(|| sizes?.get(&i.id).copied());
+        let mut order: Vec<_> = (0..items.len()).collect();
+        order.sort_by(|&a, &b| {
+            let (a, b) = (&items[a], &items[b]);
             let folders = (b.kind == DocumentKind::Folder).cmp(&(a.kind == DocumentKind::Folder));
             if folders != Ordering::Equal {
                 return folders;
             }
-            let by = match self.field {
+            // Library snapshots already use natural name order. The stable sort preserves
+            // that order when the requested field ties.
+            match self.field {
                 SortField::Name => {
-                    let order = rune_kit::natural_cmp(&a.name, &b.name);
+                    let order = rune_kit::natural_cmp(&a.name(), &b.name());
                     if self.descending {
                         order.reverse()
                     } else {
@@ -288,7 +345,7 @@ impl Sort {
                 }
                 SortField::Modified => optional(a.modified, b.modified, self.descending),
                 SortField::Created => optional(a.created, b.created, self.descending),
-                SortField::Size => optional(a.size, b.size, self.descending),
+                SortField::Size => optional(size(a), size(b), self.descending),
                 SortField::Kind => {
                     let order = rune_kit::natural_cmp(a.kind.label(), b.kind.label());
                     if self.descending {
@@ -297,8 +354,8 @@ impl Sort {
                         order
                     }
                 }
-            };
-            by.then_with(|| rune_kit::natural_cmp(&a.name, &b.name))
+            }
         });
+        order
     }
 }

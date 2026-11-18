@@ -4,11 +4,15 @@ use fff_search::crawler::{
 };
 use memmap2::Mmap;
 use objc2_foundation::{NSLocale, NSString, NSStringCompareOptions};
-use std::{ops::Range, sync::Arc};
+use std::{
+    ops::Range,
+    sync::{Arc, OnceLock},
+};
 use unicode_normalization::UnicodeNormalization;
 use unicode_segmentation::UnicodeSegmentation;
 
 pub const BATCH: usize = 2048;
+const _: () = assert!(BATCH < u16::MAX as usize);
 pub const REVISION: &str = "c188e7a8f90e4ee4aabe18f93d5869dfb4289f12";
 
 pub fn folded(text: &str) -> String {
@@ -42,6 +46,26 @@ impl Entry {
         self.start as usize..self.start as usize + usize::from(self.length)
     }
 }
+/// Row offsets of the lexicographically first and last original paths.
+#[derive(Default)]
+struct Bounds {
+    first: u16,
+    last: u16,
+}
+impl Bounds {
+    fn include(&mut self, entries: &[Entry], bytes: &[u8], path: &str) {
+        if entries.is_empty() {
+            return;
+        }
+        let row = entries.len() as u16;
+        if path.as_bytes() < &bytes[entries[self.first as usize].range()] {
+            self.first = row;
+        }
+        if path.as_bytes() > &bytes[entries[self.last as usize].range()] {
+            self.last = row;
+        }
+    }
+}
 enum Originals {
     Owned(Vec<u8>),
     Mapped(Arc<Mmap>),
@@ -51,6 +75,7 @@ enum Prepared {
     Mapped {
         map: Arc<Mmap>,
         chunks: Range<usize>,
+        encoded_block: Option<Range<usize>>,
         indices: Range<usize>,
     },
 }
@@ -59,12 +84,17 @@ pub struct Snapshot {
     original_start: usize,
     originals: Originals,
     entries: Vec<Entry>,
+    // Built only when a filesystem change needs a subtree lookup. Two bytes per path.
+    sorted_rows: OnceLock<Vec<u16>>,
+    bounds: Bounds,
     pub paths: Vec<ChunkedString>,
     prepared: Prepared,
 }
 impl Snapshot {
     pub fn build(rows: &[(String, bool)]) -> Self {
+        assert!(rows.len() <= BATCH, "bounded snapshot");
         let mut originals = Vec::new();
+        let mut bounds = Bounds::default();
         let mut entries = Vec::new();
         let mut builder = ChunkedPathStoreBuilder::new(rows.len());
         let mut paths = Vec::new();
@@ -77,6 +107,7 @@ impl Snapshot {
                 continue;
             }
             let start = u32::try_from(originals.len()).expect("bounded snapshot offsets");
+            bounds.include(&entries, &originals, path);
             originals.extend_from_slice(path.as_bytes());
             entries.push(Entry {
                 start,
@@ -93,6 +124,8 @@ impl Snapshot {
             original_start: 0,
             originals: Originals::Owned(originals),
             entries,
+            sorted_rows: OnceLock::new(),
+            bounds,
             paths,
             prepared: Prepared::Owned(builder.finish()),
         }
@@ -111,6 +144,70 @@ impl Snapshot {
         // entry offsets and immutable backing allocation preserve those boundaries.
         unsafe { std::str::from_utf8_unchecked(&bytes[start..start + usize::from(entry.length)]) }
     }
+    /// A cheap exclusion check for an exact path or its slash-delimited descendants.
+    pub fn may_overlap_prefix(&self, prefix: &str) -> bool {
+        if self.len() == 0 {
+            return false;
+        }
+        let first = self.path(self.bounds.first as usize);
+        let last = self.path(self.bounds.last as usize);
+        last >= prefix
+            && (first <= prefix
+                || first
+                    .strip_prefix(prefix)
+                    .and_then(|tail| tail.as_bytes().first())
+                    .is_some_and(|b| *b <= b'/'))
+    }
+    /// Return the exact path and all descendants for each changed prefix. Batches remain
+    /// in their original order for matching and persistence.
+    pub fn affected_rows(&self, prefixes: &foldhash::HashSet<String>) -> Vec<u16> {
+        if self.len() == 0 {
+            return Vec::new();
+        }
+        if prefixes.contains("") {
+            return (0..self.len() as u16).collect();
+        }
+        let mut candidates = prefixes
+            .iter()
+            .filter(|prefix| self.may_overlap_prefix(prefix))
+            .peekable();
+        if candidates.peek().is_none() {
+            return Vec::new();
+        }
+        if prefixes.len() > self.len() / 16 {
+            return (0..self.len())
+                .filter(|&r| super::discovery::ancestors_contain(self.path(r), prefixes))
+                .map(|r| r as u16)
+                .collect();
+        }
+        let sorted = self.sorted_rows.get_or_init(|| {
+            let mut rows: Vec<_> = (0..self.len() as u16).collect();
+            rows.sort_unstable_by_key(|&r| self.path(r as usize));
+            rows
+        });
+        let mut affected = Vec::new();
+        for prefix in candidates {
+            let at = sorted.partition_point(|&r| self.path(r as usize) < prefix.as_str());
+            if let Some(&r) = sorted.get(at)
+                && self.path(r as usize) == prefix
+            {
+                affected.push(r);
+            }
+            // Compare against prefix + '/' without allocating that string for every block.
+            let start = sorted[at..].partition_point(|&r| {
+                self.path(r as usize)
+                    .as_bytes()
+                    .strip_prefix(prefix.as_bytes())
+                    .is_some_and(|tail| tail.first().is_none_or(|&b| b < b'/'))
+            }) + at;
+            affected.extend(sorted[start..].iter().copied().take_while(|&r| {
+                self.path(r as usize)
+                    .strip_prefix(prefix.as_str())
+                    .is_some_and(|s| s.starts_with('/'))
+            }));
+        }
+        affected
+    }
     pub fn directory(&self, row: usize) -> bool {
         self.entries[row].flags & 1 != 0
     }
@@ -124,6 +221,7 @@ impl Snapshot {
                 map,
                 chunks,
                 indices,
+                ..
             } => ArenaPtr::new(
                 map[chunks.clone()].as_ptr(),
                 map[indices.clone()].as_ptr().cast(),
@@ -132,6 +230,7 @@ impl Snapshot {
     }
     pub fn bytes(&self) -> usize {
         self.entries.len() * (std::mem::size_of::<Entry>() + std::mem::size_of::<ChunkedString>())
+            + self.sorted_rows.get().map_or(0, |rows| rows.capacity() * 2)
             + self.original_bytes
             + match &self.prepared {
                 Prepared::Owned(store) => store.heap_bytes(),
@@ -139,6 +238,17 @@ impl Snapshot {
                     chunks, indices, ..
                 } => chunks.len() + indices.len(),
             }
+    }
+    /// A validated current-format record can be copied unchanged to the next cache file.
+    pub fn encoded_block(&self) -> Option<&[u8]> {
+        match &self.prepared {
+            Prepared::Mapped {
+                map,
+                encoded_block: Some(range),
+                ..
+            } => Some(&map[range.clone()]),
+            _ => None,
+        }
     }
     pub fn signature(&self) -> Vec<u8> {
         let mut bits = vec![0u8; 8192];
@@ -195,7 +305,12 @@ impl Snapshot {
         }
         out
     }
-    pub fn decode(map: Arc<Mmap>, range: Range<usize>, legacy: bool) -> Option<Self> {
+    pub fn decode(
+        map: Arc<Mmap>,
+        range: Range<usize>,
+        legacy: bool,
+        encoded_block: Option<Range<usize>>,
+    ) -> Option<Self> {
         let bytes = map.get(range.clone())?;
         let number = |at: usize| -> Option<usize> {
             Some(u32::from_le_bytes(bytes.get(at..at.checked_add(4)?)?.try_into().ok()?) as usize)
@@ -206,6 +321,7 @@ impl Snapshot {
         }
         let mut at = 4;
         let mut entries = Vec::with_capacity(count);
+        let mut bounds = Bounds::default();
         for _ in 0..count {
             let size = u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?) as usize;
             let directory = *bytes.get(at + 2)?;
@@ -222,6 +338,7 @@ impl Snapshot {
             {
                 return None;
             }
+            bounds.include(&entries, bytes, path);
             entries.push(Entry {
                 start: u32::try_from(at).ok()?,
                 length: size as u16,
@@ -295,6 +412,7 @@ impl Snapshot {
         }
         let prepared = Prepared::Mapped {
             map: Arc::clone(&map),
+            encoded_block,
             chunks: range.start + chunks..range.start + indices,
             indices: range.start + indices..range.end,
         };
@@ -303,6 +421,8 @@ impl Snapshot {
             original_start: range.start,
             originals: Originals::Mapped(map),
             entries,
+            sorted_rows: OnceLock::new(),
+            bounds,
             paths,
             prepared,
         })

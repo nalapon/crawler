@@ -30,6 +30,8 @@ The script builds `crawler-rune` in release, packages the icon, licenses and gen
 
 For a debug build, run `cargo run` inside `crawler-rune/`.
 
+`main` calls `rune::prewarm_gpu()` first, as Rune's launch guide asks. The index engine spawns its thread and its matching pool on the first search or recorded open, not at launch: an app that only browses, and the Space preview window's own `App`, never start them. Keep new launch work out of `App::new` and `setup`.
+
 Prefer the packaged app when checking permissions, fonts, previews and launch behavior. The debug executable alone is not equivalent. macOS controls protected-folder access; show failures and never bypass privacy controls. Usage descriptions do not grant access. Keep [LICENSE](LICENSE), [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), bundled dependency licenses and generated Rust notices in packaged builds. Manual installation commands are in [README.md](README.md); there is no Homebrew package yet.
 
 ## Source map
@@ -87,6 +89,8 @@ Retro themes use the interface faces of their era: Geneva for System 7, Tahoma f
 
 Activity has a toolbar row (sample summary, process filter, Pause) above two flush panes: the process table and the map with its details. Transfers shows AirDrop beside the Copies pane, which lists the running copy and this session's finished, cancelled and failed copies.
 
+Rune springs every layout and colour change and fades in every element it mounts. Nothing in the workspace animates: its root sets `Spring::NONE` and `instant_changes()` (`app::view`), so changes land at once and new content appears whole. The only motion left is in the top layer: the reader sheet, overlays and toasts. Do not add `.motion(..)`, `.matched(..)` or a transition inside the workspace. Each one cost something visible: a travelling selection highlight or section indicator is drawn above the row or button it lands on and hid its label for about half a second, previews crossfaded on top of each other, and the PDF pane's sharp render waited for its 0.7 s fade-in (724 ms after a selection, 37 ms without it). Rune follows the system's Reduce Motion setting in a real window and ignores it in headless runs. Key a row's children, because the selection highlight enters in front of them. Check motion changes with Rune's `scripts/motion-audit/analyze.py` on a `--trace-all --trace` recording.
+
 Preserve selection and scroll without rebuilding unrelated panels. Global keys go to the open reader first, then to the visible section.
 
 ## Scope funnel and FFF search
@@ -132,6 +136,8 @@ Command-K or Command-Shift-P opens the command palette for sections, places, sel
 Every file opens inside Crawler. There is no Open button, no default text editor, no editor discovery and no hand-off to another app: do not add them back. Enter on a file Crawler cannot draw (archives, disk images, audio, apps and other packages) does nothing.
 
 `DocumentKind::for_path` in `funnel/model.rs` is the only extension table. `preview::content::Format::of` groups its kinds and `opening::dispatch` routes them: folders to Folders, PDFs to the PDF reader and Markdown, Word, spreadsheets, code, plain text, images and video to the document reader (`Reader::Document`, `preview/mod.rs`). Add a format to that table, never to a second list. Record recent-file history only after a document has loaded.
+
+A reader is a sheet over the workspace, which stays mounted underneath (`app::view`). Opening slides the sheet in from the right over the workspace with `Transition::move_edge` and the `GLIDE` spring; closing slides it back and uncovers the workspace. Rune fades whatever it unmounts, so the way out is an offset on a sheet that stays mounted for 0.4 s (`App::leaving`), not an exit transition: `close_reader` hands input back to the workspace at once and the reader's state is released when the sheet is off screen or another file opens. Under a sheet the workspace is inert and its pane starts no work; a PDF pane draws nothing there, because the reader owns the source's surfaces. A PDF closed back into the document it was linked from swaps with no slide. Rune reports an element's drawn rectangle only after the sheet stops, so the PDF reader requests the first page's sharp render when it opens, from the known place of that page (`pdf/view.rs`, `pages`), instead of waiting for the slide to end.
 
 The document reader has one header for every format: Back, the name, the position, then only the controls that document can use. X, two consecutive non-repeated Escape presses within 700 ms, or Command-W close a reader and restore the workspace and its focus. A `Document` has one `Body`:
 

@@ -11,6 +11,7 @@ use rune::{Cx, El, Key, KeyEvent, Tx, Waker, col};
 use rune_kit::Kit;
 
 use crate::args::Launch;
+use crate::preferences::Preferences;
 use crate::theme::{Look, Theme};
 use crate::{activity, funnel, index, opening, pdf, preview, settings, shell, transfers};
 
@@ -77,12 +78,13 @@ impl Section {
 pub enum Reader {
     #[default]
     None,
-    /// Markdown, Word, spreadsheets, code, text, images and video.
+    /// Markdown, Word, spreadsheets, PowerPoint, code, text, images and video.
     Document,
     Pdf,
 }
 
 /// What every view needs to paint: the theme's roles and the rune-kit tokens built from them.
+#[derive(Clone)]
 pub struct Paint {
     pub look: Look,
     pub kit: Kit,
@@ -90,13 +92,16 @@ pub struct Paint {
 
 pub struct App {
     pub launch: Launch,
-    pub prefs: Prefs,
+    prefs: Preferences,
     pub waker: Option<Waker>,
     pub section: Section,
     /// The saved theme. `theme_preview` overrides it while the command palette previews one.
     pub theme: Theme,
     pub theme_preview: Option<Theme>,
     pub reader: Reader,
+    /// A closed reader whose sheet is still sliding out, and the clock time at which its
+    /// state is released. It is drawn but takes no input: `reader` is already `None`.
+    leaving: Option<(Reader, f64)>,
     /// A file to open on the first poll (`--open` or a path handed to the app).
     pub pending_open: Option<PathBuf>,
     /// The PDF whose successful display was last added to recent files.
@@ -108,6 +113,7 @@ pub struct App {
     pub show_help: bool,
     pub host: Option<rune::AppHandle<App>>,
     reports: Reports,
+    pub(crate) frame_inputs: crate::frame_timing::Inputs,
 
     pub index: index::Engine,
     pub funnel: funnel::State,
@@ -155,10 +161,15 @@ impl App {
         } else {
             Section::Search
         });
+        let mut index = index::Engine::new(launch.search_workers);
+        if launch.state_report.is_some() {
+            index.enable_diagnostics();
+        }
         App {
             reports: Reports::new(&launch),
+            frame_inputs: Default::default(),
             host: None,
-            index: index::Engine::new(launch.search_workers),
+            index,
             funnel: funnel::State::new(&launch, &prefs),
             opening: opening::State::new(&prefs),
             preview: preview::State::new(&prefs),
@@ -167,12 +178,13 @@ impl App {
             transfers: transfers::State::default(),
             settings: settings::State::default(),
             launch,
-            prefs,
+            prefs: Preferences::new(prefs),
             waker: None,
             section,
             theme,
             theme_preview: None,
             reader: Reader::None,
+            leaving: None,
             pending_open: None,
             recorded_pdf: None,
             reader_escape_at: None,
@@ -190,13 +202,44 @@ impl App {
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
         self.theme_preview = None;
-        let _ = self.prefs.set("theme", &theme);
+        let _ = self.set_preference("theme", &theme);
+    }
+
+    pub fn set_preference<T: serde::Serialize + ?Sized>(
+        &mut self,
+        key: &'static str,
+        value: &T,
+    ) -> Result<(), rune::prefs::PrefsError> {
+        self.prefs.set(key, value, self.waker.clone())
+    }
+
+    pub fn mark_search_input(&mut self, query: u64, tx: &Tx) {
+        if self.launch.frame_timing {
+            self.frame_inputs.search = tx.input_time().map(|at| (query, at));
+        }
+    }
+
+    pub fn mark_folder_input(&mut self, visit: u64, tx: &Tx) {
+        if self.launch.frame_timing {
+            self.frame_inputs.folder = tx.input_time().map(|at| (visit, at));
+        }
+    }
+
+    pub fn mark_open_input(&mut self, path: &std::path::Path, tx: &Tx) {
+        if self.launch.frame_timing {
+            self.frame_inputs.open = tx.input_time().map(|at| (path.to_owned(), at));
+        }
+    }
+
+    pub(crate) fn state_started(&self) -> std::time::Instant {
+        self.reports.started
     }
 
     pub fn show(&mut self, section: Section) {
         if self.section == section {
             return;
         }
+        opening::cancel_navigation(self);
         funnel::leaving(self, self.section);
         self.section = section;
         funnel::entering(self, section);
@@ -210,23 +253,48 @@ impl App {
         });
     }
 
+    /// Closes the open reader. The workspace takes input again at once; the reader's own
+    /// state lives on until its sheet has slid out (`leaving`).
     pub fn close_reader(&mut self) {
-        match self.reader {
-            Reader::None => return,
-            Reader::Document => preview::reader_closed(self),
-            Reader::Pdf => {
-                pdf::reader_closed(self);
-                // A PDF opened from a link in a document returns to that document.
-                if preview::resume_reader(self) {
-                    self.reader_escape_at = None;
-                    return;
-                }
-            }
+        let closing = self.reader;
+        if closing == Reader::None {
+            return;
         }
+        self.finish_leaving();
         self.reader = Reader::None;
         self.reader_escape_at = None;
+        // A PDF opened from a link in a document returns to that document, with no slide.
+        if closing == Reader::Pdf && preview::resume_reader(self) {
+            pdf::reader_closed(self);
+            return;
+        }
+        self.leaving = Some((closing, self.clock + SHEET_EXIT));
+    }
+
+    /// Releases a closed reader's state, once its sheet is off screen or another one opens.
+    pub fn finish_leaving(&mut self) {
+        if let Some((reader, _)) = self.leaving.take() {
+            match reader {
+                Reader::Document => preview::reader_closed(self),
+                Reader::Pdf => pdf::reader_closed(self),
+                Reader::None => {}
+            }
+        }
+    }
+
+    /// Whether the PDF reader is drawn, open or sliding out, rather than a pane's preview.
+    pub fn pdf_sheet_shown(&self) -> bool {
+        self.reader == Reader::Pdf || matches!(self.leaving, Some((Reader::Pdf, _)))
+    }
+
+    /// Whether a reader's sheet is on screen, open or sliding out.
+    pub fn sheet_shown(&self) -> bool {
+        self.reader != Reader::None || self.leaving.is_some()
     }
 }
+
+/// Seconds a closed reader stays drawn while its sheet slides out.
+const SHEET_EXIT: f64 = 0.4;
 
 pub fn setup(app: &mut App, waker: Waker) {
     app.index.set_waker(waker.clone());
@@ -255,14 +323,23 @@ pub fn poll(app: &mut App, clock: f64, tx: &mut Tx) -> bool {
     app.clock = clock;
     let mut changed = false;
     if let Some(path) = app.pending_open.take() {
-        opening::open_path(app, &path, tx);
+        opening::open_external_paths(app, vec![path], tx);
         changed = true;
     }
-    for path in crate::documents::take() {
-        opening::open_path(app, &path, tx);
+    let documents = crate::documents::take();
+    if !documents.is_empty() {
+        opening::open_external_paths(app, documents, tx);
         changed = true;
     }
     record_displayed_pdf(app);
+    if let Some((_, until)) = app.leaving {
+        if clock >= until {
+            app.finish_leaving();
+            changed = true;
+        } else {
+            tx.wake_after(std::time::Duration::from_secs_f64(until - clock));
+        }
+    }
     let before = app.toasts.len();
     app.toasts.retain(|t| t.until > clock);
     changed |= app.toasts.len() != before;
@@ -276,6 +353,10 @@ pub fn poll(app: &mut App, clock: f64, tx: &mut Tx) -> bool {
     changed |= pdf::poll(app, tx);
     changed |= activity::poll(app, tx);
     changed |= transfers::poll(app, tx);
+    if let Some(error) = app.prefs.take_error() {
+        app.toast(error);
+        changed = true;
+    }
     poll_reports(app, tx);
     changed
 }
@@ -301,6 +382,7 @@ pub fn on_close(app: &mut App, tx: &mut Tx) {
     pdf::on_close(app, tx);
     transfers::on_close(app);
     app.index.suspend();
+    app.prefs.finish();
 }
 
 /// Global keys first, then the reader or the visible section.
@@ -346,18 +428,21 @@ fn reader_key(app: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
     if handled {
         return true;
     }
-    match ev.key {
-        Key::Command('w') => app.close_reader(),
+    let escape = match ev.key {
+        Key::Command('w') => false,
         Key::Text(ref t)
             if t.eq_ignore_ascii_case("x") && !ev.mods.cmd && !preview::typing(app) =>
         {
-            app.close_reader()
+            false
         }
-        Key::Escape => match app.reader_escape_at {
-            Some(at) if app.clock - at <= 0.7 => app.close_reader(),
-            _ => app.reader_escape_at = Some(app.clock),
-        },
+        Key::Escape => true,
         _ => return false,
+    };
+    let now = tx.clock();
+    if escape && app.reader_escape_at.is_none_or(|at| now - at > 0.7) {
+        app.reader_escape_at = Some(now);
+    } else {
+        app.close_reader();
     }
     if app.reader == Reader::Document {
         preview::focus_reader(tx);
@@ -374,26 +459,68 @@ pub fn view(app: &App, cx: &mut Cx<App>) -> El {
         look,
     };
     let mut layer = Vec::new();
-    let body = match app.reader {
-        Reader::Document => preview::reader_view(app, cx, &p, &mut layer),
-        Reader::Pdf => pdf::reader_view(app, cx, &p, &mut layer),
-        Reader::None => {
-            let content = match app.section {
-                Section::Search | Section::Folders => funnel::view(app, cx, &p, &mut layer),
-                Section::Activity => activity::view(app, cx, &p, &mut layer),
-                Section::Transfers => transfers::view(app, cx, &p, &mut layer),
-                Section::Settings => settings::view(app, cx, &p, &mut layer),
-            };
-            col()
-                .key("workspace")
-                .w_full()
-                .h_full()
-                .fill(look.background)
-                .child(shell::section_bar(app, cx, &p, &mut layer))
-                .child(content.grow(1.0).min_h(0.0).w_full())
-                .child(shell::status_bar(app, &p))
-        }
+    let content = match app.section {
+        Section::Search | Section::Folders => funnel::view(app, cx, &p, &mut layer),
+        Section::Activity => activity::view(app, cx, &p, &mut layer),
+        Section::Transfers => transfers::view(app, cx, &p, &mut layer),
+        Section::Settings => settings::view(app, cx, &p, &mut layer),
     };
+    // Nothing in the workspace animates: layout and colour changes land at once and what
+    // it mounts appears whole. Rune would spring every change and fade in every new
+    // element, which hid a row's name under a travelling highlight, crossfaded previews
+    // and held back the PDF pane's sharp render for 0.7 s after each key.
+    let mut body = col()
+        .key("workspace")
+        .motion(rune::Spring::NONE)
+        .instant_changes()
+        .w_full()
+        .h_full()
+        .fill(look.background)
+        .child(shell::section_bar(app, cx, &p, &mut layer))
+        .child(content.grow(1.0).min_h(0.0).w_full())
+        .child(shell::status_bar(app, &p));
+    // A reader is a sheet over the workspace, which stays mounted underneath. Opening slides
+    // the sheet in from the right over the workspace; closing slides it back and uncovers it.
+    // Rune fades whatever it unmounts, so the way out is an offset on a sheet that stays
+    // mounted until it is off screen (`App::leaving`), not an exit transition.
+    let leaving = app.reader == Reader::None;
+    let shown = if leaving {
+        app.leaving.map_or(Reader::None, |(reader, _)| reader)
+    } else {
+        app.reader
+    };
+    let mut above = Vec::new();
+    let reader = match shown {
+        Reader::Document => Some(preview::reader_view(app, cx, &p, &mut above)),
+        Reader::Pdf => Some(pdf::reader_view(app, cx, &p, &mut above)),
+        Reader::None => None,
+    };
+    if let Some(reader) = reader {
+        if !leaving {
+            // The covered workspace takes no input while the sheet is up.
+            body = body.inert();
+        }
+        let width = cx.layout_size("workspace").map_or(1180.0, |size| size[0]);
+        let mut sheet = rune::el()
+            .key("reader-sheet")
+            .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+            .transition(rune::Transition::asymmetric(
+                rune::Transition::move_edge(rune::Edge::Trailing)
+                    .springs(rune::tok::motion::pair::GLIDE),
+                rune::Transition::none(),
+            ))
+            .offset(if leaving { width } else { 0.0 }, 0.0)
+            .offset_motion(rune::tok::motion::GLIDE_EXIT)
+            // Only the sheet travels. What it holds lands at once, so a page that first lays
+            // out at the pane's width doesn't spring to the window's while it slides.
+            .child(reader.w_full().h_full().instant_changes());
+        if leaving {
+            sheet = sheet.inert();
+        }
+        layer.push(sheet);
+        // What the reader floats (note popovers, prompts) stays above its sheet.
+        layer.extend(above);
+    }
     settings::overlays(app, cx, &p, &mut layer);
     shell::toasts(app, &p, &mut layer);
     rune_kit::root(body, layer).on_drawn_layout_tx(|a: &mut App, _, tx| {

@@ -71,7 +71,10 @@ pub fn image(path: &Path, max_pixels: u32) -> Result<Bitmap, String> {
         return Err("This image could not be decoded.".into());
     }
     let scale = (f64::from(max_pixels) / width.max(height)).min(1.0);
-    let (drawn_width, drawn_height) = ((width * scale).round().max(1.0), (height * scale).round().max(1.0));
+    let (drawn_width, drawn_height) = (
+        (width * scale).round().max(1.0),
+        (height * scale).round().max(1.0),
+    );
     // EXIF orientations 5 to 8 turn the picture a quarter, so the bitmap swaps its sides.
     let (out_width, out_height) = if orientation >= 5 {
         (drawn_height, drawn_width)
@@ -126,6 +129,14 @@ pub fn image(path: &Path, max_pixels: u32) -> Result<Bitmap, String> {
 }
 
 pub fn thumbnail(path: &Path, cancelled: &impl Fn() -> bool) -> Option<Bitmap> {
+    thumbnail_at(path, [700.0, 900.0], cancelled)
+}
+
+pub(super) fn thumbnail_at(
+    path: &Path,
+    [width, height]: [f64; 2],
+    cancelled: &impl Fn() -> bool,
+) -> Option<Bitmap> {
     autoreleasepool(|_| {
         let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
         let (send, receive) = mpsc::sync_channel(1);
@@ -137,7 +148,7 @@ pub fn thumbnail(path: &Path, cancelled: &impl Fn() -> bool) -> Option<Bitmap> {
                 QLThumbnailGenerationRequest::initWithFileAtURL_size_scale_representationTypes(
                     QLThumbnailGenerationRequest::alloc(),
                     &url,
-                    CGSize::new(700.0, 900.0),
+                    CGSize::new(width, height),
                     1.0,
                     QLThumbnailGenerationRequestRepresentationTypes::Thumbnail,
                 );

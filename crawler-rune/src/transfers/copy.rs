@@ -162,21 +162,8 @@ pub fn run(sources: Vec<PathBuf>, dest: PathBuf, progress: &Progress) -> Finishe
     let result = (|| -> io::Result<()> {
         writable(&dest)?;
         let destination = fs::canonicalize(&dest)?;
-        let mut sizes = Vec::with_capacity(sources.len());
+        let mut planned = Vec::with_capacity(sources.len());
         for source in &sources {
-            match size(source, progress) {
-                Ok(n) => sizes.push(n),
-                Err(e) if progress.cancel.load(Ordering::Relaxed) => return Err(e),
-                Err(_) => sizes.push(0),
-            }
-        }
-        progress
-            .value
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .total = sizes.iter().copied().fold(0u64, u64::saturating_add);
-        progress.wake(true);
-        for (source, bytes) in sources.iter().zip(sizes) {
             if progress.cancel.load(Ordering::Relaxed) {
                 break;
             }
@@ -194,13 +181,31 @@ pub fn run(sources: Vec<PathBuf>, dest: PathBuf, progress: &Progress) -> Finishe
                 failures.push(format!("{display} already exists. Skipped."));
                 continue;
             }
+            match size(source, progress) {
+                Ok(bytes) => planned.push((source, name, target, bytes)),
+                Err(e) if progress.cancel.load(Ordering::Relaxed) => return Err(e),
+                Err(_) => planned.push((source, name, target, 0)),
+            }
+        }
+        progress
+            .value
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .total = planned
+            .iter()
+            .fold(0u64, |sum, (_, _, _, bytes)| sum.saturating_add(*bytes));
+        progress.wake(true);
+        for (source, name, target, bytes) in planned {
+            if progress.cancel.load(Ordering::Relaxed) {
+                break;
+            }
             let before = progress.snapshot().copied;
             *progress.base.lock().unwrap_or_else(|e| e.into_inner()) = before;
             progress
                 .value
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .name = display.into_owned();
+                .name = name.to_string_lossy().into_owned();
             progress.wake(true);
             // A private directory owns every partial byte. An exclusive rename publishes the
             // finished item, so cancellation and races can never delete somebody else's target.

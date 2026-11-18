@@ -25,6 +25,8 @@ pub struct Launch {
     pub state_report: Option<PathBuf>,
     pub event_log: Option<PathBuf>,
     pub launch_report: Option<PathBuf>,
+    /// `--frame-timing`: report native frames carrying a result, folder or reader.
+    pub frame_timing: bool,
     /// Positional paths, as `scripts/crawler [path]` and Finder hand them over.
     pub paths: Vec<PathBuf>,
 }
@@ -52,6 +54,7 @@ impl Launch {
                 "--state-report" => out.state_report = value().map(PathBuf::from),
                 "--event-log" => out.event_log = value().map(PathBuf::from),
                 "--launch-report" => out.launch_report = value().map(PathBuf::from),
+                "--frame-timing" => out.frame_timing = true,
                 other if !other.starts_with('-') => out.paths.push(PathBuf::from(other)),
                 _ => {}
             }

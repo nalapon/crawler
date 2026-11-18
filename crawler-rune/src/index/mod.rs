@@ -70,6 +70,16 @@ pub enum Status {
     },
     Failed(String),
 }
+impl Status {
+    /// Indexed counts are diagnostic. Only a failure change needs a view update.
+    fn same_visible_state(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Failed(previous), Self::Failed(next)) => previous == next,
+            (Self::Failed(_), _) | (_, Self::Failed(_)) => false,
+            _ => true,
+        }
+    }
+}
 
 mod cache;
 mod discovery;
@@ -101,7 +111,19 @@ pub struct Engine {
     waker: Option<Waker>,
     commands: mpsc::Sender<worker::Message>,
     shared: Arc<Mutex<Shared>>,
+    status: Status,
+    diagnostics: bool,
     generation: Arc<AtomicU64>,
+    /// What the worker thread needs, held until the first search or recorded open starts it.
+    /// An app that never searches (the Space preview window, a launch that only browses)
+    /// never spawns the index thread or its matching pool.
+    idle: Option<Start>,
+}
+struct Start {
+    workers: usize,
+    root: PathBuf,
+    support: PathBuf,
+    receive: mpsc::Receiver<worker::Message>,
 }
 impl Engine {
     pub fn new(workers: Option<usize>) -> Engine {
@@ -123,26 +145,55 @@ impl Engine {
             report: serde_json::json!({"workers": workers}),
             waker: None,
         }));
-        let generation = Arc::new(AtomicU64::new(0));
         let (commands, receive) = mpsc::channel();
-        let state = Arc::clone(&shared);
-        let token = Arc::clone(&generation);
-        let sender = commands.clone();
-        if let Err(error) = std::thread::Builder::new()
-            .name("crawler-index".into())
-            .spawn(move || worker::run(workers, root, support, sender, receive, state, token))
-        {
-            if let Ok(mut state) = shared.lock() {
-                state.status = Status::Failed(error.to_string());
-            }
-        }
         Engine {
             next_id: 0,
             interval: performance::Interval::default(),
             waker: None,
             commands,
             shared,
-            generation,
+            status: Status::Idle,
+            diagnostics: false,
+            generation: Arc::new(AtomicU64::new(0)),
+            idle: Some(Start {
+                workers,
+                root,
+                support,
+                receive,
+            }),
+        }
+    }
+    pub fn enable_diagnostics(&mut self) {
+        self.diagnostics = true;
+    }
+    /// Spawns the worker thread the first time it has something to do.
+    fn start(&mut self) {
+        let Some(start) = self.idle.take() else {
+            return;
+        };
+        let state = Arc::clone(&self.shared);
+        let token = Arc::clone(&self.generation);
+        let sender = self.commands.clone();
+        let diagnostics = self.diagnostics;
+        let spawned = std::thread::Builder::new()
+            .name("crawler-index".into())
+            .spawn(move || {
+                worker::run(
+                    start.workers,
+                    start.root,
+                    start.support,
+                    sender,
+                    start.receive,
+                    state,
+                    token,
+                    diagnostics,
+                )
+            });
+        if let Err(error) = spawned
+            && let Ok(mut state) = self.shared.lock()
+        {
+            state.status = Status::Failed(error.to_string());
+            self.status = state.status.clone();
         }
     }
     pub fn set_waker(&mut self, waker: Waker) {
@@ -160,6 +211,7 @@ impl Engine {
             self.interval.cancel();
             0
         } else {
+            self.start();
             self.interval.begin(self.next_id)
         };
         let _ = self.commands.send(worker::Message::Search {
@@ -167,6 +219,7 @@ impl Engine {
             signpost,
             query,
             started,
+            enqueue_ms: started.elapsed().as_secs_f64() * 1000.0,
         });
         self.next_id
     }
@@ -187,23 +240,44 @@ impl Engine {
             .then_some(response)
     }
     pub fn record_access(&mut self, path: &Path) {
+        // The worker owns the access history file, so an open must reach it.
+        self.start();
         let _ = self.commands.send(worker::Message::Access(path.to_owned()));
     }
     pub fn idle(&mut self) {
         self.interval.cancel();
         self.generation.store(0, Ordering::Release);
+        if self.idle.is_some() {
+            return;
+        }
         let _ = self.commands.send(worker::Message::Idle);
     }
     pub fn suspend(&mut self) {
         self.interval.cancel();
         self.generation.store(0, Ordering::Release);
+        if self.idle.is_some() {
+            return;
+        }
         let _ = self.commands.send(worker::Message::Suspend);
     }
+    pub fn poll_status(&mut self) -> bool {
+        match self.shared.try_lock() {
+            Ok(shared) => {
+                let changed = !self.status.same_visible_state(&shared.status);
+                self.status = shared.status.clone();
+                changed
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if let Some(waker) = &self.waker {
+                    waker();
+                }
+                false
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => false,
+        }
+    }
     pub fn status(&self) -> Status {
-        self.shared
-            .lock()
-            .map(|s| s.status.clone())
-            .unwrap_or(Status::Idle)
+        self.status.clone()
     }
     pub fn report(&self) -> serde_json::Value {
         self.shared
@@ -224,6 +298,9 @@ impl Engine {
     pub fn trace_stage(&mut self, id: u64, stage: &'static str, milliseconds: f64) {
         if stage == "first_title_draw_ms" {
             self.interval.drawn(id);
+        }
+        if !self.diagnostics {
+            return;
         }
         let _ = self.commands.send(worker::Message::Trace {
             id,

@@ -4,7 +4,7 @@ mod sampling;
 
 use crate::app::{App, Paint, Reader, Section};
 use crate::shell;
-use model::{Group, ListRow, Metric, Node};
+use model::{ListRow, Metric, Node};
 use rune::{Align, Cx, El, Key, KeyEvent, Latest, TextEdit, Tx, Waker, col, el, row, text};
 use rune_kit::{
     Cell, Dialog, MenuItem, RollingText, SortDir, Table, TableColumn, TableState, TableStyle,
@@ -22,7 +22,6 @@ pub struct State {
     paused: bool,
     filter: TextEdit,
     table: TableState,
-    groups: Vec<Group>,
     rows: Vec<ListRow>,
     expanded: HashSet<String>,
     metric: Metric,
@@ -32,7 +31,7 @@ pub struct State {
     map_focused: bool,
     pending_g: bool,
     inspect: bool,
-    quit: Option<Process>,
+    quit: Option<std::sync::Arc<Process>>,
     menu: Option<rune::PointerPress>,
 }
 impl Default for State {
@@ -48,7 +47,6 @@ impl Default for State {
             paused: false,
             filter: TextEdit::new(""),
             table,
-            groups: Vec::new(),
             rows: Vec::new(),
             expanded: HashSet::new(),
             metric: Metric::Memory,
@@ -116,8 +114,8 @@ pub fn poll(app: &mut App, tx: &mut Tx) -> bool {
 }
 
 fn rebuild(s: &mut State) {
-    s.groups = model::groups(&s.sample.processes, &s.filter.text);
-    s.expanded.retain(|id| s.groups.iter().any(|g| &g.id == id));
+    let groups = model::groups(&s.sample.processes, &s.filter.text);
+    s.expanded.retain(|id| groups.iter().any(|g| &g.id == id));
     let (column, dir) = s
         .table
         .sort()
@@ -143,8 +141,7 @@ fn rebuild(s: &mut State) {
             dir.apply(order).then_with(|| a.id.cmp(&b.id))
         })
     };
-    let mut parents: Vec<_> = s
-        .groups
+    let mut parents: Vec<_> = groups
         .iter()
         .map(|g| ListRow {
             id: format!("group:{}", g.id),
@@ -194,41 +191,20 @@ fn rebuild(s: &mut State) {
             s.table.clear_selection();
         }
     }
-    s.roots = s
-        .groups
-        .iter()
-        .map(|g| Node {
-            id: format!("group:{}", g.id),
-            name: g.name.clone(),
-            value: g.value(s.metric).unwrap_or(0.0),
-            processes: g.processes.clone(),
-            children: model::forest(&g.processes, s.metric),
-        })
-        .collect();
-    s.roots.retain(|n| n.value > 0.0);
-    s.roots.sort_by(|a, b| {
-        b.value
-            .total_cmp(&a.value)
-            .then_with(|| a.name.cmp(&b.name))
-    });
-    if s.roots.len() > 14 {
-        let rest = s.roots.split_off(14);
-        s.roots.push(Node {
-            id: "other".into(),
-            name: "Other processes".into(),
-            value: rest.iter().map(|n| n.value).sum(),
-            processes: rest
-                .iter()
-                .flat_map(|n| n.processes.iter().cloned())
-                .collect(),
-            children: rest,
-        });
-    }
+    s.roots = model::roots(
+        groups
+            .into_iter()
+            .map(|group| {
+                let children = model::forest(&group.processes, s.metric);
+                Node::group(format!("group:{}", group.id), group.name, children)
+            })
+            .collect(),
+    );
     let old_scope = std::mem::take(&mut s.scope);
     for id in old_scope {
         if visible(s)
             .iter()
-            .any(|n| n.id == id && !n.children.is_empty())
+            .any(|n| n.id == id && !n.visible().is_empty())
         {
             s.scope.push(id);
         } else {
@@ -236,22 +212,22 @@ fn rebuild(s: &mut State) {
         }
     }
 }
-fn visible(s: &State) -> Vec<Node> {
-    let mut nodes = s.roots.clone();
+fn visible(s: &State) -> &[Node] {
+    let mut nodes = s.roots.as_slice();
     for id in &s.scope {
-        let Some(found) = nodes.into_iter().find(|n| n.id == *id) else {
-            return Vec::new();
+        let Some(found) = nodes.iter().find(|n| n.id == *id) else {
+            return &[];
         };
-        nodes = model::limited(found.children, id);
+        nodes = found.visible();
     }
     nodes
 }
-fn find_node(nodes: &[Node], id: &str) -> Option<Node> {
-    for n in nodes {
-        if n.id == id {
-            return Some(n.clone());
+fn find_node<'a>(nodes: &'a [Node], id: &str) -> Option<&'a Node> {
+    for node in nodes {
+        if node.id == id {
+            return Some(node);
         }
-        if let Some(found) = find_node(&model::limited(n.children.clone(), &n.id), id) {
+        if let Some(found) = find_node(node.visible(), id) {
             return Some(found);
         }
     }
@@ -262,7 +238,7 @@ fn node_path(nodes: &[Node], id: &str) -> Option<Vec<String>> {
         if n.id == id {
             return Some(vec![n.id.clone()]);
         }
-        if let Some(mut path) = node_path(&model::limited(n.children.clone(), &n.id), id) {
+        if let Some(mut path) = node_path(n.visible(), id) {
             path.insert(0, n.id.clone());
             return Some(path);
         }
@@ -273,14 +249,18 @@ fn selected(s: &State) -> Option<ListRow> {
     if s.map_focused {
         s.map_selection
             .as_ref()
-            .and_then(|id| find_node(&visible(s), id))
-            .map(|n| ListRow {
-                id: n.id,
-                group: String::new(),
-                name: n.name,
-                subtitle: format!("{} processes", n.processes.len()),
-                processes: n.processes,
-                child: false,
+            .and_then(|id| find_node(visible(s), id))
+            .map(|node| {
+                let mut processes = Vec::new();
+                node.members(&mut processes);
+                ListRow {
+                    id: node.id.clone(),
+                    group: String::new(),
+                    name: node.name.clone(),
+                    subtitle: format!("{} processes", processes.len()),
+                    processes,
+                    child: false,
+                }
             })
     } else {
         s.rows
@@ -292,9 +272,11 @@ fn selected(s: &State) -> Option<ListRow> {
 fn select_map(s: &mut State, id: String) {
     s.map_focused = true;
     s.map_selection = Some(id.clone());
-    if let Some(node) = find_node(&visible(s), &id) {
+    if let Some(node) = find_node(visible(s), &id) {
         let row = s.rows.iter().find(|r| r.id == id).or_else(|| {
-            node.processes.first().and_then(|p| {
+            let mut members = Vec::new();
+            node.members(&mut members);
+            members.first().and_then(|p| {
                 s.rows
                     .iter()
                     .find(|r| r.processes.len() == 1 && r.processes[0].id == p.id)
@@ -316,8 +298,8 @@ fn explore(s: &mut State) {
     if s.map_focused {
         if let Some(id) = s.map_selection.as_ref() {
             let nodes = visible(s);
-            if find_node(&nodes, id).is_some_and(|n| !n.children.is_empty()) {
-                if let Some(path) = node_path(&nodes, id) {
+            if find_node(nodes, id).is_some_and(|n| !n.visible().is_empty()) {
+                if let Some(path) = node_path(nodes, id) {
                     s.scope.extend(path);
                     s.map_selection = visible(s).first().map(|n| n.id.clone());
                 }
@@ -544,7 +526,7 @@ fn tiles(
         };
         let container = !s.scope.is_empty()
             && depth == 0
-            && !n.children.is_empty()
+            && !n.visible().is_empty()
             && width > 110.0
             && height > 95.0;
         let mut content = col()
@@ -567,7 +549,6 @@ fn tiles(
             )
             .role("button")
             .label(format!("{}: {}", n.name, s.metric.format(Some(n.value))))
-            .motion(rune::tok::motion::SNAPPY)
             .child(
                 text(&n.name)
                     .font(p.look.font(12.0, 600.0))
@@ -582,7 +563,7 @@ fn tiles(
             );
         if container {
             content = content.child(tiles(
-                &model::limited(n.children.clone(), &n.id),
+                n.visible(),
                 s,
                 p,
                 (width - 16.0).max(1.0),
@@ -863,7 +844,6 @@ pub fn view(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) -> El {
         if active {
             let mut indicator = el()
                 .key("metric-indicator")
-                .matched("metric-indicator")
                 .pin(Some(0.), Some(0.), Some(0.), Some(0.))
                 .radius(if p.look.era() == crate::theme::Era::Modern {
                     4.0
@@ -872,7 +852,6 @@ pub fn view(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) -> El {
                 })
                 .fill(p.look.background)
                 .border(1.0, p.look.line)
-                .motion(rune::tok::motion::SNAPPY)
                 .inert();
             if matches!(
                 p.look.era(),
@@ -888,6 +867,7 @@ pub fn view(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) -> El {
                 .press_scale(0.98)
                 .child(
                     text(m.title())
+                        .key("metric-label")
                         .font(p.look.font(11.0, 500.0))
                         .color(p.look.text),
                 )
@@ -1028,7 +1008,7 @@ pub fn view(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) -> El {
                 .min_h(0.0)
                 .padding(8.0)
                 .child(tiles(
-                    &visible(s),
+                    visible(s),
                     s,
                     p,
                     map_size[0] as f64 - 16.0,

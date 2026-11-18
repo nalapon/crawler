@@ -3,12 +3,16 @@ use super::OpenResult;
 use objc2::{msg_send, rc::autoreleasepool};
 use objc2_app_kit::{NSRunningApplication, NSWorkspace, NSWorkspaceOpenConfiguration};
 use objc2_foundation::{
-    NSArray, NSError, NSFileManager, NSString, NSURL, NSURLVolumeIsBrowsableKey,
-    NSURLVolumeIsEjectableKey, NSURLVolumeIsRemovableKey, NSURLVolumeNameKey,
-    NSVolumeEnumerationOptions,
+    NSArray, NSDirectoryEnumerationOptions, NSError, NSFileManager, NSString, NSURL,
+    NSURLIsPackageKey, NSURLVolumeIsBrowsableKey, NSURLVolumeIsEjectableKey,
+    NSURLVolumeIsRemovableKey, NSURLVolumeNameKey, NSVolumeEnumerationOptions,
 };
 use rune::Waker;
+use std::collections::HashMap;
+use std::ffi::{CStr, OsStr};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 
 /// Hands `path` to an application (Terminal for a folder). The result arrives on `result`.
@@ -153,20 +157,75 @@ pub fn observe_volumes(tx: Sender<()>, waker: Waker) -> WorkspaceObserver {
 }
 
 pub fn is_package(path: &Path) -> bool {
-    autoreleasepool(|_| unsafe {
+    package_status(path).unwrap_or(false)
+}
+
+/// Unknown resource values are safe to display as folders but should be checked again.
+pub(crate) fn package_status(path: &Path) -> Option<bool> {
+    autoreleasepool(|_| {
         let url =
             NSURL::fileURLWithPath_isDirectory(&NSString::from_str(&path.to_string_lossy()), true);
+        url_package_status(&url)
+    })
+}
+
+fn url_package_status(url: &NSURL) -> Option<bool> {
+    unsafe {
         let mut value = None;
-        if url
-            .getResourceValue_forKey_error(&mut value, objc2_foundation::NSURLIsPackageKey)
-            .is_err()
-        {
-            return false;
-        }
-        value.is_some_and(|v| {
+        url.getResourceValue_forKey_error(&mut value, NSURLIsPackageKey)
+            .ok()?;
+        value.map(|v| {
             let b: bool = msg_send![&*v, boolValue];
             b
         })
+    }
+}
+
+/// Reads the same package key from URLs with Foundation's directory prefetch enabled.
+/// A missing URL or unknown resource value is left for the caller's ordinary lookup.
+pub(crate) fn prefetch_packages(
+    folder: &Path,
+    mut candidates: HashMap<&OsStr, &mut Option<bool>>,
+    cancel: &AtomicBool,
+) {
+    if candidates.is_empty() || cancel.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(folder) = folder.to_str() else {
+        return;
+    };
+    autoreleasepool(|_| unsafe {
+        let path = NSURL::fileURLWithPath_isDirectory(&NSString::from_str(folder), true);
+        let keys = NSArray::from_slice(&[NSURLIsPackageKey]);
+        let Some(entries) = NSFileManager::defaultManager()
+            .enumeratorAtURL_includingPropertiesForKeys_options_errorHandler(
+                &path,
+                Some(&keys),
+                NSDirectoryEnumerationOptions::SkipsSubdirectoryDescendants
+                    | NSDirectoryEnumerationOptions::SkipsHiddenFiles,
+                None,
+            )
+        else {
+            return;
+        };
+        while !candidates.is_empty() && !cancel.load(Ordering::Relaxed) {
+            let next = autoreleasepool(|_| {
+                let Some(entry) = entries.nextObject() else {
+                    return false;
+                };
+                if let Ok(url) = entry.downcast::<NSURL>() {
+                    let bytes = CStr::from_ptr(url.fileSystemRepresentation().as_ptr()).to_bytes();
+                    let name = Path::new(OsStr::from_bytes(bytes)).file_name();
+                    if let Some(value) = name.and_then(|name| candidates.remove(name)) {
+                        *value = url_package_status(&url);
+                    }
+                }
+                true
+            });
+            if !next {
+                break;
+            }
+        }
     })
 }
 

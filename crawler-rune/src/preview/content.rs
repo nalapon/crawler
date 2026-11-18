@@ -1,14 +1,15 @@
 use super::{
-    native,
+    native, presentation,
     sheet::{self, Workbook},
     word,
 };
 use crate::funnel::model::DocumentKind;
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Event, LinkType, Options, Parser, Tag, TagEnd};
 use rune::{Image, ImageCache};
 use rune_kit::syntax::{self, Highlight};
 use std::{
-    collections::HashMap,
+    borrow::Cow,
+    collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
     io::Read,
     ops::Range,
@@ -29,24 +30,29 @@ pub enum Format {
     Text,
     Word,
     Sheet,
+    PowerPoint,
     Image,
     Video,
     Thumbnail,
 }
 impl Format {
     pub fn of(path: &Path) -> Self {
-        match DocumentKind::for_path(path, false) {
+        Self::from_kind(DocumentKind::for_path(path, false))
+    }
+    fn from_kind(kind: DocumentKind) -> Self {
+        match kind {
             DocumentKind::Pdf => Self::Pdf,
             DocumentKind::Markdown => Self::Markdown,
             DocumentKind::Word => Self::Word,
             DocumentKind::Sheet => Self::Sheet,
+            DocumentKind::PowerPoint => Self::PowerPoint,
             DocumentKind::Text => Self::Text,
             DocumentKind::Image => Self::Image,
             DocumentKind::Video => Self::Video,
             DocumentKind::Folder
             | DocumentKind::Audio
             | DocumentKind::Package
-            | DocumentKind::Other => Self::Thumbnail,
+            | DocumentKind::Other(_) => Self::Thumbnail,
         }
     }
     /// Whether the full-window document reader shows it. PDFs have their own reader.
@@ -102,8 +108,24 @@ pub struct Heading {
 }
 /// One top-level Markdown block, rendered as one virtual row.
 pub struct Block {
-    pub source: String,
+    source: String,
+    definitions: Vec<Arc<str>>,
     pub heading: Option<Heading>,
+}
+
+impl Block {
+    // Rune parses each visible block independently. Only add definitions this block uses.
+    pub fn markdown(&self) -> Cow<'_, str> {
+        if self.definitions.is_empty() {
+            return Cow::Borrowed(&self.source);
+        }
+        let mut text = self.source.clone();
+        for definition in &self.definitions {
+            text.push_str("\n\n");
+            text.push_str(definition);
+        }
+        Cow::Owned(text)
+    }
 }
 
 /// Code or plain text: one buffer, the offset where each line starts and one sorted list of
@@ -179,6 +201,11 @@ pub enum Body {
     Blocks(Vec<Block>),
     Text(Text),
     Sheet(Workbook),
+    Slide {
+        index: usize,
+        count: usize,
+        image: Image,
+    },
 }
 pub struct Document {
     pub path: PathBuf,
@@ -188,9 +215,10 @@ pub struct Document {
     pub body: Body,
     pub truncated: bool,
     pub budget: Budget,
-    pub images: HashMap<String, Image>,
+    pub images: Vec<(usize, String, PathBuf)>,
+    pub retained_bytes: usize,
     pub thumbnail: Option<Image>,
-    pub icon: Option<Image>,
+    pub kind: DocumentKind,
     pub fenced: Arc<HashMap<String, Vec<Highlight>>>,
     pub revision: u64,
 }
@@ -202,13 +230,14 @@ impl Document {
             .to_string_lossy()
             .into_owned()
     }
-    /// Virtual rows: Markdown blocks, text lines or sheet rows.
+    /// Markdown blocks, text lines, sheet rows or presentation slides.
     pub fn rows(&self) -> usize {
         match &self.body {
             Body::None => 0,
             Body::Blocks(blocks) => blocks.len(),
             Body::Text(text) => text.lines(),
             Body::Sheet(book) => book.sheet.rows(),
+            Body::Slide { count, .. } => *count,
         }
     }
     pub fn blocks(&self) -> &[Block] {
@@ -222,10 +251,11 @@ impl Document {
 pub struct Request {
     pub path: PathBuf,
     pub budget: Budget,
-    /// The sheet of a workbook to load.
-    pub sheet: usize,
+    /// The workbook sheet or presentation slide to load.
+    pub part: usize,
     pub revision: u64,
     pub generation: Arc<AtomicU64>,
+    pub candidate: Option<Arc<Document>>,
     pub cache: Arc<ImageCache>,
 }
 impl Request {
@@ -242,7 +272,17 @@ pub fn load(request: Request) -> Result<Arc<Document>, String> {
         .open(&request.path)
         .map_err(|e| e.to_string())?;
     let metadata = file.metadata().map_err(|e| e.to_string())?;
-    let format = Format::of(&request.path);
+    if let Some(candidate) = &request.candidate
+        && metadata.is_file()
+        && candidate.path == request.path
+        && candidate.bytes == Some(metadata.len())
+        && candidate.modified.is_some()
+        && candidate.modified == metadata.modified().ok()
+    {
+        return Ok(candidate.clone());
+    }
+    let kind = DocumentKind::for_path(&request.path, false);
+    let format = Format::from_kind(kind);
     if !(metadata.is_file() || metadata.is_dir() && format == Format::Thumbnail) {
         return Err("This item is not a regular file.".into());
     }
@@ -254,9 +294,14 @@ pub fn load(request: Request) -> Result<Arc<Document>, String> {
         body: Body::None,
         truncated: false,
         budget: request.budget,
-        images: HashMap::new(),
+        images: Vec::new(),
+        retained_bytes: 0,
         thumbnail: None,
-        icon: None,
+        kind: if metadata.is_dir() {
+            DocumentKind::Package
+        } else {
+            kind
+        },
         fenced: Arc::default(),
         revision: request.revision,
     };
@@ -271,11 +316,7 @@ pub fn load(request: Request) -> Result<Arc<Document>, String> {
             let (source, truncated) = read_text(file, request.budget, format, &cancelled)?;
             document.truncated = truncated;
             let path = request.path.to_string_lossy();
-            document.body = Body::Text(Text::new(
-                source,
-                syntax::lang_for_path(&path),
-                &cancelled,
-            ));
+            document.body = Body::Text(Text::new(source, syntax::lang_for_path(&path), &cancelled));
         }
         Format::Word if request.budget == Budget::Reader => {
             let source = if kind == "docx" || kind == "docm" || kind == "dotx" {
@@ -296,11 +337,12 @@ pub fn load(request: Request) -> Result<Arc<Document>, String> {
         }
         // Only the streaming formats are cheap enough to parse for a pane preview.
         Format::Sheet
-            if request.budget == Budget::Reader || matches!(kind.as_str(), "xlsx" | "xlsm" | "xlsb") =>
+            if request.budget == Budget::Reader
+                || matches!(kind.as_str(), "xlsx" | "xlsm" | "xlsb") =>
         {
             let (book, truncated) = sheet::workbook(
                 &request.path,
-                request.sheet,
+                request.part,
                 sheet::Limits::of(request.budget),
                 &cancelled,
             )?;
@@ -321,24 +363,69 @@ pub fn load(request: Request) -> Result<Arc<Document>, String> {
                 document.thumbnail = Some(decoded_image(&request.cache, bitmap));
             }
         }
-        Format::Thumbnail | Format::Word | Format::Sheet => {
+        Format::PowerPoint if request.budget == Budget::Reader => {
+            let (bitmap, count) = presentation::render(file, request.part, &cancelled)?;
+            document.body = Body::Slide {
+                index: request.part,
+                count,
+                image: decoded_image(&request.cache, bitmap),
+            };
+        }
+        Format::Thumbnail | Format::Word | Format::Sheet | Format::PowerPoint => {
             if let Some(bitmap) = native::thumbnail(&request.path, &cancelled) {
                 document.thumbnail = Some(decoded_image(&request.cache, bitmap));
             }
         }
         Format::Pdf | Format::Video => {}
     }
-    if request.budget == Budget::Preview
-        && document.thumbnail.is_none()
-        && matches!(document.body, Body::None)
-        && !matches!(format, Format::Pdf | Format::Video)
-    {
-        let icon = request.cache.app_icon(&request.path, 64.0);
-        let _ = icon.wait();
-        document.icon = Some(icon);
-    }
     if cancelled() {
         return Err("Cancelled".into());
+    }
+    if request.budget == Budget::Preview {
+        // Charge decoded pixels, including mipmaps, and owned row buffers. Only pane documents
+        // enter the navigation cache. A conservative charge leaves room for allocator overhead.
+        let pixels = document
+            .thumbnail
+            .as_ref()
+            .and_then(Image::size)
+            .map_or(0, |[w, h]| w as usize * h as usize * 8);
+        let body = match &document.body {
+            Body::None | Body::Slide { .. } => 0,
+            Body::Text(t) => {
+                t.source.capacity()
+                    + 4 * t.starts.capacity()
+                    + size_of::<Highlight>() * t.highlights.capacity()
+            }
+            Body::Sheet(book) => book.retained_bytes(),
+            Body::Blocks(blocks) => {
+                blocks.capacity() * size_of::<Block>()
+                    + blocks
+                        .iter()
+                        .map(|b| {
+                            b.source.capacity()
+                                + b.definitions.capacity() * size_of::<Arc<str>>()
+                                + b.definitions.iter().map(|s| s.len()).sum::<usize>()
+                                + b.heading
+                                    .as_ref()
+                                    .map_or(0, |h| h.slug.capacity() + h.title.capacity())
+                        })
+                        .sum::<usize>()
+                    + document
+                        .fenced
+                        .iter()
+                        .map(|(k, v)| k.capacity() + v.capacity() * size_of::<Highlight>() + 64)
+                        .sum::<usize>()
+            }
+        };
+        document.retained_bytes = 512
+            + document.path.as_os_str().len()
+            + pixels
+            + body
+            + document
+                .images
+                .iter()
+                .map(|(_, s, p)| 96 + s.capacity() + p.as_os_str().len())
+                .sum::<usize>();
     }
     Ok(Arc::new(document))
 }
@@ -452,12 +539,10 @@ fn prepare_markdown(doc: &mut Document, source: &str, request: &Request) -> Resu
         }
     }
     sanitized.push_str(&source[previous..]);
-    let parser = Parser::new_ext(&sanitized, options());
-    let references = parser
-        .reference_definitions()
-        .iter()
-        .map(|(name, def)| format!("\n[{name}]: <{}>\n", def.dest))
-        .collect::<String>();
+    let mut parser = Parser::new_ext(&sanitized, options()).into_offset_iter();
+    let mut shared_definitions = HashMap::<usize, Arc<str>>::new();
+    let mut used_definitions = Vec::<Arc<str>>::new();
+    let mut definition_starts = HashSet::new();
     let mut depth = 0usize;
     let mut start = 0;
     let mut heading: Option<u8> = None;
@@ -467,8 +552,8 @@ fn prepare_markdown(doc: &mut Document, source: &str, request: &Request) -> Resu
     let mut fenced = HashMap::new();
     let mut code_language = None;
     let mut code_text = String::new();
-    let mut image_paths = Vec::new();
-    for (event, range) in parser.into_offset_iter() {
+
+    while let Some((event, range)) = parser.next() {
         if request.cancelled() {
             return Err("Cancelled".into());
         }
@@ -491,10 +576,24 @@ fn prepare_markdown(doc: &mut Document, source: &str, request: &Request) -> Resu
                     });
                     code_text.clear();
                 }
-                if let Tag::Image { dest_url, .. } = tag
-                    && image_paths.len() < 48
+                if let Tag::Link { link_type, id, .. } | Tag::Image { link_type, id, .. } = tag
+                    && matches!(
+                        link_type,
+                        LinkType::Shortcut | LinkType::Collapsed | LinkType::Reference
+                    )
+                    && let Some(def) = parser.reference_definitions().get(id)
+                    && definition_starts.insert(def.span.start)
                 {
-                    image_paths.push(dest_url.to_string());
+                    let shared = shared_definitions
+                        .entry(def.span.start)
+                        .or_insert_with(|| Arc::from(&sanitized[def.span.clone()]));
+                    used_definitions.push(shared.clone());
+                }
+                if let Tag::Image { dest_url, .. } = tag
+                    && doc.images.len() < 48
+                    && let Some(path) = local_path(&doc.path, dest_url)
+                {
+                    doc.images.push((blocks.len(), dest_url.to_string(), path));
                 }
                 depth += 1;
             }
@@ -528,6 +627,7 @@ fn prepare_markdown(doc: &mut Document, source: &str, request: &Request) -> Resu
                 }
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
+                    definition_starts.clear();
                     let heading = heading.take().map(|level| {
                         let slug = slug(&heading_text);
                         let count = slugs.entry(slug.clone()).or_default();
@@ -543,36 +643,22 @@ fn prepare_markdown(doc: &mut Document, source: &str, request: &Request) -> Resu
                             level,
                         }
                     });
-                    let mut block = sanitized[start..range.end].to_owned();
-                    block.push_str(&references);
                     blocks.push(Block {
-                        source: block,
+                        source: sanitized[start..range.end].to_owned(),
+                        definitions: std::mem::take(&mut used_definitions),
                         heading,
                     });
                 }
             }
             Event::Rule if depth == 0 => blocks.push(Block {
                 source: sanitized[range].to_owned(),
+                definitions: Vec::new(),
                 heading: None,
             }),
             _ => {}
         }
     }
     doc.body = Body::Blocks(blocks);
-    for source in image_paths {
-        if request.cancelled() {
-            return Err("Cancelled".into());
-        }
-        if doc.images.contains_key(&source) {
-            continue;
-        }
-        if let Some(path) = local_path(&doc.path, &source)
-            && let Ok(bitmap) = native::image(&path, 1600)
-        {
-            doc.images
-                .insert(source, decoded_image(&request.cache, bitmap));
-        }
-    }
     doc.fenced = Arc::new(fenced);
     Ok(())
 }
@@ -643,14 +729,18 @@ pub fn find(doc: &Document, needle: &str) -> Vec<Found> {
         return Vec::new();
     }
     match &doc.body {
-        Body::None => Vec::new(),
+        Body::None | Body::Slide { .. } => Vec::new(),
         Body::Blocks(blocks) => blocks
             .iter()
             .enumerate()
             .flat_map(|(block, b)| {
-                rune_kit::markdown::find(&b.source, needle, rune_kit::markdown::Case::Insensitive)
-                    .into_iter()
-                    .map(move |ranges| Found { block, ranges })
+                rune_kit::markdown::find(
+                    &b.markdown(),
+                    needle,
+                    rune_kit::markdown::Case::Insensitive,
+                )
+                .into_iter()
+                .map(move |ranges| Found { block, ranges })
             })
             .take(10_000)
             .collect(),
@@ -665,8 +755,11 @@ pub fn find(doc: &Document, needle: &str) -> Vec<Found> {
             .collect(),
         Body::Sheet(book) => (0..book.sheet.rows())
             .filter(|row| {
-                (0..book.sheet.columns)
-                    .any(|column| occurrences(book.sheet.cell(*row, column), needle).next().is_some())
+                (0..book.sheet.columns).any(|column| {
+                    occurrences(book.sheet.cell(*row, column), needle)
+                        .next()
+                        .is_some()
+                })
             })
             .map(|block| Found {
                 block,
@@ -693,7 +786,7 @@ fn occurrences<'a>(text: &'a str, needle: &'a str) -> impl Iterator<Item = Range
     })
 }
 
-fn decoded_image(cache: &ImageCache, bitmap: native::Bitmap) -> Image {
+pub fn decoded_image(cache: &ImageCache, bitmap: native::Bitmap) -> Image {
     let image = cache.rgba(bitmap.width, bitmap.height, bitmap.rgba);
     let _ = image.wait();
     image

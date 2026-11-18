@@ -3,10 +3,11 @@ use std::{
     collections::HashMap,
     ffi::CStr,
     mem::{size_of, zeroed},
+    sync::Arc,
     time::Instant,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ProcessId {
     pub pid: i32,
     pub started: u64,
@@ -39,7 +40,7 @@ pub struct Counters {
 }
 #[derive(Default)]
 pub struct Sample {
-    pub processes: Vec<Process>,
+    pub processes: Vec<Arc<Process>>,
     pub counters: HashMap<i32, Counters>,
     pub unavailable: usize,
     pub error: Option<String>,
@@ -87,7 +88,7 @@ pub fn read(previous: HashMap<i32, Counters>) -> Sample {
                 let error = std::io::Error::last_os_error().raw_os_error();
                 if matches!(error, Some(libc::EPERM | libc::EACCES)) {
                     sample.unavailable += 1;
-                    sample.processes.push(Process {
+                    sample.processes.push(Arc::new(Process {
                         id: ProcessId { pid, started: 0 },
                         parent: 0,
                         name: format!("PID {pid}"),
@@ -97,7 +98,7 @@ pub fn read(previous: HashMap<i32, Counters>) -> Sample {
                         read: None,
                         written: None,
                         threads: None,
-                    });
+                    }));
                 }
                 continue;
             }
@@ -170,7 +171,7 @@ pub fn read(previous: HashMap<i32, Counters>) -> Sample {
             } else {
                 sample.unavailable += 1;
             }
-            sample.processes.push(Process {
+            sample.processes.push(Arc::new(Process {
                 id: ProcessId { pid, started },
                 parent: info.pbi_ppid as i32,
                 name,
@@ -180,7 +181,7 @@ pub fn read(previous: HashMap<i32, Counters>) -> Sample {
                 read,
                 written,
                 threads,
-            });
+            }));
         }
     }
     sample.milliseconds = began.elapsed().as_secs_f64() * 1000.0;

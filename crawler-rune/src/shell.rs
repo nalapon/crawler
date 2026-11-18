@@ -114,7 +114,8 @@ fn shell_button_with_icon(
         Era::WindowsBevel | Era::UnixBevel => base,
         Era::Classic | Era::Terminal => base,
     };
-    // A matched background preserves the sliding section indicator across reparenting.
+    // The indicator does not travel between sections: a travelling one is drawn above the
+    // button it lands on and hides its label until it settles.
     if active && section.is_some() {
         let inset = if matches!(l.era(), Era::WindowsBevel | Era::UnixBevel) {
             2.0
@@ -123,17 +124,18 @@ fn shell_button_with_icon(
         };
         base = base.child(
             el().key("section-indicator")
-                .matched("section-indicator")
                 .pin(Some(inset), Some(inset), Some(inset), Some(inset))
                 .radius(if l.era() == Era::Modern { 6.0 } else { 0.0 })
                 .fill(fill)
-                .motion(rune::tok::motion::SNAPPY)
                 .inert(),
         );
     } else {
         base = base.fill(fill);
     }
     let mut content = row().gap(4.0).items_center();
+    if place.is_some() {
+        content = content.min_w(0.0).shrink();
+    }
     if let Some(kind) = place {
         content = content.child(shell_icon(p, kind.into(), active, 18.0));
     }
@@ -164,29 +166,30 @@ fn shell_button_with_icon(
     let icon_only = key.starts_with("eject-")
         || matches!(
             key,
-            "folder-back"
-                | "folder-forward"
-                | "folder-refresh"
-                | "commands-button"
-                | "help-button"
+            "folder-back" | "folder-forward" | "folder-refresh" | "commands-button" | "help-button"
         );
     if !icon_only {
-        content = content.child(
-            text(label)
-                .font(l.font(
-                    if section.is_some() || place.is_some() {
-                        12.0
-                    } else {
-                        11.0
-                    },
-                    if active { 600.0 } else { 500.0 },
-                ))
-                .color(ink),
-        );
+        let title = text(label)
+            .font(l.font(
+                if section.is_some() || place.is_some() {
+                    12.0
+                } else {
+                    11.0
+                },
+                if active { 600.0 } else { 500.0 },
+            ))
+            .color(ink);
+        content = content.child(if place.is_some() {
+            title.truncate().min_w(0.0).shrink()
+        } else {
+            title
+        });
     }
+    // A button's own size and colours land at once: its label is bolder when active, and a
+    // spring there slides every neighbour.
     p.kit
         .interactive(base)
-        .motion(rune::tok::motion::SNAPPY)
+        .motion(rune::Spring::NONE)
         .press_scale(0.98)
         .child(content)
 }
@@ -196,6 +199,8 @@ fn shell_button_with_icon(
 pub enum ControlIcon {
     Back,
     Forward,
+    Up,
+    Down,
     Refresh,
     Pause,
     Play,
@@ -210,6 +215,8 @@ pub fn control_icon(kind: ControlIcon, ink: rune::Color, size: f32) -> El {
     let lines: Vec<Vec<[f32; 2]>> = match kind {
         Back => vec![vec![[9., 2.], [4., 7.], [9., 12.]]],
         Forward => vec![vec![[5., 2.], [10., 7.], [5., 12.]]],
+        Up => vec![vec![[3., 9.], [7., 5.], [11., 9.]]],
+        Down => vec![vec![[3., 5.], [7., 9.], [11., 5.]]],
         Pause => vec![vec![[5., 3.], [5., 11.]], vec![[9., 3.], [9., 11.]]],
         Play => vec![vec![[4., 2.], [11., 7.], [4., 12.], [4., 2.]]],
         Add => vec![vec![[7., 2.], [7., 12.]], vec![[2., 7.], [12., 7.]]],

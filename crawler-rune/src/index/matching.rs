@@ -1,7 +1,7 @@
 use fff_query_parser::{Constraint, FuzzyQuery, MixedSearchConfig, QueryParser};
 use fff_search::{
     FileItem, PaginationArgs, ScoringContext,
-    crawler::{fuzzy_match_and_score_files, fuzzy_match_byte_offsets_for_page, set_path},
+    crawler::{fuzzy_match_byte_offsets_for_page, set_path, visit_match_scores},
 };
 use rayon::prelude::*;
 use std::{
@@ -46,6 +46,22 @@ pub struct Matches {
     pub counts: BTreeMap<PathBuf, usize>,
     pub total: usize,
 }
+impl Ranked {
+    fn order(&self, other: &Self) -> std::cmp::Ordering {
+        rank_order(
+            self.score,
+            self.batch.path(self.row),
+            other.score,
+            other.batch.path(other.row),
+        )
+    }
+}
+fn rank_order(a_score: i32, a: &str, b_score: i32, b: &str) -> std::cmp::Ordering {
+    b_score
+        .cmp(&a_score)
+        .then_with(|| a.len().cmp(&b.len()))
+        .then_with(|| a.cmp(b))
+}
 impl Matches {
     pub fn merge(&mut self, other: Self) {
         self.total += other.total;
@@ -53,12 +69,7 @@ impl Matches {
             *self.counts.entry(path).or_default() += count;
         }
         self.hits.extend(other.hits);
-        self.hits.sort_unstable_by(|a, b| {
-            b.score
-                .cmp(&a.score)
-                .then_with(|| a.batch.path(a.row).len().cmp(&b.batch.path(b.row).len()))
-                .then_with(|| a.batch.path(a.row).cmp(b.batch.path(b.row)))
-        });
+        self.hits.sort_unstable_by(Ranked::order);
         self.hits.truncate(100);
     }
     pub fn response(
@@ -171,6 +182,7 @@ pub fn batch(
 struct Inputs {
     files: Vec<FileItem>,
     rows: Vec<usize>,
+    ranked: Vec<(usize, i32)>,
 }
 thread_local! {
     static INPUTS: RefCell<Inputs> = RefCell::default();
@@ -184,13 +196,26 @@ fn batch_with_inputs(
     literal: bool,
     inputs: &mut Inputs,
 ) -> Matches {
-    let Inputs { files, rows } = inputs;
+    let Inputs {
+        files,
+        rows,
+        ranked,
+    } = inputs;
     rows.clear();
+    ranked.clear();
     let scope = match &query.scope {
         Scope::Mac => None,
         Scope::Under(p) => p.strip_prefix(root).ok().and_then(Path::to_str),
     };
     if matches!(query.scope, Scope::Under(_)) && scope.is_none() {
+        return Matches::default();
+    }
+    // An ASCII scope can match only the exact bytes of each prefix component.
+    // Non-ASCII scopes still use the canonical-equivalence check row by row.
+    if scope.is_some_and(|prefix| {
+        let prefix = prefix.trim_end_matches('/');
+        !prefix.is_empty() && prefix.is_ascii() && !batch.may_overlap_prefix(prefix)
+    }) {
         return Matches::default();
     }
     let excluded = exclude
@@ -247,15 +272,8 @@ fn batch_with_inputs(
     let parser = QueryParser::new(MixedSearchConfig);
     let parsed = parsed(&parser, &query.text, literal);
     let context = context(&parsed, &query.text);
-    let arena = batch.arena();
-    let (items, scores, total) =
-        fuzzy_match_and_score_files(files, &context, files.len(), arena, arena);
-    let mut result = Matches {
-        total,
-        ..Matches::default()
-    };
     let mut counts = foldhash::HashMap::default();
-    for (position, (item, score)) in items.into_iter().zip(scores).enumerate() {
+    visit_match_scores(files, &context, batch.arena(), |item, score| {
         // The matcher returns references into this exact, unmoved files allocation.
         let index = (std::ptr::from_ref(item) as usize - files.as_ptr() as usize)
             / std::mem::size_of::<FileItem>();
@@ -269,23 +287,34 @@ fn batch_with_inputs(
         if let Some((child, _)) = relative.split_once('/') {
             *counts.entry(child).or_insert(0usize) += 1;
         }
-        if position < 100 {
-            result.hits.push(Ranked {
-                batch: Arc::clone(batch),
-                row,
-                score: score.total,
-            });
-        }
+        ranked.push((row, score));
+    });
+    let total = ranked.len();
+    if total > 100 {
+        ranked.select_nth_unstable_by(100, |&(a, a_score), &(b, b_score)| {
+            rank_order(a_score, batch.path(a), b_score, batch.path(b))
+        });
+        ranked.truncate(100);
     }
     let base = match &query.scope {
         Scope::Mac => root,
         Scope::Under(p) => p,
     };
-    result.counts = counts
-        .into_iter()
-        .map(|(child, count)| (base.join(child), count))
-        .collect();
-    result
+    Matches {
+        total,
+        hits: ranked
+            .iter()
+            .map(|&(row, score)| Ranked {
+                batch: Arc::clone(batch),
+                row,
+                score,
+            })
+            .collect(),
+        counts: counts
+            .into_iter()
+            .map(|(child, count)| (base.join(child), count))
+            .collect(),
+    }
 }
 pub fn descendant(path: &str, scope: &str) -> bool {
     relative_to(path, scope).is_some()

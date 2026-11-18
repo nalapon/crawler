@@ -11,10 +11,7 @@ use crate::{
     shell,
 };
 use copy::{Outcome, Progress, Snapshot};
-use rune::tok::motion;
-use rune::{
-    Cx, El, Icon, Key, KeyEvent, ScrollSpec, Transition, Tx, Waker, col, el, icon, row, text,
-};
+use rune::{Cx, El, Icon, Key, KeyEvent, ScrollSpec, Tx, Waker, col, el, icon, row, text};
 use std::{
     borrow::Cow,
     collections::VecDeque,
@@ -310,10 +307,7 @@ pub fn poll(app: &mut App, tx: &mut Tx) -> bool {
     if let Some(notice) = copy_notice {
         app.toast(notice);
         changed = true;
-    }
-    if changed {
         tx.animated();
-        tx.motion(motion::SNAPPY);
     }
     changed
 }
@@ -523,8 +517,7 @@ fn progress(p: &Paint, key: &str, copied: u64, total: u64) -> El {
                 .h_full()
                 .w_frac(fraction)
                 .radius(3.0)
-                .fill(p.look.accent)
-                .motion(motion::SNAPPY),
+                .fill(p.look.accent),
         )
 }
 pub fn status(app: &App, p: &Paint) -> Option<El> {
@@ -599,7 +592,6 @@ fn copies(app: &App, p: &Paint) -> El {
         pane = pane.child(
             col()
                 .key(format!("running-copy-{}", running.job.id))
-                .matched(format!("copy-{}", running.job.id))
                 .padding(16.0)
                 .gap(8.0)
                 .child(
@@ -661,18 +653,12 @@ fn copies(app: &App, p: &Paint) -> El {
                                 let record = &a.transfers.records[i];
                                 col()
                                     .key(record.id.clone())
-                                    .matched(record.id.clone())
                                     .w_full()
                                     .min_h(82.0)
                                     .px(16.0)
                                     .py(12.0)
                                     .gap(5.0)
                                     .border_sides([0.0, 0.0, 1.0, 0.0], look.line)
-                                    .transition(
-                                        Transition::opacity()
-                                            .combined(Transition::offset(0.0, -8.0)),
-                                    )
-                                    .motion(motion::SNAPPY)
                                     .child(
                                         text(record.title.as_str())
                                             .font(look.font(12.0, 400.0))
@@ -697,9 +683,7 @@ fn copies(app: &App, p: &Paint) -> El {
     }
     pane
 }
-fn beacon(s: &State, p: &Paint, reduced_motion: bool) -> El {
-    let active = !reduced_motion
-        && (s.sending.is_some() || s.devices.is_empty() && s.discovery_error.is_none());
+fn beacon(s: &State, p: &Paint) -> El {
     let mut body = el().key("airdrop-beacon-waves").size(130.0, 130.0).center();
     for (index, diameter) in [106.0, 66.0, 26.0].into_iter().enumerate() {
         let wave = el()
@@ -709,11 +693,7 @@ fn beacon(s: &State, p: &Paint, reduced_motion: bool) -> El {
             .radius(diameter / 2.0)
             .border(1.0, p.look.accent.alpha(0.35))
             .inert();
-        body = body.child(if active {
-            wave.looping(rune::LoopSpec::opacity(2.4, index as f64 * 0.25, 0.15, 1.0))
-        } else {
-            wave
-        });
+        body = body.child(wave);
     }
     col()
         .key("airdrop-beacon")
@@ -734,7 +714,7 @@ fn beacon(s: &State, p: &Paint, reduced_motion: bool) -> El {
             ),
         )
 }
-fn air_view(app: &App, p: &Paint, reduced_motion: bool, tile_height: f32) -> El {
+fn air_view(app: &App, p: &Paint, tile_height: f32) -> El {
     let s = &app.transfers;
     let busy = busy(s);
     let status = s
@@ -774,8 +754,6 @@ fn air_view(app: &App, p: &Paint, reduced_motion: bool, tile_height: f32) -> El 
                 "{}, {}. Choose files to send.",
                 device.name, device.detail
             ))
-            .transition(Transition::opacity().combined(Transition::offset(0.0, 8.0)))
-            .motion(motion::SNAPPY)
             .child(
                 icon(
                     if device.name.to_lowercase().contains("iphone")
@@ -907,7 +885,7 @@ fn air_view(app: &App, p: &Paint, reduced_motion: bool, tile_height: f32) -> El 
                 .h(22.0)
                 .mt(8.0),
         )
-        .child(beacon(s, p, reduced_motion).mt(8.0))
+        .child(beacon(s, p).mt(8.0))
         .child(
             el().w_full().h(40.0).center().child(
                 text(status)
@@ -1008,7 +986,6 @@ pub fn view(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) -> El {
         .child(air_view(
             app,
             p,
-            cx.system_reduced_motion(),
             cx.layout_size("airdrop")
                 .map_or(220.0, |s| (s[1] - 482.0).clamp(124.0, 220.0)),
         ))

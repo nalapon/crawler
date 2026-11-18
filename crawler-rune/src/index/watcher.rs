@@ -8,7 +8,6 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc,
     },
     thread,
 };
@@ -28,11 +27,11 @@ impl Watcher {
     pub fn start(
         root: PathBuf,
         since: Option<u64>,
+        ready: impl FnOnce(bool) + Send + 'static,
         deliver: impl Fn(Events) + Send + 'static,
-    ) -> (Self, mpsc::Receiver<bool>) {
+    ) -> Self {
         let cancel = Arc::new(AtomicBool::new(false));
         let token = Arc::clone(&cancel);
-        let (ready, receiver) = mpsc::channel();
         let _ = thread::Builder::new()
             .name("crawler-fsevents".into())
             .spawn(move || {
@@ -67,14 +66,14 @@ impl Watcher {
                     )
                 };
                 if stream.is_null() {
-                    let _ = ready.send(false);
+                    ready(false);
                     return;
                 }
                 let Some(run_loop) = CFRunLoop::current() else {
                     unsafe {
                         FSEventStreamRelease(stream);
                     }
-                    let _ = ready.send(false);
+                    ready(false);
                     return;
                 };
                 // The deprecated run-loop API keeps teardown and callback lifetime on this thread.
@@ -87,7 +86,7 @@ impl Watcher {
                     );
                 }
                 let started = unsafe { FSEventStreamStart(stream) };
-                let _ = ready.send(started);
+                ready(started);
                 if started {
                     while !token.load(Ordering::Relaxed) {
                         CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, 0.1, false);
@@ -101,7 +100,7 @@ impl Watcher {
                     FSEventStreamRelease(stream);
                 }
             });
-        (Self { cancel }, receiver)
+        Self { cancel }
     }
 }
 impl Drop for Watcher {

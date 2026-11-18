@@ -1,3 +1,4 @@
+use crate::funnel::model::DocumentKind;
 use std::{
     borrow::Cow,
     collections::VecDeque,
@@ -103,38 +104,17 @@ use crate::{
     app::{App, Paint},
     shell,
 };
-use objc2_foundation::{NSArray, NSNumber, NSString, NSURL, NSURLIsPackageKey};
-use rune::{Cx, El, Icon, Key, Latest, TextEdit, Tx, Waker, col, icon, row, text};
+use rune::{Cx, El, Key, Latest, TextEdit, Tx, Waker, col, row, text};
 use rune_kit::{Cell, Dialog, Table, TableColumn, TableState, TextInput};
 
-fn is_package(path: &Path) -> bool {
-    let url =
-        NSURL::fileURLWithPath_isDirectory(&NSString::from_str(&path.to_string_lossy()), true);
-    let key = unsafe { NSURLIsPackageKey };
-    url.resourceValuesForKeys_error(&NSArray::from_slice(&[key]))
-        .ok()
-        .and_then(|values| values.objectForKey(key))
-        .and_then(|value| value.downcast::<NSNumber>().ok())
-        .is_some_and(|value| value.boolValue())
-}
-
-static FOLDER: Icon = Icon {
-    name: "crawler-picker-folder",
-    view: 16.0,
-    body: r#"<path d="M1 4V2h5l2 2h7v10H1Z" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>"#,
-};
-static FILE: Icon = Icon {
-    name: "crawler-picker-file",
-    view: 16.0,
-    body: r#"<path d="M3 1h6l4 4v10H3Zm6 0v4h4" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>"#,
-};
 #[derive(Clone, PartialEq, Eq)]
 struct Entry {
     id: String,
     path: PathBuf,
     name: String,
-    directory: bool,
+    kind: DocumentKind,
     bytes: u64,
+    modified: Option<std::time::SystemTime>,
 }
 #[derive(Default)]
 pub struct Picker {
@@ -149,10 +129,36 @@ pub struct Picker {
     cache: VecDeque<(PathBuf, Vec<Entry>)>,
     visible: Vec<usize>,
     table: TableState,
+    cursor_index: std::cell::Cell<Option<usize>>,
     read: Latest<Result<Vec<Entry>, String>>,
     error: Option<String>,
 }
+impl super::State {
+    pub(crate) fn picker_preview(&self) -> Option<(&Path, Option<(u64, std::time::SystemTime)>)> {
+        if !self.picker.open {
+            return None;
+        }
+        let entry = self.picker.selected_file()?;
+        Some((&entry.path, entry.modified.map(|time| (entry.bytes, time))))
+    }
+}
+
 impl Picker {
+    fn selected_entry(&self) -> Option<&Entry> {
+        let id = self.table.cursor()?;
+        if let Some(row) = self.cursor_index.get().and_then(|i| self.rows.get(i))
+            && row.id == id
+        {
+            return Some(row);
+        }
+        let at = self.rows.iter().position(|entry| entry.id == id)?;
+        self.cursor_index.set(Some(at));
+        self.rows.get(at)
+    }
+    fn selected_file(&self) -> Option<&Entry> {
+        self.selected_entry()
+            .filter(|entry| entry.kind != DocumentKind::Folder)
+    }
     pub fn setup(&mut self, waker: &Waker) {
         self.read = Latest::default().debounce(std::time::Duration::from_millis(120));
         self.read.set_waker(waker.clone());
@@ -198,18 +204,23 @@ impl Picker {
                     continue;
                 }
                 let metadata = fs::metadata(&path).map_err(|e| e.to_string())?;
-                let package = metadata.is_dir() && is_package(&path);
+                let package = metadata.is_dir() && crate::opening::platform::is_package(&path);
                 rows.push(Entry {
                     id: path.to_string_lossy().into_owned(),
+                    kind: if package {
+                        DocumentKind::Package
+                    } else {
+                        DocumentKind::for_path(&path, metadata.is_dir())
+                    },
                     path,
                     name,
-                    directory: metadata.is_dir() && !package,
                     bytes: metadata.len(),
+                    modified: metadata.modified().ok(),
                 });
             }
             rows.sort_by(|a, b| {
-                b.directory
-                    .cmp(&a.directory)
+                (b.kind == DocumentKind::Folder)
+                    .cmp(&(a.kind == DocumentKind::Folder))
                     .then_with(|| rune_kit::natural_cmp(&a.name, &b.name))
             });
             Ok(rows)
@@ -366,7 +377,13 @@ pub fn overlay(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) {
             row()
                 .gap(8.0)
                 .items_center()
-                .child(icon(if r.directory { &FOLDER } else { &FILE }, 16.0).color(ink))
+                .child(crate::icons::file(
+                    &r.path,
+                    r.kind,
+                    look,
+                    a.transfers.picker.table.is_selected(&r.id),
+                    16.0,
+                ))
                 .child(
                     text(r.name.clone())
                         .font(rune::tok::type_::LABEL)
@@ -382,7 +399,7 @@ pub fn overlay(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) {
             .rows
             .iter()
             .find(|r| r.id == id)
-            .map(|r| (r.directory, r.path.clone()));
+            .map(|r| (r.kind == DocumentKind::Folder, r.path.clone()));
         if let Some((directory, path)) = row {
             if directory {
                 a.transfers.picker.navigate(path);
@@ -395,11 +412,8 @@ pub fn overlay(app: &App, cx: &mut Cx<App>, p: &Paint, layer: &mut Vec<El>) {
     .grow(1.0)
     .min_h(0.0)
     .min_w(0.0);
-    let selected = s
-        .table
-        .cursor()
-        .and_then(|id| s.rows.iter().find(|r| r.id == id));
-    let preview = if let Some(entry) = selected.filter(|r| !r.directory) {
+    let selected = s.selected_entry();
+    let preview = if let Some(entry) = selected.filter(|r| r.kind != DocumentKind::Folder) {
         crate::preview::pane(app, cx, p, &entry.path, "airdrop-picker-preview")
             .w(210.0)
             .h_full()

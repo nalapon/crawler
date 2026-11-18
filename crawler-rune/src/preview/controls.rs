@@ -16,6 +16,11 @@ pub const BACK: Icon = Icon {
     view: 24.0,
     body: r#"<path d="m14 5-7 7 7 7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
+pub const NEXT: Icon = Icon {
+    name: "reader-next",
+    view: 24.0,
+    body: r#"<path d="m10 5 7 7-7 7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>"#,
+};
 pub const ZOOM_IN: Icon = Icon {
     name: "reader-zoom-in",
     view: 24.0,
@@ -30,6 +35,16 @@ pub const FIT: Icon = Icon {
     name: "reader-fit",
     view: 24.0,
     body: r#"<path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+pub const FULL_SCREEN: Icon = Icon {
+    name: "reader-full-screen",
+    view: 24.0,
+    body: r#"<path d="M9 4H4v5m0-5 5 5m6-5h5v5m0-5-5 5M4 15v5h5m-5 0 5-5m11 0v5h-5m5 0-5-5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+pub const EXIT_FULL_SCREEN: Icon = Icon {
+    name: "reader-exit-full-screen",
+    view: 24.0,
+    body: r#"<path d="M4 9h5V4M4 4l5 5m6-5v5h5m0-5-5 5M4 15h5v5m-5 0 5-5m6 5v-5h5m0 5-5-5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
 pub const SELECT: Icon = Icon {
     name: "pdf-select",

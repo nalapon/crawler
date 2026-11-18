@@ -351,7 +351,7 @@ fn preview_selection(app: &mut App, tx: &mut Tx) {
                 None
             }
         });
-        tx.color_motion(rune::tok::motion::CALM);
+        tx.color_motion(rune::tok::motion::SETTLE);
     }
     if let Some(c) = choices.get(app.settings.selection) {
         tx.scroll_into_view_in("command-results", format!("command-{}", c.id));
@@ -409,7 +409,7 @@ fn activate(app: &mut App, tx: &mut Tx) {
         Action::Reveal => opening::reveal(&files),
         Action::AirDrop => transfers::airdrop(app, files, tx),
         Action::Theme(theme) => {
-            tx.color_motion(rune::tok::motion::CALM);
+            tx.color_motion(rune::tok::motion::SETTLE);
             app.set_theme(theme);
         }
         Action::Terminal => {
@@ -950,7 +950,7 @@ fn theme_tile(theme: Theme, selected: bool, p: &Paint) -> El {
         )
         .press_scale(0.98)
         .on_press_tx(move |a: &mut App, tx| {
-            tx.color_motion(rune::tok::motion::CALM);
+            tx.color_motion(rune::tok::motion::SETTLE);
             a.set_theme(theme);
         })
 }

@@ -39,6 +39,7 @@ pub struct Sheet {
     pub columns: usize,
     /// Each column's width in points, from the longest of its first rows.
     pub widths: Vec<f32>,
+    pub offsets: Vec<f32>,
     text: String,
     /// Where each cell's text ends in `text`; a cell starts where the one before it ends.
     ends: Vec<u32>,
@@ -69,6 +70,18 @@ pub struct Workbook {
     pub names: Vec<String>,
     pub active: usize,
     pub sheet: Sheet,
+}
+
+impl Workbook {
+    pub fn retained_bytes(&self) -> usize {
+        self.names.capacity() * size_of::<String>()
+            + self.names.iter().map(String::capacity).sum::<usize>()
+            + self.sheet.text.capacity()
+            + 4 * (self.sheet.ends.capacity()
+                + self.sheet.rows.capacity()
+                + self.sheet.widths.capacity()
+                + self.sheet.offsets.capacity())
+    }
 }
 
 struct Builder {
@@ -109,6 +122,7 @@ impl Builder {
         while !value.is_char_boundary(end) {
             end -= 1;
         }
+        self.truncated |= end < value.len();
         self.text.push_str(&value[..end]);
         self.ends.push(self.text.len() as u32);
         true
@@ -127,7 +141,8 @@ impl Builder {
         let start = *self.rows.last().expect("rows start at zero") as usize;
         // Trailing empty cells would widen the sheet without showing anything.
         while self.ends.len() > start
-            && self.ends[self.ends.len() - 1] == self.ends.len().checked_sub(2).map_or(0, |i| self.ends[i])
+            && self.ends[self.ends.len() - 1]
+                == self.ends.len().checked_sub(2).map_or(0, |i| self.ends[i])
         {
             self.ends.pop();
         }
@@ -150,6 +165,7 @@ impl Builder {
         let mut sheet = Sheet {
             columns: self.columns,
             widths: Vec::new(),
+            offsets: Vec::new(),
             text: self.text,
             ends: self.ends,
             rows: self.rows,
@@ -163,6 +179,12 @@ impl Builder {
                 (characters as f32 * 7.2 + 24.0).clamp(64.0, 360.0)
             })
             .collect();
+        sheet.offsets.push(0.0);
+        for width in &sheet.widths {
+            sheet
+                .offsets
+                .push(sheet.offsets.last().copied().unwrap_or_default() + width);
+        }
         (sheet, self.truncated)
     }
 }
@@ -184,7 +206,9 @@ pub fn workbook(
     let mut builder = Builder::new(limits);
     match &mut sheets {
         Sheets::Xlsx(book) => {
-            let mut cells = book.worksheet_cells_reader(&name).map_err(|e| e.to_string())?;
+            let mut cells = book
+                .worksheet_cells_reader(&name)
+                .map_err(|e| e.to_string())?;
             stream(
                 || cells.next_cell().map_err(|e| e.to_string()),
                 &mut builder,
@@ -192,7 +216,9 @@ pub fn workbook(
             )?;
         }
         Sheets::Xlsb(book) => {
-            let mut cells = book.worksheet_cells_reader(&name).map_err(|e| e.to_string())?;
+            let mut cells = book
+                .worksheet_cells_reader(&name)
+                .map_err(|e| e.to_string())?;
             stream(
                 || cells.next_cell().map_err(|e| e.to_string()),
                 &mut builder,

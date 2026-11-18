@@ -140,24 +140,6 @@ impl Reader {
             identity,
         })
     }
-    pub fn prioritize(&mut self, text: &str) {
-        let mut bits: Vec<_> = text
-            .as_bytes()
-            .windows(3)
-            .map(super::snapshot::trigram_bit)
-            .collect();
-        bits.sort_unstable();
-        bits.dedup();
-        // Hints only change arrival order. Every whole snapshot still reaches FFF.
-        let map = &self.map;
-        self.blocks.make_contiguous().sort_by_cached_key(|block| {
-            std::cmp::Reverse(block.signature.as_ref().map_or(0, |range| {
-                bits.iter()
-                    .filter(|&&bit| map[range.start + bit / 8] & (1 << (bit % 8)) != 0)
-                    .count()
-            }))
-        });
-    }
     pub fn skip_loaded(&mut self, positions: &foldhash::HashSet<usize>) {
         self.blocks
             .retain(|block| !positions.contains(&block.bytes.start));
@@ -179,20 +161,45 @@ pub struct Decoder {
     legacy: bool,
 }
 impl Decoder {
+    pub fn prioritize(&self, blocks: &mut std::collections::VecDeque<Block>, text: &str) {
+        if text.len() < 3 {
+            return;
+        }
+        let mut bits: Vec<_> = text
+            .as_bytes()
+            .windows(3)
+            .map(super::snapshot::trigram_bit)
+            .collect();
+        bits.sort_unstable();
+        bits.dedup();
+        // Hints only change arrival order. Every whole snapshot still reaches FFF.
+        let map = &self.map;
+        blocks.make_contiguous().sort_by_cached_key(|block| {
+            std::cmp::Reverse(block.signature.as_ref().map_or(0, |range| {
+                bits.iter()
+                    .filter(|&&bit| map[range.start + bit / 8] & (1 << (bit % 8)) != 0)
+                    .count()
+            }))
+        });
+    }
     /// Verifies and decodes one block into its position in the file and its snapshot.
     pub fn decode(&self, block: Block) -> io::Result<(usize, Arc<Snapshot>)> {
         let Block {
             bytes: range,
             checksum,
-            ..
+            signature,
         } = block;
+        let encoded_block = checksum
+            .as_ref()
+            .zip(signature.as_ref())
+            .map(|(digest, _)| digest.start - 8..range.end);
         if let Some(checksum) = checksum
             && blake3::hash(&self.map[range.clone()]).as_bytes() != &self.map[checksum]
         {
             return Err(corrupt());
         }
         let position = range.start;
-        Snapshot::decode(Arc::clone(&self.map), range, self.legacy)
+        Snapshot::decode(Arc::clone(&self.map), range, self.legacy, encoded_block)
             .map(|batch| (position, Arc::new(batch)))
             .ok_or_else(corrupt)
     }
@@ -242,6 +249,11 @@ pub fn save(
                     io::ErrorKind::Interrupted,
                     "Search cache save cancelled",
                 ));
+            }
+            if let Some(record) = batch.encoded_block() {
+                out.write_all(record)?;
+                pad(out, record.len())?;
+                continue;
             }
             let bytes = batch.encode();
             out.write_all(&(bytes.len() as u64).to_le_bytes())?;
